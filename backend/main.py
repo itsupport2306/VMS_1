@@ -1407,6 +1407,11 @@ class CeipalClient:
         self._jobs_cache = None
         self._jobs_cache_time = None
         self._fetch_lock = asyncio.Lock()  # Prevent concurrent fetches
+        # Single-flight flag for fetch_all_jobs_background. Concurrent triggers (scheduler + every
+        # /api/jobs request) used to start parallel paginated fetches that hammered Ceipal into
+        # 429 retry loops. Safe to read/write without a lock since asyncio is single-threaded
+        # and the check + set happens between awaits.
+        self._background_fetch_running = False
         self._last_fetched_pages = 0  # Track how many pages were fetched
         os.makedirs(self.cache_dir, exist_ok=True)
 
@@ -1710,9 +1715,19 @@ class CeipalClient:
     
     async def fetch_all_jobs_background(self):
         """Background task to fetch ALL jobs progressively using disk cache to manage memory.
-        
+
         Fetches all pages without limit, saving to disk periodically to prevent memory issues.
+
+        Single-flight: if a previous invocation is still running, this trigger is dropped.
+        Both the 5-minute scheduler and the on-demand /api/jobs route call this method, and
+        a single fetch can take longer than 5 minutes when Ceipal throttles, so concurrent
+        triggers must NOT spawn parallel paginated fetches (they cascade into 429 storms).
         """
+        if self._background_fetch_running:
+            print("[Background] Fetch already in progress — dropping duplicate trigger.")
+            return
+        self._background_fetch_running = True
+
         print("[Background] Starting progressive job fetch (all pages)...")
         all_jobs = []  # In-memory batch
         consecutive_429_errors = 0
@@ -1845,7 +1860,9 @@ class CeipalClient:
                 all_jobs_for_cache = [Job(**job_data) for job_data in disk_batch]
                 self._set_cached_jobs(all_jobs_for_cache)
             # Exception path = partial fetch; do NOT run closure detection.
-    
+        finally:
+            self._background_fetch_running = False
+
     async def fetch_more_jobs(self, start_page: int, max_pages: int = 25) -> List[Job]:
         """Fetch additional pages of jobs beyond initial load"""
         more_jobs: List[Job] = []
