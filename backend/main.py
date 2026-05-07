@@ -1799,10 +1799,14 @@ class CeipalClient:
                         # Save current batch to disk
                         disk_batch.extend([job.dict() for job in all_jobs])
                         self._write_json_cache("jobs_full_list.json", disk_batch)
-                        self._set_cached_jobs(all_jobs)  # Keep recent for fast API
+                        # Cache the CUMULATIVE list (everything fetched so far), not just the
+                        # 3-page batch about to be cleared. Otherwise /api/jobs sees only the
+                        # latest ~50 jobs while a long fetch is in flight, even though disk
+                        # already has hundreds.
+                        self._set_cached_jobs([Job(**job_data) for job_data in disk_batch])
                         self._last_fetched_pages = page
                         self._last_total_records = total_records
-                        print(f"[Background] Saved {len(disk_batch)} jobs to disk, cleared memory batch")
+                        print(f"[Background] Saved {len(disk_batch)} jobs to disk, cached cumulative list, cleared memory batch")
                         # Clear in-memory list to free memory
                         all_jobs = []
                     
