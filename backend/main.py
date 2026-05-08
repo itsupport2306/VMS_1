@@ -815,7 +815,7 @@ MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 10485760))  # 10MB
 
 # Excel Jobs File Configuration
 EXCEL_JOBS_FILE = os.getenv("EXCEL_JOBS_FILE", "VMS Job Fiule.xlsx")
-UPLOADED_EXCEL_FILE: Optional[str] = None  # Track admin-uploaded Excel file
+UPLOADED_EXCEL_FILES: List[str] = []  # Track admin-uploaded Excel files (multiple files supported)
 
 # Ensure directories exist
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -1209,13 +1209,15 @@ async def upload_excel_jobs(
 ):
     """Upload Excel file with job data (admin only).
     
+    Jobs from uploaded files are COMBINED with original VMS Job Fiule.xlsx jobs.
+    
     Expected columns: Job Code, Location, Job title, Status, EndClient, Salary, 
     Job Description, Start Date, Profession, Specialty, State, # of Open Positions,
     # of Total Positions, Duration Description, Segment Names
     
     Note: 'Job title' column is supported in addition to 'Job Type'
     """
-    global UPLOADED_EXCEL_FILE
+    global UPLOADED_EXCEL_FILES
     
     # Verify admin
     is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
@@ -1240,25 +1242,96 @@ async def upload_excel_jobs(
             content = await file.read()
             f.write(content)
         
-        # Update global variable to use this file
-        UPLOADED_EXCEL_FILE = file_path
+        # Add to list of uploaded files (append, don't replace)
+        UPLOADED_EXCEL_FILES.append(file_path)
         
         # Clear cache to force reload
         clear_excel_jobs_cache()
         
-        # Test loading the file
-        jobs = load_excel_jobs()
+        # Test loading all files
+        all_jobs = load_excel_jobs()
+        
+        # Get count from just this file
+        new_file_jobs = load_excel_jobs_from_file(file_path)
         
         return {
-            "message": f"Excel file uploaded successfully. Loaded {len(jobs)} jobs.",
+            "message": f"Excel file uploaded successfully. Added {len(new_file_jobs)} jobs from this file. Total jobs now: {len(all_jobs)}",
             "filename": file.filename,
-            "jobs_count": len(jobs),
+            "new_jobs_count": len(new_file_jobs),
+            "total_jobs_count": len(all_jobs),
+            "uploaded_files_count": len(UPLOADED_EXCEL_FILES),
             "file_path": file_path
         }
         
     except Exception as e:
         print(f"[Excel Upload] Error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to upload Excel file: {str(e)}")
+
+@app.get("/api/admin/jobs/excel-files")
+async def list_uploaded_excel_files(current_user: UserDB = Depends(get_current_user)):
+    """List all uploaded Excel files (admin only)"""
+    is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Only admin can view uploaded files")
+    
+    files_info = []
+    for idx, file_path in enumerate(UPLOADED_EXCEL_FILES):
+        if os.path.exists(file_path):
+            files_info.append({
+                "index": idx,
+                "filename": os.path.basename(file_path),
+                "path": file_path,
+                "exists": True
+            })
+        else:
+            files_info.append({
+                "index": idx,
+                "filename": os.path.basename(file_path),
+                "path": file_path,
+                "exists": False
+            })
+    
+    return {
+        "original_file": EXCEL_JOBS_FILE,
+        "original_exists": os.path.exists(EXCEL_JOBS_FILE),
+        "uploaded_files": files_info,
+        "total_uploaded": len(UPLOADED_EXCEL_FILES)
+    }
+
+@app.delete("/api/admin/jobs/excel-files/{file_index}")
+async def remove_uploaded_excel_file(
+    file_index: int,
+    current_user: UserDB = Depends(get_current_user)
+):
+    """Remove a specific uploaded Excel file by index (admin only)"""
+    global UPLOADED_EXCEL_FILES
+    
+    is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Only admin can remove uploaded files")
+    
+    if file_index < 0 or file_index >= len(UPLOADED_EXCEL_FILES):
+        raise HTTPException(status_code=404, detail=f"File index {file_index} not found")
+    
+    file_path = UPLOADED_EXCEL_FILES[file_index]
+    filename = os.path.basename(file_path)
+    
+    # Remove file from disk if exists
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        print(f"[Excel] Deleted file: {file_path}")
+    
+    # Remove from list
+    UPLOADED_EXCEL_FILES.pop(file_index)
+    
+    # Clear cache to force reload
+    clear_excel_jobs_cache()
+    
+    return {
+        "message": f"Excel file '{filename}' removed successfully",
+        "removed_file": filename,
+        "remaining_uploaded_files": len(UPLOADED_EXCEL_FILES)
+    }
 
 @app.get("/api/auth/me", response_model=UserResponse)
 async def get_current_user_info(current_user: UserDB = Depends(get_current_user)):
@@ -1289,44 +1362,26 @@ _excel_jobs_cache_time: Optional[datetime] = None
 
 EXCEL_CACHE_MINUTES = 1440  # Cache Excel jobs for 24 hours (1 day) - Excel jobs are static
 
-def load_excel_jobs() -> List[Job]:
-    """Load jobs from Excel file and convert to Job models with caching.
+def load_excel_jobs_from_file(file_path: str) -> List[Job]:
+    """Load jobs from a single Excel file.
     
-    Uses uploaded Excel file if available, otherwise falls back to default file.
-    
-    Excel columns expected:
-    Job Code, Location, Job Type (or Job title), Status, EndClient, Salary, Job Description,
-    Start Date, Profession, Specialty, State, # of Open Positions,
-    # of Total Positions, Duration Description, Segment Names
+    Returns list of Job models parsed from the file.
     """
-    global _excel_jobs_cache, _excel_jobs_cache_time
-    
-    # Return cached jobs if less than cache duration old
-    if _excel_jobs_cache and _excel_jobs_cache_time:
-        age = datetime.now() - _excel_jobs_cache_time
-        if age < timedelta(minutes=EXCEL_CACHE_MINUTES):
-            print(f"[Excel] Using cached jobs ({len(_excel_jobs_cache)} jobs, cached {age.seconds}s ago)")
-            return _excel_jobs_cache
-    
     jobs: List[Job] = []
     
-    # Determine which file to use: uploaded file takes priority
-    excel_file = UPLOADED_EXCEL_FILE if UPLOADED_EXCEL_FILE and os.path.exists(UPLOADED_EXCEL_FILE) else EXCEL_JOBS_FILE
-    
-    # Check if file exists
-    if not os.path.exists(excel_file):
-        print(f"[Excel] File not found: {excel_file}")
+    if not os.path.exists(file_path):
+        print(f"[Excel] File not found: {file_path}")
         return jobs
     
     try:
         import pandas as pd
         
-        print(f"[Excel] Reading jobs from {excel_file}...")
+        print(f"[Excel] Reading jobs from {file_path}...")
         
         # Read only necessary columns to reduce memory
-        df = pd.read_excel(excel_file)
+        df = pd.read_excel(file_path)
         
-        print(f"[Excel] Loaded {len(df)} rows from Excel")
+        print(f"[Excel] Loaded {len(df)} rows from {os.path.basename(file_path)}")
         
         # Normalize column names (strip spaces, lowercase for matching)
         col_mapping = {}
@@ -1425,19 +1480,64 @@ def load_excel_jobs() -> List[Job]:
                 jobs.append(job)
                 
             except Exception as e:
-                print(f"[Excel] Error parsing row {idx}: {e}")
+                print(f"[Excel] Error parsing row {idx} in {os.path.basename(file_path)}: {e}")
                 continue
         
-        print(f"[Excel] Successfully parsed {len(jobs)} jobs from Excel")
-        
-        # Cache the jobs
-        _excel_jobs_cache = jobs
-        _excel_jobs_cache_time = datetime.now()
+        print(f"[Excel] Successfully parsed {len(jobs)} jobs from {os.path.basename(file_path)}")
         
     except Exception as e:
-        print(f"[Excel] Error reading Excel file: {e}")
+        print(f"[Excel] Error reading file {file_path}: {e}")
     
     return jobs
+
+
+def load_excel_jobs() -> List[Job]:
+    """Load jobs from ALL Excel files (original + uploaded) and combine them.
+    
+    Loads from:
+    1. Original file: VMS Job Fiule.xlsx
+    2. All uploaded files in UPLOADED_EXCEL_FILES list
+    
+    Returns combined list of all jobs from all files.
+    """
+    global _excel_jobs_cache, _excel_jobs_cache_time
+    
+    # Return cached jobs if less than cache duration old
+    if _excel_jobs_cache and _excel_jobs_cache_time:
+        age = datetime.now() - _excel_jobs_cache_time
+        if age < timedelta(minutes=EXCEL_CACHE_MINUTES):
+            print(f"[Excel] Using cached jobs ({len(_excel_jobs_cache)} jobs, cached {age.seconds}s ago)")
+            return _excel_jobs_cache
+    
+    all_jobs: List[Job] = []
+    
+    # Load from original file first
+    if os.path.exists(EXCEL_JOBS_FILE):
+        original_jobs = load_excel_jobs_from_file(EXCEL_JOBS_FILE)
+        all_jobs.extend(original_jobs)
+        print(f"[Excel] Original file: {len(original_jobs)} jobs")
+    else:
+        print(f"[Excel] Original file not found: {EXCEL_JOBS_FILE}")
+    
+    # Load from all uploaded files
+    uploaded_count = 0
+    for uploaded_file in UPLOADED_EXCEL_FILES:
+        if os.path.exists(uploaded_file):
+            uploaded_jobs = load_excel_jobs_from_file(uploaded_file)
+            all_jobs.extend(uploaded_jobs)
+            uploaded_count += len(uploaded_jobs)
+            print(f"[Excel] Uploaded file {os.path.basename(uploaded_file)}: {len(uploaded_jobs)} jobs")
+        else:
+            print(f"[Excel] Uploaded file not found: {uploaded_file}")
+    
+    print(f"[Excel] Total jobs from all files: {len(all_jobs)} (original + {uploaded_count} from uploads)")
+    
+    # Cache the combined jobs
+    _excel_jobs_cache = all_jobs
+    _excel_jobs_cache_time = datetime.now()
+    
+    return all_jobs
+
 
 def clear_excel_jobs_cache():
     """Clear the Excel jobs cache to force reload on next request"""
