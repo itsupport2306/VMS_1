@@ -1461,6 +1461,11 @@ function showEmailVendorModal(candidate) {
     }
     btn.disabled = true;
     btn.textContent = 'Sending...';
+
+    // Abort the request after 45s so the modal never appears hung. SendGrid normally responds in
+    // under 5s; anything longer almost certainly means a server-side problem worth surfacing.
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 45000);
     try {
       const res = await fetch(`${API_BASE}/api/candidates/${encodeURIComponent(btn.dataset.candidateId)}/notify-vendor`, {
         method: 'POST',
@@ -1469,7 +1474,9 @@ function showEmailVendorModal(candidate) {
           ...(authToken ? { 'Authorization': `Bearer ${authToken}` } : {}),
         },
         body: JSON.stringify({ subject, message }),
+        signal: controller.signal,
       });
+      clearTimeout(timeoutId);
       if (res.status === 401) { logout(); return; }
       const text = await res.text();
       let json; try { json = JSON.parse(text); } catch { json = { detail: text }; }
@@ -1477,7 +1484,11 @@ function showEmailVendorModal(candidate) {
       showAlert('ok', `Email sent to ${json.vendor_email}`);
       closeEmailVendorModal();
     } catch (err) {
-      errEl.textContent = err.message || 'Failed to send email.';
+      clearTimeout(timeoutId);
+      const msg = err.name === 'AbortError'
+        ? 'Request timed out after 45s. Check Render logs for [NotifyVendor] / [VendorMail] entries.'
+        : (err.message || 'Failed to send email.');
+      errEl.textContent = msg;
       errEl.style.display = 'block';
       btn.disabled = false;
       btn.textContent = 'Send';
