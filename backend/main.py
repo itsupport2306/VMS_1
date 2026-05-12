@@ -203,9 +203,18 @@ def send_submission_notification_email(candidate_data: dict, vendor_info: dict) 
             html_content=html_content
         )
 
+        import time
         sg = SendGridAPIClient(SENDGRID_API_KEY)
+        t0 = time.monotonic()
         response = sg.send(message)
-        print(f"[Email] Submission notification sent to {recipients}, status: {response.status_code}")
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        msg_id = None
+        try:
+            headers = getattr(response, "headers", {}) or {}
+            msg_id = headers.get("X-Message-Id") if hasattr(headers, "get") else None
+        except Exception:
+            pass
+        print(f"[SubmissionMail] SendGrid responded in {elapsed_ms}ms status={response.status_code} msg_id={msg_id} recipients={recipients}")
         return response.status_code == 202
     except Exception as e:
         import traceback
@@ -218,25 +227,32 @@ def send_submission_notification_email(candidate_data: dict, vendor_info: dict) 
 
 
 def send_vendor_message_email(vendor_email: str, vendor_name: str, subject: str, message_body: str,
-                              candidate_name: str, job_title: str, job_id: str) -> bool:
+                              candidate_name: str, job_title: str, job_id: str) -> tuple:
     """Send a free-form message from admin to a vendor about one of their candidate submissions.
 
     Used by the "Email Vendor" action in the admin submissions UI so admins can update vendors
     on submission status (interview, decline, offer details, etc.).
+
+    Returns (success: bool, detail: str). detail carries the SendGrid status or error reason for
+    surfacing to the admin UI so silent failures don't look like a hung "Sending..." state.
     """
+    print(f"[VendorMail] Begin send to '{vendor_email}' subject='{subject[:60]}' from={SENDGRID_FROM_EMAIL}")
     if not SENDGRID_API_KEY:
-        print(f"[Email] SendGrid not configured — cannot send vendor message to {vendor_email}")
-        return False
+        print("[VendorMail] SendGrid API key not configured")
+        return False, "SendGrid not configured on server"
+    if not vendor_email:
+        return False, "Vendor email is empty"
+
     try:
         from sendgrid import SendGridAPIClient
         from sendgrid.helpers.mail import Mail
-
-        # Render the admin's message as HTML, preserving line breaks.
         from html import escape
+
         safe_body = escape(message_body).replace("\n", "<br>")
+        safe_vendor_name = escape(vendor_name) if vendor_name else "Vendor"
 
         html_content = f'''
-            <p>Hello {escape(vendor_name) or "Vendor"},</p>
+            <p>Hello {safe_vendor_name},</p>
             <p>This message is regarding your submission below.</p>
             <table style="border-collapse: collapse; width: 100%; max-width: 600px; margin: 12px 0;">
                 <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Candidate:</td><td style="padding: 8px; border: 1px solid #ddd;">{escape(candidate_name)}</td></tr>
@@ -257,13 +273,29 @@ def send_vendor_message_email(vendor_email: str, vendor_name: str, subject: str,
             subject=subject,
             html_content=html_content,
         )
+
+        import time
         sg = SendGridAPIClient(SENDGRID_API_KEY)
+        t0 = time.monotonic()
         response = sg.send(message)
-        print(f"[Email] Vendor message sent to {vendor_email}, status: {response.status_code}")
-        return response.status_code == 202
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        status = getattr(response, "status_code", None)
+        # Log response headers for debugging delivery issues (X-Message-Id helps trace in SendGrid dashboard).
+        msg_id = None
+        try:
+            headers = getattr(response, "headers", {}) or {}
+            msg_id = headers.get("X-Message-Id") if hasattr(headers, "get") else None
+        except Exception:
+            pass
+        print(f"[VendorMail] SendGrid responded in {elapsed_ms}ms status={status} msg_id={msg_id}")
+        if status == 202:
+            return True, f"Accepted by SendGrid (msg_id={msg_id or 'n/a'})"
+        return False, f"SendGrid rejected with status {status}"
     except Exception as e:
-        print(f"[Email] Error sending vendor message to {vendor_email}: {e}")
-        return False
+        import traceback
+        print(f"[VendorMail] Exception sending to {vendor_email}: {e}")
+        print(f"[VendorMail] Traceback: {traceback.format_exc()}")
+        return False, f"SendGrid error: {type(e).__name__}: {e}"
 
 
 # Statuses that count as "open" upstream and "closed" downstream.
@@ -2705,7 +2737,13 @@ async def submit_candidate(
             "id": current_user.id
         }
         print(f"[Submissions] Attempting to send notification email to {SUBMISSION_NOTIFICATION_RECIPIENTS}")
-        email_sent = send_submission_notification_email(candidate_doc, vendor_info)
+        # Run the synchronous SendGrid call off the event loop so it doesn't stall other requests
+        # if SendGrid is slow. Failure to email is non-fatal — the candidate is already stored.
+        try:
+            email_sent = await asyncio.to_thread(send_submission_notification_email, candidate_doc, vendor_info)
+        except Exception as e:
+            print(f"[Submissions] Exception during notification email dispatch: {e}")
+            email_sent = False
         if email_sent:
             print(f"[Submissions] Notification email sent for candidate {candidate_id}")
         else:
@@ -2856,6 +2894,7 @@ async def notify_vendor_about_submission(
     current_user: UserDB = Depends(get_current_user),
 ):
     """Admin-only: email the vendor who submitted this candidate with a free-form message."""
+    print(f"[NotifyVendor] Request for candidate_id={candidate_id} by user={current_user.email}")
     is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
     if not is_admin:
         raise HTTPException(status_code=403, detail="Only admin can email vendors")
@@ -2882,26 +2921,34 @@ async def notify_vendor_about_submission(
                 pass
 
     if candidate is None:
+        print(f"[NotifyVendor] Candidate {candidate_id} not found")
         raise HTTPException(status_code=404, detail="Candidate not found")
 
     vendor_email = (candidate.get("submitted_by_email") or "").strip()
     if not vendor_email:
+        print(f"[NotifyVendor] Candidate {candidate_id} has no submitted_by_email")
         raise HTTPException(status_code=400, detail="Vendor email is missing on this submission")
 
-    email_sent = send_vendor_message_email(
-        vendor_email=vendor_email,
-        vendor_name=candidate.get("submitted_by_name") or "",
-        subject=subject,
-        message_body=message_body,
-        candidate_name=candidate.get("name") or "",
-        job_title=candidate.get("job_title") or "",
-        job_id=candidate.get("job_id") or "",
+    print(f"[NotifyVendor] Dispatching SendGrid send to {vendor_email}")
+    # Run the blocking SendGrid call in a worker thread so it doesn't block the FastAPI event loop
+    # (the SendGrid Python SDK is synchronous and can take several seconds, which would otherwise
+    # stall every other request on this Render worker, making login + /api/jobs feel hung).
+    success, detail = await asyncio.to_thread(
+        send_vendor_message_email,
+        vendor_email,
+        candidate.get("submitted_by_name") or "",
+        subject,
+        message_body,
+        candidate.get("name") or "",
+        candidate.get("job_title") or "",
+        candidate.get("job_id") or "",
     )
+    print(f"[NotifyVendor] Result success={success} detail={detail}")
 
-    if not email_sent:
-        raise HTTPException(status_code=502, detail="Failed to send email — check SendGrid configuration")
+    if not success:
+        raise HTTPException(status_code=502, detail=detail)
 
-    return {"message": "Email sent", "vendor_email": vendor_email, "candidate_id": candidate_id}
+    return {"message": "Email sent", "vendor_email": vendor_email, "candidate_id": candidate_id, "detail": detail}
 
 
 @app.get("/api/resumes/{candidate_id}")
