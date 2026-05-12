@@ -1125,9 +1125,10 @@ async function loadSubmissions() {
           ` : `<span class="status-badge status-${c.status || 'submitted'}">${(c.status || 'submitted').toUpperCase()}</span>`}
         </td>
         <td><button class="btn btn--secondary view-resume-btn" data-path="${c.resume_path || ''}">View Resume</button></td>
+        ${isUserAdmin ? `<td><button class="btn btn--secondary email-vendor-btn" data-candidate-id="${c.id}">Email Vendor</button></td>` : ''}
       </tr>
     `).join('');
-    
+
     els.submissionsTable.innerHTML = `
       <div class="panel">
         <div class="panel__title">Submissions (${items.length})</div>
@@ -1145,6 +1146,7 @@ async function loadSubmissions() {
                 <th>Submitted</th>
                 <th>Status</th>
                 <th>Resume</th>
+                ${isUserAdmin ? '<th>Action</th>' : ''}
               </tr>
             </thead>
             <tbody>
@@ -1180,6 +1182,15 @@ async function loadSubmissions() {
             // Revert to original status on error
             e.target.value = e.target.querySelector('option[selected]')?.value || 'submitted';
           }
+        });
+      });
+
+      // Email Vendor buttons (admin only) — open compose modal pre-filled with candidate context.
+      document.querySelectorAll('.email-vendor-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          const row = e.target.closest('tr');
+          const candidate = JSON.parse(row.dataset.candidate);
+          showEmailVendorModal(candidate);
         });
       });
     }
@@ -1393,6 +1404,89 @@ function showVendorDetailsModal(vendor) {
 
 function closeVendorDetailModal() {
   const modal = document.getElementById('vendorDetailModal');
+  if (modal) modal.remove();
+}
+
+function showEmailVendorModal(candidate) {
+  closeEmailVendorModal();
+
+  const vendorName = candidate.submitted_by_name || 'Vendor';
+  const vendorEmail = candidate.submitted_by_email || '';
+  const candidateName = candidate.name || '';
+  const jobTitle = candidate.job_title || '';
+  const jobId = candidate.job_id || '';
+  const candidateId = candidate.id || '';
+  const defaultSubject = `Update on your submission: ${candidateName} for ${jobTitle}`;
+
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  modal.id = 'emailVendorModal';
+  modal.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;z-index:10000;display:flex;align-items:center;justify-content:center;';
+  modal.innerHTML = `
+    <div class="modal__overlay" onclick="closeEmailVendorModal()" style="position:absolute;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:1;"></div>
+    <div class="modal__content" style="position:relative;z-index:2;width:560px;max-width:92vw;max-height:85vh;background:white;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,0.3);display:flex;flex-direction:column;">
+      <div class="modal__header" style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-shrink:0;">
+        <h3 style="margin:0;font-size:18px;">Email Vendor</h3>
+        <button class="modal__close" onclick="closeEmailVendorModal()" style="background:none;border:none;font-size:24px;cursor:pointer;color:#6b7280;">&times;</button>
+      </div>
+      <div class="modal__body" style="padding:20px;overflow-y:auto;flex:1;">
+        <div style="margin-bottom:12px;color:#374151;font-size:13px;">
+          <div><strong>To:</strong> ${vendorName} &lt;${vendorEmail || '<em>missing</em>'}&gt;</div>
+          <div><strong>Re:</strong> ${candidateName} — ${jobTitle} (${jobId})</div>
+        </div>
+        <label style="display:block;margin-top:12px;font-weight:600;font-size:13px;">Subject</label>
+        <input id="emailVendorSubject" type="text" value="${defaultSubject.replace(/"/g, '&quot;')}" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;margin-top:4px;" />
+        <label style="display:block;margin-top:12px;font-weight:600;font-size:13px;">Message</label>
+        <textarea id="emailVendorMessage" rows="8" placeholder="Write your message to the vendor..." style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;margin-top:4px;font-family:inherit;font-size:14px;resize:vertical;"></textarea>
+        <div id="emailVendorError" style="color:#dc2626;font-size:13px;margin-top:8px;display:none;"></div>
+      </div>
+      <div class="modal__footer" style="padding:16px 20px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px;flex-shrink:0;">
+        <button class="btn btn--secondary" onclick="closeEmailVendorModal()">Cancel</button>
+        <button class="btn btn--primary" id="emailVendorSendBtn" data-candidate-id="${candidateId}" ${vendorEmail ? '' : 'disabled'}>Send</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+
+  document.getElementById('emailVendorSendBtn').addEventListener('click', async (e) => {
+    const btn = e.target;
+    const subject = (document.getElementById('emailVendorSubject').value || '').trim();
+    const message = (document.getElementById('emailVendorMessage').value || '').trim();
+    const errEl = document.getElementById('emailVendorError');
+    errEl.style.display = 'none';
+    if (!subject || !message) {
+      errEl.textContent = 'Subject and message are required.';
+      errEl.style.display = 'block';
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = 'Sending...';
+    try {
+      const res = await fetch(`${API_BASE}/api/candidates/${encodeURIComponent(btn.dataset.candidateId)}/notify-vendor`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(authToken ? { 'Authorization': `Bearer ${authToken}` } : {}),
+        },
+        body: JSON.stringify({ subject, message }),
+      });
+      if (res.status === 401) { logout(); return; }
+      const text = await res.text();
+      let json; try { json = JSON.parse(text); } catch { json = { detail: text }; }
+      if (!res.ok) throw new Error(json.detail || `HTTP ${res.status}`);
+      showAlert('ok', `Email sent to ${json.vendor_email}`);
+      closeEmailVendorModal();
+    } catch (err) {
+      errEl.textContent = err.message || 'Failed to send email.';
+      errEl.style.display = 'block';
+      btn.disabled = false;
+      btn.textContent = 'Send';
+    }
+  });
+}
+
+function closeEmailVendorModal() {
+  const modal = document.getElementById('emailVendorModal');
   if (modal) modal.remove();
 }
 

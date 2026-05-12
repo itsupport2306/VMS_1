@@ -90,6 +90,15 @@ APP_URL = os.getenv("APP_URL", "https://vms-1-xlkv.onrender.com")  # Your Render
 JOB_CLOSURE_NOTIFICATIONS_ENABLED = os.getenv("JOB_CLOSURE_NOTIFICATIONS_ENABLED", "false").lower() == "true"
 JOB_CLOSURE_PER_RUN_CAP = int(os.getenv("JOB_CLOSURE_PER_RUN_CAP", "25"))
 
+# Recipients for new-submission notification emails. Comma-separated env var; defaults include
+# the team mailbox plus admin so internal stakeholders see every submission.
+SUBMISSION_NOTIFICATION_RECIPIENTS = [
+    addr.strip() for addr in os.getenv(
+        "SUBMISSION_NOTIFICATION_RECIPIENTS",
+        "support.vms@radixsol.com,admin@radixsol.com",
+    ).split(",") if addr.strip()
+]
+
 # In-memory password reset token storage (expires after 1 hour)
 # Structure: {token: {email: str, expires: datetime, used: bool}}
 _password_reset_tokens = {}
@@ -186,16 +195,17 @@ def send_submission_notification_email(candidate_data: dict, vendor_info: dict) 
             </p>
         '''
         
+        recipients = SUBMISSION_NOTIFICATION_RECIPIENTS or [ADMIN_EMAIL]
         message = Mail(
             from_email=SENDGRID_FROM_EMAIL,
-            to_emails=ADMIN_EMAIL,  # Send to admin
+            to_emails=recipients,
             subject=f'New Candidate Submission: {candidate_name} for {job_title}',
             html_content=html_content
         )
-        
+
         sg = SendGridAPIClient(SENDGRID_API_KEY)
         response = sg.send(message)
-        print(f"[Email] Submission notification sent to admin, status: {response.status_code}")
+        print(f"[Email] Submission notification sent to {recipients}, status: {response.status_code}")
         return response.status_code == 202
     except Exception as e:
         import traceback
@@ -203,8 +213,58 @@ def send_submission_notification_email(candidate_data: dict, vendor_info: dict) 
         print(f"[Email] Traceback: {traceback.format_exc()}")
         print(f"[Email] SendGrid API Key present: {bool(SENDGRID_API_KEY)}")
         print(f"[Email] From email: {SENDGRID_FROM_EMAIL}")
-        print(f"[Email] To email: {ADMIN_EMAIL}")
+        print(f"[Email] Recipients: {SUBMISSION_NOTIFICATION_RECIPIENTS}")
         return False
+
+
+def send_vendor_message_email(vendor_email: str, vendor_name: str, subject: str, message_body: str,
+                              candidate_name: str, job_title: str, job_id: str) -> bool:
+    """Send a free-form message from admin to a vendor about one of their candidate submissions.
+
+    Used by the "Email Vendor" action in the admin submissions UI so admins can update vendors
+    on submission status (interview, decline, offer details, etc.).
+    """
+    if not SENDGRID_API_KEY:
+        print(f"[Email] SendGrid not configured — cannot send vendor message to {vendor_email}")
+        return False
+    try:
+        from sendgrid import SendGridAPIClient
+        from sendgrid.helpers.mail import Mail
+
+        # Render the admin's message as HTML, preserving line breaks.
+        from html import escape
+        safe_body = escape(message_body).replace("\n", "<br>")
+
+        html_content = f'''
+            <p>Hello {escape(vendor_name) or "Vendor"},</p>
+            <p>This message is regarding your submission below.</p>
+            <table style="border-collapse: collapse; width: 100%; max-width: 600px; margin: 12px 0;">
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Candidate:</td><td style="padding: 8px; border: 1px solid #ddd;">{escape(candidate_name)}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Job Title:</td><td style="padding: 8px; border: 1px solid #ddd;">{escape(job_title)}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Job ID:</td><td style="padding: 8px; border: 1px solid #ddd;">{escape(job_id)}</td></tr>
+            </table>
+            <div style="padding: 12px; border-left: 3px solid #7c3aed; background: #faf9ff; margin: 12px 0;">
+                {safe_body}
+            </div>
+            <p style="color: #666; font-size: 12px; margin-top: 30px;">
+                Sent from the Vendor Management System. Reply to this email to contact us.
+            </p>
+        '''
+
+        message = Mail(
+            from_email=SENDGRID_FROM_EMAIL,
+            to_emails=vendor_email,
+            subject=subject,
+            html_content=html_content,
+        )
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        response = sg.send(message)
+        print(f"[Email] Vendor message sent to {vendor_email}, status: {response.status_code}")
+        return response.status_code == 202
+    except Exception as e:
+        print(f"[Email] Error sending vendor message to {vendor_email}: {e}")
+        return False
+
 
 # Statuses that count as "open" upstream and "closed" downstream.
 # A genuine closure is any status crossing from OPEN_STATUSES → CLOSED_STATUSES.
@@ -1035,6 +1095,11 @@ async def login(user_data: UserLogin):
 
 class ForgotPasswordRequest(BaseModel):
     email: str
+
+class VendorMessageRequest(BaseModel):
+    subject: str
+    message: str
+
 
 class ResetPasswordWithToken(BaseModel):
     token: str
@@ -2639,10 +2704,10 @@ async def submit_candidate(
             "email": current_user.email,
             "id": current_user.id
         }
-        print(f"[Submissions] Attempting to send notification email to {ADMIN_EMAIL}")
+        print(f"[Submissions] Attempting to send notification email to {SUBMISSION_NOTIFICATION_RECIPIENTS}")
         email_sent = send_submission_notification_email(candidate_doc, vendor_info)
         if email_sent:
-            print(f"[Submissions] Notification email sent to admin for candidate {candidate_id}")
+            print(f"[Submissions] Notification email sent for candidate {candidate_id}")
         else:
             print(f"[Submissions] Failed to send notification email for candidate {candidate_id}")
         
@@ -2782,6 +2847,62 @@ async def update_candidate_status(
     except Exception as e:
         print(f"[Submissions] Error updating status: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to update status: {str(e)}")
+
+
+@app.post("/api/candidates/{candidate_id}/notify-vendor")
+async def notify_vendor_about_submission(
+    candidate_id: str,
+    payload: VendorMessageRequest,
+    current_user: UserDB = Depends(get_current_user),
+):
+    """Admin-only: email the vendor who submitted this candidate with a free-form message."""
+    is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Only admin can email vendors")
+
+    subject = (payload.subject or "").strip()
+    message_body = (payload.message or "").strip()
+    if not subject or not message_body:
+        raise HTTPException(status_code=400, detail="Subject and message are required")
+
+    # Look up candidate (Mongo first, JSON fallback)
+    candidate = None
+    if mongodb_enabled and candidates_collection is not None:
+        candidate = candidates_collection.find_one({"id": candidate_id})
+    if candidate is None:
+        candidates_file = os.path.join(DATA_DIR, "candidates.json")
+        if os.path.exists(candidates_file):
+            try:
+                with open(candidates_file, "r") as f:
+                    for c in json.load(f):
+                        if c.get("id") == candidate_id:
+                            candidate = c
+                            break
+            except Exception:
+                pass
+
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    vendor_email = (candidate.get("submitted_by_email") or "").strip()
+    if not vendor_email:
+        raise HTTPException(status_code=400, detail="Vendor email is missing on this submission")
+
+    email_sent = send_vendor_message_email(
+        vendor_email=vendor_email,
+        vendor_name=candidate.get("submitted_by_name") or "",
+        subject=subject,
+        message_body=message_body,
+        candidate_name=candidate.get("name") or "",
+        job_title=candidate.get("job_title") or "",
+        job_id=candidate.get("job_id") or "",
+    )
+
+    if not email_sent:
+        raise HTTPException(status_code=502, detail="Failed to send email — check SendGrid configuration")
+
+    return {"message": "Email sent", "vendor_email": vendor_email, "candidate_id": candidate_id}
+
 
 @app.get("/api/resumes/{candidate_id}")
 async def download_resume(candidate_id: str):
