@@ -90,6 +90,15 @@ APP_URL = os.getenv("APP_URL", "https://vms-1-xlkv.onrender.com")  # Your Render
 JOB_CLOSURE_NOTIFICATIONS_ENABLED = os.getenv("JOB_CLOSURE_NOTIFICATIONS_ENABLED", "false").lower() == "true"
 JOB_CLOSURE_PER_RUN_CAP = int(os.getenv("JOB_CLOSURE_PER_RUN_CAP", "25"))
 
+# Recipients for new-submission notification emails. Comma-separated env var; defaults include
+# the team mailbox plus admin so internal stakeholders see every submission.
+SUBMISSION_NOTIFICATION_RECIPIENTS = [
+    addr.strip() for addr in os.getenv(
+        "SUBMISSION_NOTIFICATION_RECIPIENTS",
+        "support.vms@radixsol.com,admin@radixsol.com",
+    ).split(",") if addr.strip()
+]
+
 # In-memory password reset token storage (expires after 1 hour)
 # Structure: {token: {email: str, expires: datetime, used: bool}}
 _password_reset_tokens = {}
@@ -186,16 +195,17 @@ def send_submission_notification_email(candidate_data: dict, vendor_info: dict) 
             </p>
         '''
         
+        recipients = SUBMISSION_NOTIFICATION_RECIPIENTS or [ADMIN_EMAIL]
         message = Mail(
             from_email=SENDGRID_FROM_EMAIL,
-            to_emails=ADMIN_EMAIL,  # Send to admin
+            to_emails=recipients,
             subject=f'New Candidate Submission: {candidate_name} for {job_title}',
             html_content=html_content
         )
-        
+
         sg = SendGridAPIClient(SENDGRID_API_KEY)
         response = sg.send(message)
-        print(f"[Email] Submission notification sent to admin, status: {response.status_code}")
+        print(f"[Email] Submission notification sent to {recipients}, status: {response.status_code}")
         return response.status_code == 202
     except Exception as e:
         import traceback
@@ -203,8 +213,58 @@ def send_submission_notification_email(candidate_data: dict, vendor_info: dict) 
         print(f"[Email] Traceback: {traceback.format_exc()}")
         print(f"[Email] SendGrid API Key present: {bool(SENDGRID_API_KEY)}")
         print(f"[Email] From email: {SENDGRID_FROM_EMAIL}")
-        print(f"[Email] To email: {ADMIN_EMAIL}")
+        print(f"[Email] Recipients: {SUBMISSION_NOTIFICATION_RECIPIENTS}")
         return False
+
+
+def send_vendor_message_email(vendor_email: str, vendor_name: str, subject: str, message_body: str,
+                              candidate_name: str, job_title: str, job_id: str) -> bool:
+    """Send a free-form message from admin to a vendor about one of their candidate submissions.
+
+    Used by the "Email Vendor" action in the admin submissions UI so admins can update vendors
+    on submission status (interview, decline, offer details, etc.).
+    """
+    if not SENDGRID_API_KEY:
+        print(f"[Email] SendGrid not configured — cannot send vendor message to {vendor_email}")
+        return False
+    try:
+        from sendgrid import SendGridAPIClient
+        from sendgrid.helpers.mail import Mail
+
+        # Render the admin's message as HTML, preserving line breaks.
+        from html import escape
+        safe_body = escape(message_body).replace("\n", "<br>")
+
+        html_content = f'''
+            <p>Hello {escape(vendor_name) or "Vendor"},</p>
+            <p>This message is regarding your submission below.</p>
+            <table style="border-collapse: collapse; width: 100%; max-width: 600px; margin: 12px 0;">
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Candidate:</td><td style="padding: 8px; border: 1px solid #ddd;">{escape(candidate_name)}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Job Title:</td><td style="padding: 8px; border: 1px solid #ddd;">{escape(job_title)}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Job ID:</td><td style="padding: 8px; border: 1px solid #ddd;">{escape(job_id)}</td></tr>
+            </table>
+            <div style="padding: 12px; border-left: 3px solid #7c3aed; background: #faf9ff; margin: 12px 0;">
+                {safe_body}
+            </div>
+            <p style="color: #666; font-size: 12px; margin-top: 30px;">
+                Sent from the Vendor Management System. Reply to this email to contact us.
+            </p>
+        '''
+
+        message = Mail(
+            from_email=SENDGRID_FROM_EMAIL,
+            to_emails=vendor_email,
+            subject=subject,
+            html_content=html_content,
+        )
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        response = sg.send(message)
+        print(f"[Email] Vendor message sent to {vendor_email}, status: {response.status_code}")
+        return response.status_code == 202
+    except Exception as e:
+        print(f"[Email] Error sending vendor message to {vendor_email}: {e}")
+        return False
+
 
 # Statuses that count as "open" upstream and "closed" downstream.
 # A genuine closure is any status crossing from OPEN_STATUSES → CLOSED_STATUSES.
@@ -815,6 +875,7 @@ MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 10485760))  # 10MB
 
 # Excel Jobs File Configuration
 EXCEL_JOBS_FILE = os.getenv("EXCEL_JOBS_FILE", "VMS Job Fiule.xlsx")
+UPLOADED_EXCEL_FILES: List[str] = []  # Track admin-uploaded Excel files (multiple files supported)
 
 # Ensure directories exist
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -1035,6 +1096,11 @@ async def login(user_data: UserLogin):
 class ForgotPasswordRequest(BaseModel):
     email: str
 
+class VendorMessageRequest(BaseModel):
+    subject: str
+    message: str
+
+
 class ResetPasswordWithToken(BaseModel):
     token: str
     password: str
@@ -1194,6 +1260,144 @@ async def remove_whitelisted_user(
     else:
         raise HTTPException(status_code=500, detail="Failed to save users file")
 
+def clear_excel_jobs_cache():
+    """Clear the Excel jobs cache to force reload on next request"""
+    global _excel_jobs_cache, _excel_jobs_cache_time
+    _excel_jobs_cache = None
+    _excel_jobs_cache_time = None
+    print("[Excel] Cache cleared")
+
+@app.post("/api/admin/jobs/upload-excel")
+async def upload_excel_jobs(
+    file: UploadFile = File(...),
+    current_user: UserDB = Depends(get_current_user)
+):
+    """Upload Excel file with job data (admin only).
+    
+    Jobs from uploaded files are COMBINED with original VMS Job Fiule.xlsx jobs.
+    
+    Expected columns: Job Code, Location, Job title, Status, EndClient, Salary, 
+    Job Description, Start Date, Profession, Specialty, State, # of Open Positions,
+    # of Total Positions, Duration Description, Segment Names
+    
+    Note: 'Job title' column is supported in addition to 'Job Type'
+    """
+    global UPLOADED_EXCEL_FILES
+    
+    # Verify admin
+    is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Only admin can upload Excel files")
+    
+    # Validate file type
+    if not file.filename.endswith(('.xlsx', '.xls')):
+        raise HTTPException(status_code=400, detail="Only Excel files (.xlsx, .xls) are allowed")
+    
+    try:
+        # Create upload directory if not exists
+        excel_upload_dir = os.path.join(DATA_DIR, "excel_uploads")
+        os.makedirs(excel_upload_dir, exist_ok=True)
+        
+        # Save file with timestamp to avoid conflicts
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_path = os.path.join(excel_upload_dir, f"jobs_{timestamp}_{file.filename}")
+        
+        # Write file
+        with open(file_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        
+        # Add to list of uploaded files (append, don't replace)
+        UPLOADED_EXCEL_FILES.append(file_path)
+        
+        # Clear cache to force reload
+        clear_excel_jobs_cache()
+        
+        # Test loading all files
+        all_jobs = load_excel_jobs()
+        
+        # Get count from just this file
+        new_file_jobs = load_excel_jobs_from_file(file_path)
+        
+        return {
+            "message": f"Excel file uploaded successfully. Added {len(new_file_jobs)} jobs from this file. Total jobs now: {len(all_jobs)}",
+            "filename": file.filename,
+            "new_jobs_count": len(new_file_jobs),
+            "total_jobs_count": len(all_jobs),
+            "uploaded_files_count": len(UPLOADED_EXCEL_FILES),
+            "file_path": file_path
+        }
+        
+    except Exception as e:
+        print(f"[Excel Upload] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to upload Excel file: {str(e)}")
+
+@app.get("/api/admin/jobs/excel-files")
+async def list_uploaded_excel_files(current_user: UserDB = Depends(get_current_user)):
+    """List all uploaded Excel files (admin only)"""
+    is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Only admin can view uploaded files")
+    
+    files_info = []
+    for idx, file_path in enumerate(UPLOADED_EXCEL_FILES):
+        if os.path.exists(file_path):
+            files_info.append({
+                "index": idx,
+                "filename": os.path.basename(file_path),
+                "path": file_path,
+                "exists": True
+            })
+        else:
+            files_info.append({
+                "index": idx,
+                "filename": os.path.basename(file_path),
+                "path": file_path,
+                "exists": False
+            })
+    
+    return {
+        "original_file": EXCEL_JOBS_FILE,
+        "original_exists": os.path.exists(EXCEL_JOBS_FILE),
+        "uploaded_files": files_info,
+        "total_uploaded": len(UPLOADED_EXCEL_FILES)
+    }
+
+@app.delete("/api/admin/jobs/excel-files/{file_index}")
+async def remove_uploaded_excel_file(
+    file_index: int,
+    current_user: UserDB = Depends(get_current_user)
+):
+    """Remove a specific uploaded Excel file by index (admin only)"""
+    global UPLOADED_EXCEL_FILES
+    
+    is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Only admin can remove uploaded files")
+    
+    if file_index < 0 or file_index >= len(UPLOADED_EXCEL_FILES):
+        raise HTTPException(status_code=404, detail=f"File index {file_index} not found")
+    
+    file_path = UPLOADED_EXCEL_FILES[file_index]
+    filename = os.path.basename(file_path)
+    
+    # Remove file from disk if exists
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        print(f"[Excel] Deleted file: {file_path}")
+    
+    # Remove from list
+    UPLOADED_EXCEL_FILES.pop(file_index)
+    
+    # Clear cache to force reload
+    clear_excel_jobs_cache()
+    
+    return {
+        "message": f"Excel file '{filename}' removed successfully",
+        "removed_file": filename,
+        "remaining_uploaded_files": len(UPLOADED_EXCEL_FILES)
+    }
+
 @app.get("/api/auth/me", response_model=UserResponse)
 async def get_current_user_info(current_user: UserDB = Depends(get_current_user)):
     """Get current logged in user info"""
@@ -1223,39 +1427,26 @@ _excel_jobs_cache_time: Optional[datetime] = None
 
 EXCEL_CACHE_MINUTES = 1440  # Cache Excel jobs for 24 hours (1 day) - Excel jobs are static
 
-def load_excel_jobs() -> List[Job]:
-    """Load jobs from Excel file and convert to Job models with caching.
+def load_excel_jobs_from_file(file_path: str) -> List[Job]:
+    """Load jobs from a single Excel file.
     
-    Excel columns expected:
-    Job Code, Location, Job Type, Status, EndClient, Salary, Job Description,
-    Start Date, Profession, Specialty, State, # of Open Positions,
-    # of Total Positions, Duration Description, Segment Names
+    Returns list of Job models parsed from the file.
     """
-    global _excel_jobs_cache, _excel_jobs_cache_time
-    
-    # Return cached jobs if less than 30 minutes old
-    if _excel_jobs_cache and _excel_jobs_cache_time:
-        age = datetime.now() - _excel_jobs_cache_time
-        if age < timedelta(minutes=EXCEL_CACHE_MINUTES):
-            print(f"[Excel] Using cached jobs ({len(_excel_jobs_cache)} jobs, cached {age.seconds}s ago)")
-            return _excel_jobs_cache
-    
     jobs: List[Job] = []
     
-    # Check if file exists
-    if not os.path.exists(EXCEL_JOBS_FILE):
-        print(f"[Excel] File not found: {EXCEL_JOBS_FILE}")
+    if not os.path.exists(file_path):
+        print(f"[Excel] File not found: {file_path}")
         return jobs
     
     try:
         import pandas as pd
         
-        print(f"[Excel] Reading jobs from {EXCEL_JOBS_FILE}...")
+        print(f"[Excel] Reading jobs from {file_path}...")
         
         # Read only necessary columns to reduce memory
-        df = pd.read_excel(EXCEL_JOBS_FILE)
+        df = pd.read_excel(file_path)
         
-        print(f"[Excel] Loaded {len(df)} rows from Excel")
+        print(f"[Excel] Loaded {len(df)} rows from {os.path.basename(file_path)}")
         
         # Normalize column names (strip spaces, lowercase for matching)
         col_mapping = {}
@@ -1354,19 +1545,64 @@ def load_excel_jobs() -> List[Job]:
                 jobs.append(job)
                 
             except Exception as e:
-                print(f"[Excel] Error parsing row {idx}: {e}")
+                print(f"[Excel] Error parsing row {idx} in {os.path.basename(file_path)}: {e}")
                 continue
         
-        print(f"[Excel] Successfully parsed {len(jobs)} jobs from Excel")
-        
-        # Cache the jobs
-        _excel_jobs_cache = jobs
-        _excel_jobs_cache_time = datetime.now()
+        print(f"[Excel] Successfully parsed {len(jobs)} jobs from {os.path.basename(file_path)}")
         
     except Exception as e:
-        print(f"[Excel] Error reading Excel file: {e}")
+        print(f"[Excel] Error reading file {file_path}: {e}")
     
     return jobs
+
+
+def load_excel_jobs() -> List[Job]:
+    """Load jobs from ALL Excel files (original + uploaded) and combine them.
+    
+    Loads from:
+    1. Original file: VMS Job Fiule.xlsx
+    2. All uploaded files in UPLOADED_EXCEL_FILES list
+    
+    Returns combined list of all jobs from all files.
+    """
+    global _excel_jobs_cache, _excel_jobs_cache_time
+    
+    # Return cached jobs if less than cache duration old
+    if _excel_jobs_cache and _excel_jobs_cache_time:
+        age = datetime.now() - _excel_jobs_cache_time
+        if age < timedelta(minutes=EXCEL_CACHE_MINUTES):
+            print(f"[Excel] Using cached jobs ({len(_excel_jobs_cache)} jobs, cached {age.seconds}s ago)")
+            return _excel_jobs_cache
+    
+    all_jobs: List[Job] = []
+    
+    # Load from original file first
+    if os.path.exists(EXCEL_JOBS_FILE):
+        original_jobs = load_excel_jobs_from_file(EXCEL_JOBS_FILE)
+        all_jobs.extend(original_jobs)
+        print(f"[Excel] Original file: {len(original_jobs)} jobs")
+    else:
+        print(f"[Excel] Original file not found: {EXCEL_JOBS_FILE}")
+    
+    # Load from all uploaded files
+    uploaded_count = 0
+    for uploaded_file in UPLOADED_EXCEL_FILES:
+        if os.path.exists(uploaded_file):
+            uploaded_jobs = load_excel_jobs_from_file(uploaded_file)
+            all_jobs.extend(uploaded_jobs)
+            uploaded_count += len(uploaded_jobs)
+            print(f"[Excel] Uploaded file {os.path.basename(uploaded_file)}: {len(uploaded_jobs)} jobs")
+        else:
+            print(f"[Excel] Uploaded file not found: {uploaded_file}")
+    
+    print(f"[Excel] Total jobs from all files: {len(all_jobs)} (original + {uploaded_count} from uploads)")
+    
+    # Cache the combined jobs
+    _excel_jobs_cache = all_jobs
+    _excel_jobs_cache_time = datetime.now()
+    
+    return all_jobs
+
 
 def clear_excel_jobs_cache():
     """Clear the Excel jobs cache to force reload on next request"""
@@ -2468,10 +2704,10 @@ async def submit_candidate(
             "email": current_user.email,
             "id": current_user.id
         }
-        print(f"[Submissions] Attempting to send notification email to {ADMIN_EMAIL}")
+        print(f"[Submissions] Attempting to send notification email to {SUBMISSION_NOTIFICATION_RECIPIENTS}")
         email_sent = send_submission_notification_email(candidate_doc, vendor_info)
         if email_sent:
-            print(f"[Submissions] Notification email sent to admin for candidate {candidate_id}")
+            print(f"[Submissions] Notification email sent for candidate {candidate_id}")
         else:
             print(f"[Submissions] Failed to send notification email for candidate {candidate_id}")
         
@@ -2611,6 +2847,62 @@ async def update_candidate_status(
     except Exception as e:
         print(f"[Submissions] Error updating status: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to update status: {str(e)}")
+
+
+@app.post("/api/candidates/{candidate_id}/notify-vendor")
+async def notify_vendor_about_submission(
+    candidate_id: str,
+    payload: VendorMessageRequest,
+    current_user: UserDB = Depends(get_current_user),
+):
+    """Admin-only: email the vendor who submitted this candidate with a free-form message."""
+    is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Only admin can email vendors")
+
+    subject = (payload.subject or "").strip()
+    message_body = (payload.message or "").strip()
+    if not subject or not message_body:
+        raise HTTPException(status_code=400, detail="Subject and message are required")
+
+    # Look up candidate (Mongo first, JSON fallback)
+    candidate = None
+    if mongodb_enabled and candidates_collection is not None:
+        candidate = candidates_collection.find_one({"id": candidate_id})
+    if candidate is None:
+        candidates_file = os.path.join(DATA_DIR, "candidates.json")
+        if os.path.exists(candidates_file):
+            try:
+                with open(candidates_file, "r") as f:
+                    for c in json.load(f):
+                        if c.get("id") == candidate_id:
+                            candidate = c
+                            break
+            except Exception:
+                pass
+
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    vendor_email = (candidate.get("submitted_by_email") or "").strip()
+    if not vendor_email:
+        raise HTTPException(status_code=400, detail="Vendor email is missing on this submission")
+
+    email_sent = send_vendor_message_email(
+        vendor_email=vendor_email,
+        vendor_name=candidate.get("submitted_by_name") or "",
+        subject=subject,
+        message_body=message_body,
+        candidate_name=candidate.get("name") or "",
+        job_title=candidate.get("job_title") or "",
+        job_id=candidate.get("job_id") or "",
+    )
+
+    if not email_sent:
+        raise HTTPException(status_code=502, detail="Failed to send email — check SendGrid configuration")
+
+    return {"message": "Email sent", "vendor_email": vendor_email, "candidate_id": candidate_id}
+
 
 @app.get("/api/resumes/{candidate_id}")
 async def download_resume(candidate_id: str):
