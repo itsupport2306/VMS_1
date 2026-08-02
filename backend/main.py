@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, root_validator
 from typing import List, Optional
 import httpx
 import os
@@ -38,11 +38,12 @@ notifications_collection = None
 jobs_collection = None
 job_status_tracker_collection = None
 closure_audit_collection = None
+manual_jobs_collection = None
 fs = None
 
 def init_mongodb():
     """Initialize MongoDB connection"""
-    global mongo_client, db, users_collection, whitelist_collection, candidates_collection, notifications_collection, jobs_collection, job_status_tracker_collection, closure_audit_collection, fs
+    global mongo_client, db, users_collection, whitelist_collection, candidates_collection, notifications_collection, jobs_collection, job_status_tracker_collection, closure_audit_collection, manual_jobs_collection, fs
     
     print(f"[MongoDB] Checking configuration...")
     print(f"[MongoDB] MONGODB_URI present: {bool(MONGODB_URI)}")
@@ -64,6 +65,7 @@ def init_mongodb():
         jobs_collection = db.jobs  # Track job status changes
         job_status_tracker_collection = db.job_status_tracker  # Fresh tracker for closure detection (separate from legacy `jobs`)
         closure_audit_collection = db.closure_audit  # Audit log for detected closures (dry-run + live)
+        manual_jobs_collection = db.manual_jobs  # Direct API-ingested jobs
         
         # Initialize GridFS for file storage
         import gridfs
@@ -908,6 +910,7 @@ MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 10485760))  # 10MB
 # Excel Jobs File Configuration
 EXCEL_JOBS_FILE = os.getenv("EXCEL_JOBS_FILE", "VMS Job Fiule.xlsx")
 UPLOADED_EXCEL_FILES: List[str] = []  # Track admin-uploaded Excel files (multiple files supported)
+MANUAL_JOBS_FILE = os.path.join(DATA_DIR, "manual_jobs.json")
 
 # Ensure directories exist
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -926,6 +929,29 @@ class Job(BaseModel):
     posted_date: datetime
     status: str
     end_client: Optional[str] = None
+    job_id: Optional[str] = None
+    profession: Optional[str] = None
+
+class DirectJobCreateRequest(BaseModel):
+    job_id: Optional[str] = None
+    job_code: Optional[str] = None
+    job_type: str
+    status: str
+    profession: str
+    specialty: str
+    city: str
+    state: str
+    jobdescription: str
+    billrate: str
+    client: Optional[str] = None
+
+    @root_validator(pre=True)
+    def normalize_job_id(cls, values):
+        if not values.get("job_id") and values.get("job_code"):
+            values["job_id"] = values["job_code"]
+        if not values.get("job_code") and values.get("job_id"):
+            values["job_code"] = values["job_id"]
+        return values
 
 class Candidate(BaseModel):
     id: str
@@ -1364,6 +1390,48 @@ async def upload_excel_jobs(
         print(f"[Excel Upload] Error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to upload Excel file: {str(e)}")
 
+
+@app.post("/api/admin/jobs")
+async def create_job_from_payload(
+    payload: DirectJobCreateRequest,
+    current_user: UserDB = Depends(get_current_user)
+):
+    """Create or update a job directly from API payload fields (admin only)."""
+    is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Only admin can create jobs")
+
+    try:
+        job = build_job_from_direct_input(payload)
+        upsert_manual_job(job)
+
+        return {
+            "message": "Job stored successfully",
+            "job": job,
+            "source": "direct_api",
+        }
+    except Exception as e:
+        print(f"[Manual Jobs] Error storing direct-input job {payload.job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to store job: {str(e)}")
+
+
+@app.post("/api/nexus/jobs")
+async def create_nexus_job(payload: DirectJobCreateRequest):
+    """Create or update a job from Nexus-style request parameters."""
+    try:
+        job = build_job_from_direct_input(payload)
+        upsert_manual_job(job)
+
+        return {
+            "message": "Job stored successfully",
+            "job": job,
+            "source": "nexus_api",
+        }
+    except Exception as e:
+        job_ref = payload.job_id or payload.job_code or "unknown"
+        print(f"[Nexus Jobs] Error storing Nexus job {job_ref}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to store job: {str(e)}")
+
 @app.get("/api/admin/jobs/excel-files")
 async def list_uploaded_excel_files(current_user: UserDB = Depends(get_current_user)):
     """List all uploaded Excel files (admin only)"""
@@ -1571,7 +1639,9 @@ def load_excel_jobs_from_file(file_path: str) -> List[Job]:
                     salary_range=salary if salary and salary.lower() != 'nan' else None,
                     posted_date=datetime.now(),  # Default to now
                     status=status if status and status.lower() != 'nan' else "Active",
-                    end_client=end_client if end_client and end_client.lower() != 'nan' else None
+                    end_client=end_client if end_client and end_client.lower() != 'nan' else None,
+                    job_id=job_code,
+                    profession=profession if profession and profession.lower() != 'nan' else None,
                 )
                 
                 jobs.append(job)
@@ -1642,6 +1712,101 @@ def clear_excel_jobs_cache():
     _excel_jobs_cache = None
     _excel_jobs_cache_time = None
     print("[Excel] Cache cleared")
+
+
+def build_job_from_direct_input(payload: DirectJobCreateRequest) -> Job:
+    """Map direct endpoint input into the shared Job response model."""
+    job_id = (payload.job_id or payload.job_code or "").strip()
+    location_parts = [payload.city.strip(), payload.state.strip()]
+    full_location = ", ".join([part for part in location_parts if part])
+
+    return Job(
+        id=job_id,
+        title=payload.job_type.strip() or job_id,
+        description=payload.jobdescription.strip(),
+        requirements=None,
+        department=payload.specialty.strip(),
+        location=full_location or "Not specified",
+        employment_type="Contract",
+        salary_range=payload.billrate.strip() or None,
+        posted_date=datetime.now(),
+        status=payload.status.strip(),
+        job_id=job_id,
+        profession=payload.profession.strip(),
+        end_client=(payload.client or "").strip() or None,
+    )
+
+
+def load_manual_jobs() -> List[Job]:
+    """Load jobs created through the direct API endpoint."""
+    jobs: List[Job] = []
+
+    try:
+        if mongodb_enabled and manual_jobs_collection is not None:
+            for doc in manual_jobs_collection.find().sort("created_at", -1):
+                doc.pop("_id", None)
+                doc.pop("created_at", None)
+                jobs.append(Job(**doc))
+            return jobs
+
+        if not os.path.exists(MANUAL_JOBS_FILE):
+            return jobs
+
+        with open(MANUAL_JOBS_FILE, "r") as f:
+            raw_jobs = json.load(f)
+
+        for job_data in raw_jobs:
+            jobs.append(Job(**job_data))
+    except Exception as e:
+        print(f"[Manual Jobs] Failed to load direct-input jobs: {e}")
+
+    return jobs
+
+
+def upsert_manual_job(job: Job) -> None:
+    """Persist one direct-input job by job ID."""
+    job_payload = job.dict()
+
+    if mongodb_enabled and manual_jobs_collection is not None:
+        manual_jobs_collection.update_one(
+            {"id": job.id},
+            {"$set": {**job_payload, "created_at": datetime.now()}},
+            upsert=True,
+        )
+        return
+
+    existing_jobs = []
+    if os.path.exists(MANUAL_JOBS_FILE):
+        with open(MANUAL_JOBS_FILE, "r") as f:
+            existing_jobs = json.load(f)
+
+    updated = False
+    for idx, existing_job in enumerate(existing_jobs):
+        if existing_job.get("id") == job.id:
+            existing_jobs[idx] = job_payload
+            updated = True
+            break
+
+    if not updated:
+        existing_jobs.insert(0, job_payload)
+
+    with open(MANUAL_JOBS_FILE, "w") as f:
+        json.dump(existing_jobs, f, indent=2, default=str)
+
+
+def combine_jobs_with_priority(*job_groups: List[Job]) -> List[Job]:
+    """Merge job lists, keeping the first instance of each job ID."""
+    combined = []
+    seen_ids = set()
+
+    for group in job_groups:
+        for job in group:
+            if job.id in seen_ids:
+                continue
+            seen_ids.add(job.id)
+            combined.append(job)
+
+    return combined
 
 def sanitize_job_description(description: str, is_admin: bool = False) -> str:
     """Remove client names from job description for non-admin users"""
@@ -2414,8 +2579,11 @@ async def root():
 
 @app.get("/api/jobs", response_model=JobListResponse)
 async def get_jobs(background_tasks: BackgroundTasks, current_user: UserDB = Depends(get_current_user)):
-    """Get all active jobs from Excel file (first) and Ceipal API (second)"""
+    """Get all active jobs from direct input, Excel files, and Ceipal."""
     try:
+        manual_jobs = load_manual_jobs()
+        print(f"[API] Loaded {len(manual_jobs)} jobs from direct API input")
+
         # Load Excel jobs first
         excel_jobs = load_excel_jobs()
         print(f"[API] Loaded {len(excel_jobs)} jobs from Excel")
@@ -2434,8 +2602,8 @@ async def get_jobs(background_tasks: BackgroundTasks, current_user: UserDB = Dep
         total_pages = ceipal_client._last_fetched_pages if hasattr(ceipal_client, '_last_fetched_pages') else 0
         total_records = getattr(ceipal_client, '_last_total_records', 0)
         
-        # Combine jobs: Excel first, then Ceipal
-        all_jobs = excel_jobs + cached_jobs
+        # Combine jobs with stable source priority: direct API, Excel, then Ceipal.
+        all_jobs = combine_jobs_with_priority(manual_jobs, excel_jobs, cached_jobs)
         jobs_fetched = len(all_jobs)
         
         # Has more if Ceipal jobs are still loading
@@ -2463,10 +2631,10 @@ async def get_jobs(background_tasks: BackgroundTasks, current_user: UserDB = Dep
         # If fetch fails, try to return any cached data as fallback
         if ceipal_client._jobs_cache:
             total_pages = ceipal_client._last_fetched_pages if hasattr(ceipal_client, '_last_fetched_pages') else 25
-            
-            # Load Excel jobs even in error case
+             
+            manual_jobs = load_manual_jobs()
             excel_jobs = load_excel_jobs()
-            all_jobs = excel_jobs + ceipal_client._jobs_cache
+            all_jobs = combine_jobs_with_priority(manual_jobs, excel_jobs, ceipal_client._jobs_cache)
             
             # Check if user is admin for fallback too
             is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
@@ -2489,13 +2657,16 @@ async def get_jobs(background_tasks: BackgroundTasks, current_user: UserDB = Dep
 async def get_job(job_id: str):
     """Get specific job details"""
     try:
-        # Try cache first
-        jobs = ceipal_client._get_cached_jobs()
-        if not jobs:
-            # No cache, fetch fresh
-            jobs = await ceipal_client.fetch_jobs()
-        
-        job = next((job for job in jobs if job.id == job_id), None)
+        all_jobs = combine_jobs_with_priority(
+            load_manual_jobs(),
+            load_excel_jobs(),
+            ceipal_client._get_cached_jobs() or [],
+        )
+
+        job = next((job for job in all_jobs if job.id == job_id), None)
+        if not job:
+            ceipal_jobs = await ceipal_client.fetch_jobs()
+            job = next((job for job in ceipal_jobs if job.id == job_id), None)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
         return job
