@@ -10,6 +10,7 @@ import os
 from datetime import datetime, timedelta
 import aiofiles
 import json
+import html
 from dotenv import load_dotenv
 import re
 from sqlalchemy import create_engine, Column, String, DateTime, Integer, ForeignKey
@@ -1415,6 +1416,33 @@ async def create_job_from_payload(
         raise HTTPException(status_code=500, detail=f"Failed to store job: {str(e)}")
 
 
+@app.delete("/api/admin/jobs/{job_id}")
+async def delete_job_from_payload(
+    job_id: str,
+    current_user: UserDB = Depends(get_current_user)
+):
+    """Delete a direct API-ingested job by job ID (admin only)."""
+    is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Only admin can delete jobs")
+
+    try:
+        deleted = delete_manual_job(job_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"Direct API job {job_id} not found")
+
+        return {
+            "message": "Job deleted successfully",
+            "job_id": job_id,
+            "source": "direct_api",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[Manual Jobs] Error deleting direct-input job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete job: {str(e)}")
+
+
 @app.post("/api/nexus/jobs")
 async def create_nexus_job(payload: DirectJobCreateRequest):
     """Create or update a job from Nexus-style request parameters."""
@@ -1782,16 +1810,37 @@ def summarize_json_job_description(raw_description: str) -> Optional[str]:
     return "No description provided by Nexus."
 
 
+def strip_html_job_description(raw_description: str) -> str:
+    """Convert raw HTML job descriptions into readable plain text."""
+    text = (raw_description or "").strip()
+    if not text:
+        return ""
+
+    if not re.search(r"<[a-zA-Z][^>]*>", text):
+        return html.unescape(text).strip()
+
+    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", text)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</(p|div|li|tr|h[1-6])>", "\n", text)
+    text = re.sub(r"(?is)<[^>]+>", " ", text)
+    text = html.unescape(text).replace("\xa0", " ")
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"\n\s+", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def build_job_from_direct_input(payload: DirectJobCreateRequest) -> Job:
     """Map direct endpoint input into the shared Job response model."""
     job_id = (payload.job_id or payload.job_code or "").strip()
     location_parts = [payload.city.strip(), payload.state.strip()]
     full_location = ", ".join([part for part in location_parts if part])
-    description = (
+    raw_description = (
         summarize_json_job_description(payload.jobdescription)
         or payload.jobdescription.strip()
         or "No description provided by Nexus."
     )
+    description = strip_html_job_description(raw_description) or "No description provided by Nexus."
 
     return Job(
         id=job_id,
@@ -1865,6 +1914,39 @@ def upsert_manual_job(job: Job) -> None:
 
     with open(MANUAL_JOBS_FILE, "w") as f:
         json.dump(existing_jobs, f, indent=2, default=str)
+
+
+def delete_manual_job(job_id: str) -> bool:
+    """Delete one direct-input job by job ID."""
+    normalized_job_id = (job_id or "").strip()
+    if not normalized_job_id:
+        return False
+
+    if mongodb_enabled and manual_jobs_collection is not None:
+        result = manual_jobs_collection.delete_one({"id": normalized_job_id})
+        if result.deleted_count:
+            return True
+        result = manual_jobs_collection.delete_one({"job_id": normalized_job_id})
+        return result.deleted_count > 0
+
+    if not os.path.exists(MANUAL_JOBS_FILE):
+        return False
+
+    with open(MANUAL_JOBS_FILE, "r") as f:
+        existing_jobs = json.load(f)
+
+    remaining_jobs = [
+        job for job in existing_jobs
+        if job.get("id") != normalized_job_id and job.get("job_id") != normalized_job_id
+    ]
+
+    if len(remaining_jobs) == len(existing_jobs):
+        return False
+
+    with open(MANUAL_JOBS_FILE, "w") as f:
+        json.dump(remaining_jobs, f, indent=2, default=str)
+
+    return True
 
 
 def combine_jobs_with_priority(*job_groups: List[Job]) -> List[Job]:
