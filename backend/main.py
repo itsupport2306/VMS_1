@@ -954,6 +954,12 @@ class DirectJobCreateRequest(BaseModel):
             values["job_code"] = values["job_id"]
         return values
 
+
+class AdminJobDeleteRequest(BaseModel):
+    email: str
+    password: str
+
+
 class Candidate(BaseModel):
     id: str
     name: str
@@ -1052,6 +1058,23 @@ async def get_current_user(token: str = Depends(HTTPBearer())):
         'is_active': user["is_active"],
         'hashed_password': user["hashed_password"]
     })()
+
+
+def verify_admin_credentials(email: str, password: str) -> None:
+    """Validate an admin email/password pair without requiring a bearer token."""
+    email_lower = (email or "").lower().strip()
+    if email_lower != ADMIN_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Only admin can delete jobs")
+
+    users = load_users_from_json()
+    user = users.get(email_lower)
+    if not user:
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+    if user.get("is_active") != "true":
+        raise HTTPException(status_code=400, detail="Inactive user")
+    if not verify_password(password, user["hashed_password"]):
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+
 
 # Auth Endpoints
 @app.post("/api/auth/register", response_model=Token)
@@ -1419,12 +1442,10 @@ async def create_job_from_payload(
 @app.delete("/api/admin/jobs/{job_id}")
 async def delete_job_from_payload(
     job_id: str,
-    current_user: UserDB = Depends(get_current_user)
+    credentials: AdminJobDeleteRequest
 ):
-    """Delete a direct API-ingested job by job ID (admin only)."""
-    is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
-    if not is_admin:
-        raise HTTPException(status_code=403, detail="Only admin can delete jobs")
+    """Delete a direct API-ingested job by job ID using admin credentials."""
+    verify_admin_credentials(credentials.email, credentials.password)
 
     try:
         deleted = delete_manual_job(job_id)
