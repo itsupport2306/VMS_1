@@ -1714,16 +1714,89 @@ def clear_excel_jobs_cache():
     print("[Excel] Cache cleared")
 
 
+def first_present(*values) -> str:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def summarize_json_job_description(raw_description: str) -> Optional[str]:
+    """Convert accidental raw job JSON descriptions into readable text."""
+    text = (raw_description or "").strip()
+    if not text.startswith("{"):
+        return None
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    real_description = first_present(
+        data.get("jobDescription"),
+        data.get("description"),
+        data.get("jobdescription"),
+    )
+    if real_description:
+        return real_description
+
+    shift_details = data.get("jobShiftDetails") if isinstance(data.get("jobShiftDetails"), dict) else {}
+    profession = first_present(data.get("profession"))
+    specialty = first_present(data.get("specialty"))
+    job_type = first_present(data.get("jobType"))
+    client = first_present(data.get("clientName"))
+    city = first_present(data.get("city"))
+    state = first_present(data.get("state"))
+    start_date = first_present(data.get("startDate"))
+    end_date = first_present(data.get("endDate"))
+    shift = first_present(shift_details.get("shift_1_name"))
+    bill_rate = first_present(data.get("billRate"))
+
+    lead_parts = [part for part in [profession, specialty] if part]
+    lead = " - ".join(lead_parts) if lead_parts else job_type
+
+    details = []
+    if client:
+        details.append(f"Client: {client}")
+    if city or state:
+        details.append(f"Location: {', '.join(part for part in [city, state] if part)}")
+    if start_date or end_date:
+        details.append(f"Dates: {' to '.join(part for part in [start_date, end_date] if part)}")
+    if shift:
+        details.append(f"Shift: {shift}")
+    if bill_rate:
+        details.append(f"Bill rate: {bill_rate}")
+
+    if lead and details:
+        return f"{lead}. {'; '.join(details)}."
+    if details:
+        return "; ".join(details) + "."
+    if lead:
+        return lead + "."
+    return "No description provided by Nexus."
+
+
 def build_job_from_direct_input(payload: DirectJobCreateRequest) -> Job:
     """Map direct endpoint input into the shared Job response model."""
     job_id = (payload.job_id or payload.job_code or "").strip()
     location_parts = [payload.city.strip(), payload.state.strip()]
     full_location = ", ".join([part for part in location_parts if part])
+    description = (
+        summarize_json_job_description(payload.jobdescription)
+        or payload.jobdescription.strip()
+        or "No description provided by Nexus."
+    )
 
     return Job(
         id=job_id,
         title=payload.job_type.strip() or job_id,
-        description=payload.jobdescription.strip(),
+        description=description,
         requirements=None,
         department=payload.specialty.strip(),
         location=full_location or "Not specified",

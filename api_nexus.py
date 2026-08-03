@@ -27,13 +27,10 @@ HEADERS = {
         "Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0"
     ),
 }
-
+# python submit_candidate_client.py --email virinchi@radixsol.com --password virinchi@321 --csv candidate_submission_template.csv --base-url https://radixsolvms.com/
 PAGE_SIZE = 50
 TIMEOUT = 30
 OUTPUT_CSV = "jobs.csv"
-DEFAULT_VMS_BASE_URL = os.getenv("VMS_BASE_URL", "http://localhost:8000")
-DEFAULT_ADMIN_EMAIL = os.getenv("VMS_ADMIN_EMAIL", "")
-DEFAULT_ADMIN_PASSWORD = os.getenv("VMS_ADMIN_PASSWORD", "")
 
 
 def build_payload(start: int) -> Dict[str, Any]:
@@ -155,6 +152,47 @@ def coerce_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def build_description_summary(summary_job: Dict[str, Any], detail_job: Dict[str, Any]) -> str:
+    profession = first_non_empty(detail_job.get("profession"), summary_job.get("profession"))
+    specialty = first_non_empty(detail_job.get("specialty"), summary_job.get("specialty"))
+    client = first_non_empty(detail_job.get("clientName"), summary_job.get("clientName"))
+    city = first_non_empty(detail_job.get("city"), summary_job.get("city"))
+    state = first_non_empty(detail_job.get("state"), summary_job.get("state"))
+    start_date = first_non_empty(detail_job.get("startDate"), summary_job.get("startDate"))
+    end_date = first_non_empty(detail_job.get("endDate"), summary_job.get("endDate"))
+    shift = first_non_empty(
+        (detail_job.get("jobShiftDetails") or {}).get("shift_1_name")
+        if isinstance(detail_job.get("jobShiftDetails"), dict)
+        else None,
+        summary_job.get("shiftName"),
+        summary_job.get("shift"),
+    )
+    bill_rate = first_non_empty(detail_job.get("billRate"), summary_job.get("billRate"))
+
+    lead_parts = [part for part in [profession, specialty] if part]
+    lead = " - ".join(lead_parts) if lead_parts else first_non_empty(detail_job.get("jobType"), summary_job.get("jobType"))
+
+    details = []
+    if client:
+        details.append(f"Client: {client}")
+    if city or state:
+        details.append(f"Location: {', '.join(part for part in [city, state] if part)}")
+    if start_date or end_date:
+        details.append(f"Dates: {' to '.join(part for part in [start_date, end_date] if part)}")
+    if shift:
+        details.append(f"Shift: {shift}")
+    if bill_rate:
+        details.append(f"Bill rate: {bill_rate}")
+
+    if lead and details:
+        return f"{lead}. {'; '.join(details)}."
+    if details:
+        return "; ".join(details) + "."
+    if lead:
+        return lead + "."
+    return ""
+
+
 def extract_description(summary_job: Dict[str, Any], detail_job: Dict[str, Any]) -> str:
     description = first_non_empty(
         detail_job.get("jobDescription"),
@@ -166,13 +204,9 @@ def extract_description(summary_job: Dict[str, Any], detail_job: Dict[str, Any])
     if description:
         return description
 
-    compact_detail = {
-        key: value
-        for key, value in detail_job.items()
-        if value not in (None, "", [], {})
-    }
-    if compact_detail:
-        return json.dumps(compact_detail, ensure_ascii=False)
+    summary = build_description_summary(summary_job, detail_job)
+    if summary:
+        return summary
 
     return "No description provided by Nexus."
 
