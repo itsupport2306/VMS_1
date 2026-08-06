@@ -110,6 +110,13 @@ def flatten_value(value: Any) -> Any:
     return json.dumps(value, ensure_ascii=False)
 
 
+def csv_cell_value(value: Any) -> str:
+    flat_value = flatten_value(value)
+    if flat_value is None:
+        return ""
+    return str(flat_value)
+
+
 def flatten_record(
     data: Dict[str, Any],
     parent_key: str = "",
@@ -472,7 +479,7 @@ class CsvJobStore:
                         continue
                     if key not in df.columns:
                         df[key] = ""
-                    df.at[index, key] = flatten_value(value)
+                    df.at[index, key] = csv_cell_value(value)
             else:
                 status = STATUS_PENDING
                 for key in merged:
@@ -480,7 +487,7 @@ class CsvJobStore:
                         df[key] = ""
                 new_row = {column: "" for column in df.columns}
                 for key, value in merged.items():
-                    new_row[key] = flatten_value(value)
+                    new_row[key] = csv_cell_value(value)
                 new_row[CSV_STATUS_COLUMN] = STATUS_PENDING
                 df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
 
@@ -681,7 +688,12 @@ async def detail_worker(
             }
             rows.append(row)
             print(f"Fetched detail for job {job_id} on detail worker {worker_id}")
-            await csv_store.upsert_extracted_row(row)
+            try:
+                await csv_store.upsert_extracted_row(row)
+            except Exception as exc:
+                failed_job_ids.append(job_id)
+                print(f"Failed to write CSV row for job {job_id}: {exc}")
+                continue
 
             if post_queue is not None:
                 if await csv_store.claim_for_posting(first_non_empty(job_id)):

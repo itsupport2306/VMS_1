@@ -932,6 +932,8 @@ class Job(BaseModel):
     end_client: Optional[str] = None
     job_id: Optional[str] = None
     profession: Optional[str] = None
+    specialty: Optional[str] = None
+    state: Optional[str] = None
 
 class DirectJobCreateRequest(BaseModel):
     job_id: Optional[str] = None
@@ -1691,6 +1693,8 @@ def load_excel_jobs_from_file(file_path: str) -> List[Job]:
                     end_client=end_client if end_client and end_client.lower() != 'nan' else None,
                     job_id=job_code,
                     profession=profession if profession and profession.lower() != 'nan' else None,
+                    specialty=specialty if specialty and specialty.lower() != 'nan' else None,
+                    state=state if state and state.lower() != 'nan' else None,
                 )
                 
                 jobs.append(job)
@@ -1876,6 +1880,8 @@ def build_job_from_direct_input(payload: DirectJobCreateRequest) -> Job:
         status=payload.status.strip(),
         job_id=job_id,
         profession=payload.profession.strip(),
+        specialty=payload.specialty.strip(),
+        state=payload.state.strip(),
         end_client=(payload.client or "").strip() or None,
     )
 
@@ -2585,6 +2591,13 @@ class CeipalClient:
             # Parse location from Ceipal format: "[City, State, ZIP]" or just use States
             location_raw = job_data.get("Location", "")
             states = job_data.get("States", "")
+            specialty = (
+                job_data.get("Specialty")
+                or job_data.get("JobSpecialty")
+                or job_data.get("Speciality")
+                or job_data.get("JobSpeciality")
+                or ""
+            )
             location = states
             if location_raw and location_raw != "N/A":
                 # Clean up location format: "[City, State, ZIP]" -> "City, State"
@@ -2681,7 +2694,9 @@ class CeipalClient:
                 salary_range=salary_range_display,  # Show updated rate to vendors
                 posted_date=self._parse_date(job_data.get("JobCreated", job_data.get("CreatedDate"))),
                 status=job_data.get("JobStatus", "Open"),
-                end_client=job_data.get("EndClient", None)
+                end_client=job_data.get("EndClient", None),
+                specialty=specialty.strip() or None,
+                state=states.strip() or None,
             )
             jobs.append(job)
             

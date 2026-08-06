@@ -45,3 +45,7 @@ uploads/
 
 # Logs
 *.log
+api_nexus.py
+vms_database.db
+delete_jobs_from_csv.sh
+

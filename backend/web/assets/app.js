@@ -11,6 +11,8 @@ const els = {
   jobsEmpty: document.getElementById('jobsEmpty'),
   searchInput: document.getElementById('searchInput'),
   statusFilter: document.getElementById('statusFilter'),
+  stateFilter: document.getElementById('stateFilter'),
+  specialtyFilter: document.getElementById('specialtyFilter'),
   refreshBtn: document.getElementById('refreshBtn'),
   ceipalCacheBtn: document.getElementById('ceipalCacheBtn'),
   ceipalTestBtn: document.getElementById('ceipalTestBtn'),
@@ -257,7 +259,9 @@ function logout() {
   
   // Clear search and filter state to prevent leaking to next user
   if (els.searchInput) els.searchInput.value = '';
-  if (els.statusFilter) els.statusFilter.value = 'all';
+  if (els.statusFilter) els.statusFilter.value = '';
+  if (els.stateFilter) els.stateFilter.value = '';
+  if (els.specialtyFilter) els.specialtyFilter.value = '';
   
   // Clear jobs data so next user starts fresh
   allJobs = [];
@@ -572,18 +576,83 @@ function normalizeText(v) {
   return (v ?? '').toString().toLowerCase();
 }
 
+function escapeHtml(value) {
+  return (value ?? '').toString().replace(/[&<>"']/g, ch => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[ch]));
+}
+
+function getJobState(job) {
+  if (job.state) return job.state.toString().trim();
+
+  const parts = (job.location || '')
+    .toString()
+    .split(',')
+    .map(part => part.trim())
+    .filter(Boolean);
+
+  while (parts.length && /^\d{5}(?:-\d{4})?$/.test(parts[parts.length - 1])) {
+    parts.pop();
+  }
+
+  return parts.length > 1 ? parts[parts.length - 1] : '';
+}
+
+function getJobSpecialty(job) {
+  if (job.specialty) return job.specialty.toString().trim();
+  if (job.department && !/^job code:/i.test(job.department)) return job.department.toString().trim();
+
+  const match = (job.description || '').toString().match(/Special(?:ty|ity):\s*([^|\n]+)/i);
+  return match ? match[1].trim() : '';
+}
+
+function updateSelectOptions(select, values) {
+  if (!select) return;
+
+  const currentValue = select.value;
+  const uniqueValues = [...new Set(values.map(v => (v || '').toString().trim()).filter(Boolean))]
+    .sort((a, b) => a.localeCompare(b));
+
+  select.innerHTML = '<option value="">All</option>' + uniqueValues
+    .map(value => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`)
+    .join('');
+
+  select.value = uniqueValues.includes(currentValue) ? currentValue : '';
+}
+
+function updateJobFilterOptions() {
+  updateSelectOptions(els.stateFilter, allJobs.map(getJobState));
+  updateSelectOptions(els.specialtyFilter, allJobs.map(getJobSpecialty));
+}
+
 function jobMatches(job) {
   const q = normalizeText(els.searchInput.value).trim();
   const status = normalizeText(els.statusFilter.value).trim();
+  const state = normalizeText(els.stateFilter ? els.stateFilter.value : '').trim();
+  const specialty = normalizeText(els.specialtyFilter ? els.specialtyFilter.value : '').trim();
 
   if (q) {
-    const hay = [job.title, job.department, job.location, job.employment_type].map(normalizeText).join(' ');
+    const hay = [job.title, job.department, job.location, job.employment_type, job.specialty, job.state].map(normalizeText).join(' ');
     if (!hay.includes(q)) return false;
   }
 
   if (status) {
     const s = normalizeText(job.status);
     if (!s.includes(status)) return false;
+  }
+
+  if (state) {
+    const s = normalizeText(getJobState(job));
+    if (s !== state) return false;
+  }
+
+  if (specialty) {
+    const s = normalizeText(getJobSpecialty(job));
+    if (s !== specialty) return false;
   }
 
   return true;
@@ -596,8 +665,10 @@ function renderJobs() {
   // Update job count display
   if (els.jobsCount) {
     const searchTerm = els.searchInput ? els.searchInput.value.trim() : '';
-    const statusFilter = els.statusFilter ? els.statusFilter.value : 'all';
-    const hasFilters = searchTerm || statusFilter !== 'all';
+    const statusFilter = els.statusFilter ? els.statusFilter.value : '';
+    const stateFilter = els.stateFilter ? els.stateFilter.value : '';
+    const specialtyFilter = els.specialtyFilter ? els.specialtyFilter.value : '';
+    const hasFilters = searchTerm || statusFilter || stateFilter || specialtyFilter;
     
     if (hasFilters) {
       els.jobsCount.textContent = `Showing ${filtered.length} of ${allJobs.length} jobs`;
@@ -970,6 +1041,7 @@ async function loadJobs() {
     allJobs = data.jobs || [];
     hasMoreJobs = data.has_more || false;
     console.log(`[Jobs] Loaded ${allJobs.length} jobs. Has more: ${hasMoreJobs}`);
+    updateJobFilterOptions();
     renderJobs();
     
     // If no jobs yet or still fetching more, start polling
@@ -990,6 +1062,7 @@ async function loadJobs() {
             allJobs = newJobs;
             hasMoreJobs = pollData.has_more || false;
             console.log(`[Jobs] Updated: now ${allJobs.length} jobs`);
+            updateJobFilterOptions();
             renderJobs();
           }
           
@@ -1034,6 +1107,7 @@ async function loadMoreJobs() {
       nextStartPage = data.next_start_page || nextStartPage + 25;
       hasMoreJobs = data.has_more || false;
       console.log(`[Jobs] Loaded ${newJobs.length} more jobs. Total: ${allJobs.length}. Has more: ${hasMoreJobs}`);
+      updateJobFilterOptions();
       renderJobs();
     } else {
       hasMoreJobs = false;
@@ -1504,6 +1578,8 @@ function closeEmailVendorModal() {
 // UI events
 els.searchInput.addEventListener('input', renderJobs);
 els.statusFilter.addEventListener('change', renderJobs);
+if (els.stateFilter) els.stateFilter.addEventListener('change', renderJobs);
+if (els.specialtyFilter) els.specialtyFilter.addEventListener('change', renderJobs);
 els.refreshBtn.addEventListener('click', async () => {
   await loadCeipalStatus();
   await loadJobs();
