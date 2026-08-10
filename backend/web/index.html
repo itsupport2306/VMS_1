@@ -61,17 +61,21 @@
       <section class="content" id="viewAuth">
         <div class="panel" style="text-align: center; max-width: 420px; margin: 0 auto;">
           <img src="/assets/logo.png" alt="Radixsol Logo" style="width: 120px; height: auto; margin-bottom: 20px;" />
-          <div class="panel__title" id="authTitle">Sign In</div>
-          <div class="panel__desc">Enter your credentials to continue.</div>
+          <div class="panel__title" id="authTitle">Login</div>
+          <div class="panel__desc" id="authDesc">Enter your credentials to continue.</div>
           
-          <div class="form" style="margin-top: 24px;">
+          <div class="form" id="authMainForm" style="margin-top: 24px;">
             <div class="field">
-              <label>Email</label>
+              <label id="authEmailLabel">Username/Email</label>
               <input id="authEmail" class="input" type="email" placeholder="name@example.com" />
             </div>
             <div class="field" id="authPasswordField">
               <label>Password</label>
               <input id="authPassword" class="input" type="password" placeholder="Enter password" />
+            </div>
+            <div class="field" id="authConfirmPasswordField" hidden>
+              <label>Confirm Password</label>
+              <input id="authConfirmPassword" class="input" type="password" placeholder="Confirm password" />
             </div>
             <div class="field" id="authOtpField" hidden>
               <label>Verification Code</label>
@@ -80,10 +84,12 @@
             <div class="alert" id="authAlert" hidden></div>
             <div class="row" style="gap: 12px; margin-top: 20px;">
               <button class="btn btn--secondary" id="authBackBtn" style="flex: 0 0 auto;" hidden>Back</button>
-              <button class="btn" id="authSubmitBtn" style="flex: 1;">Sign In</button>
-              <button class="btn btn--secondary" id="authSendCodeBtn" style="flex: 0 0 auto;">Send Code</button>
+              <button class="btn" id="authSubmitBtn" style="flex: 1;">Login</button>
             </div>
             <div style="margin-top: 16px; text-align: center;">
+              <a href="#" id="authToggleLink" style="color: #7c3aed; font-size: 14px; text-decoration: none;">New User? Sign Up</a>
+            </div>
+            <div style="margin-top: 10px; text-align: center;">
               <a href="#" id="forgotPasswordLink" style="color: #7c3aed; font-size: 14px; text-decoration: none;">Forgot Password?</a>
             </div>
           </div>

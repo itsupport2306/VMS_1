@@ -239,6 +239,28 @@ def send_login_otp_email(email: str, otp: str) -> bool:
     return sent
 
 
+def send_registration_otp_email(email: str, otp: str) -> bool:
+    html_content = f"""
+        <h2>Your VMS email verification code</h2>
+        <p>Use this one-time code to complete your account registration:</p>
+        <p style="font-size: 28px; font-weight: bold; letter-spacing: 4px;">{html.escape(otp)}</p>
+        <p>This code expires in {OTP_EXPIRE_MINUTES} minutes.</p>
+        <p>If you did not request this account, you can ignore this email.</p>
+    """
+    sent = send_app_email(
+        email,
+        "Verify your VMS account",
+        html_content,
+        text_content=f"Your VMS account verification code is {otp}. It expires in {OTP_EXPIRE_MINUTES} minutes.",
+    )
+    if not sent:
+        if globals().get("DEBUG", False) or globals().get("TESTING_MODE", False):
+            print(f"[Auth] Registration OTP for {email}: {otp} (email not configured or failed)")
+        else:
+            print(f"[Auth] Registration OTP email failed for {email}")
+    return sent
+
+
 def cleanup_expired_otps():
     now = datetime.now()
     expired = [email for email, data in _email_otp_tokens.items() if data["expires"] < now]
@@ -1114,7 +1136,7 @@ class CandidateSubmission(BaseModel):
 # Auth Pydantic Models
 class UserCreate(BaseModel):
     email: str
-    full_name: str
+    full_name: Optional[str] = None
     password: str
 
 class UserLogin(BaseModel):
@@ -1212,10 +1234,98 @@ def verify_admin_credentials(email: str, password: str) -> None:
 
 
 # Auth Endpoints
-@app.post("/api/auth/register", response_model=Token)
-async def register(user_data: UserCreate):
-    """Legacy password registration is disabled; admins should whitelist emails instead."""
-    raise HTTPException(status_code=410, detail="Password registration has been replaced by admin whitelisting and email OTP sign-in.")
+@app.post("/api/auth/register")
+async def register(user_data: UserCreate, request: Request):
+    """Start registration by emailing an OTP. The account is created only after OTP verification."""
+    cleanup_expired_otps()
+
+    email = user_data.email.strip()
+    email_lower = email.lower()
+    password = user_data.password or ""
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid email is required")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    users = load_users_from_json()
+    existing = users.get(email_lower)
+    if existing and existing.get("is_active") == "true":
+        raise HTTPException(status_code=400, detail="Account already exists. Please log in.")
+
+    otp = f"{secrets.randbelow(1000000):06d}"
+    full_name = (user_data.full_name or email.split("@")[0]).strip() or email_lower
+    _email_otp_tokens[email_lower] = {
+        "otp_hash": _hash_otp(otp),
+        "expires": datetime.now() + timedelta(minutes=OTP_EXPIRE_MINUTES),
+        "attempts": 0,
+        "purpose": "registration",
+        "pending_user": {
+            "id": str(uuid4()),
+            "email": email_lower,
+            "full_name": full_name,
+            "hashed_password": get_password_hash(password),
+            "is_active": "true",
+            "created_at": datetime.now().isoformat(),
+        },
+        "user_agent": request.headers.get("user-agent", ""),
+        "ip_address": get_client_ip(request),
+    }
+
+    email_sent = await asyncio.to_thread(send_registration_otp_email, email_lower, otp)
+    if not email_sent:
+        _email_otp_tokens.pop(email_lower, None)
+        raise HTTPException(
+            status_code=503,
+            detail="We could not send the verification code. Please contact support.",
+        )
+
+    return {"message": "OTP sent. Please check your email.", "expires_minutes": OTP_EXPIRE_MINUTES}
+
+
+@app.post("/api/auth/verify-registration-otp")
+async def verify_registration_otp(request_data: OtpVerify):
+    """Create and verify the account only when the registration OTP is correct."""
+    cleanup_expired_otps()
+
+    email_lower = request_data.email.lower().strip()
+    otp = (request_data.otp or "").strip()
+    token_data = _email_otp_tokens.get(email_lower)
+
+    if not token_data or token_data.get("purpose") != "registration":
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+    if token_data["expires"] < datetime.now():
+        del _email_otp_tokens[email_lower]
+        raise HTTPException(status_code=400, detail="Verification code has expired")
+    if token_data["attempts"] >= OTP_MAX_ATTEMPTS:
+        del _email_otp_tokens[email_lower]
+        raise HTTPException(status_code=429, detail="Too many failed attempts. Please sign up again.")
+
+    token_data["attempts"] += 1
+    if _hash_otp(otp) != token_data["otp_hash"]:
+        raise HTTPException(status_code=400, detail="Invalid verification code")
+
+    pending_user = token_data.get("pending_user")
+    if not pending_user:
+        del _email_otp_tokens[email_lower]
+        raise HTTPException(status_code=400, detail="Registration session has expired")
+
+    users = load_users_from_json()
+    existing = users.get(email_lower)
+    if existing and existing.get("is_active") == "true":
+        del _email_otp_tokens[email_lower]
+        raise HTTPException(status_code=400, detail="Account already exists. Please log in.")
+
+    users[email_lower] = pending_user
+    if not save_users_to_json(users):
+        raise HTTPException(status_code=500, detail="Could not complete registration")
+
+    global WHITELISTED_USERS, _users_cache
+    WHITELISTED_USERS.add(email_lower)
+    save_whitelisted_users()
+    _users_cache = load_users_from_json()
+    del _email_otp_tokens[email_lower]
+
+    return {"message": "Account verified. You can now log in."}
 
 def get_or_create_otp_user(email: str) -> dict:
     """Return an active whitelisted user, creating a profile on first OTP login."""

@@ -47,15 +47,20 @@ const els = {
   logoutBtn: document.getElementById('logoutBtn'),
   systemNavBtn: document.getElementById('systemNavBtn'),
   authTitle: document.getElementById('authTitle'),
+  authDesc: document.getElementById('authDesc'),
+  authMainForm: document.getElementById('authMainForm'),
   authEmail: document.getElementById('authEmail'),
+  authEmailLabel: document.getElementById('authEmailLabel'),
   authPasswordField: document.getElementById('authPasswordField'),
   authPassword: document.getElementById('authPassword'),
+  authConfirmPasswordField: document.getElementById('authConfirmPasswordField'),
+  authConfirmPassword: document.getElementById('authConfirmPassword'),
   authOtpField: document.getElementById('authOtpField'),
   authOtp: document.getElementById('authOtp'),
   authSubmitBtn: document.getElementById('authSubmitBtn'),
-  authSendCodeBtn: document.getElementById('authSendCodeBtn'),
   authBackBtn: document.getElementById('authBackBtn'),
   authAlert: document.getElementById('authAlert'),
+  authToggleLink: document.getElementById('authToggleLink'),
   forgotPasswordLink: document.getElementById('forgotPasswordLink'),
   forgotPasswordForm: document.getElementById('forgotPasswordForm'),
   forgotEmail: document.getElementById('forgotEmail'),
@@ -109,7 +114,7 @@ let activeJob = null;
 // Auth state
 let authToken = localStorage.getItem('vms_token') || null;
 let currentUser = JSON.parse(localStorage.getItem('vms_user') || 'null');
-let isRegisterMode = false;
+let authMode = 'login';
 let pendingOtpEmail = '';
 
 const ADMIN_EMAIL = 'Admin@radixsol.com';
@@ -261,6 +266,7 @@ function logout() {
   authToken = null;
   currentUser = null;
   pendingOtpEmail = '';
+  authMode = 'login';
   localStorage.removeItem('vms_token');
   localStorage.removeItem('vms_user');
   
@@ -276,13 +282,56 @@ function logout() {
   updateAuthUI();
 }
 
-// Register mode removed - only login allowed for whitelisted users
-// function toggleAuthMode() { }
+function setAuthMode(mode, options = {}) {
+  authMode = mode;
+  clearAuthAlert();
+
+  if (els.forgotPasswordForm) els.forgotPasswordForm.style.display = 'none';
+  if (els.resetPasswordForm) els.resetPasswordForm.style.display = 'none';
+  if (els.authMainForm) els.authMainForm.style.display = 'block';
+
+  const isSignup = mode === 'signup';
+  const isVerify = mode === 'verify-signup';
+
+  if (els.authTitle) els.authTitle.textContent = isVerify ? 'Verify Email' : (isSignup ? 'Sign Up' : 'Login');
+  if (els.authDesc) {
+    els.authDesc.textContent = isVerify
+      ? 'Enter the OTP verification code sent to your email.'
+      : (isSignup ? 'Create your account and verify your email.' : 'Enter your credentials to continue.');
+  }
+  if (els.authEmailLabel) els.authEmailLabel.textContent = isSignup || isVerify ? 'User Email' : 'Username/Email';
+  if (els.authConfirmPasswordField) els.authConfirmPasswordField.hidden = !isSignup;
+  if (els.authOtpField) els.authOtpField.hidden = !isVerify;
+  if (els.authPasswordField) els.authPasswordField.hidden = isVerify;
+  if (els.forgotPasswordLink) els.forgotPasswordLink.parentElement.hidden = mode !== 'login';
+  if (els.authToggleLink) {
+    els.authToggleLink.textContent = mode === 'login' ? 'New User? Sign Up' : 'Already registered? Login';
+  }
+  if (els.authSubmitBtn) {
+    els.authSubmitBtn.textContent = isVerify ? 'Verify OTP' : (isSignup ? 'Sign Up' : 'Login');
+    els.authSubmitBtn.disabled = false;
+  }
+  if (els.authBackBtn) els.authBackBtn.hidden = !isVerify;
+  if (els.authEmail) els.authEmail.disabled = isVerify;
+  if (els.authPassword) els.authPassword.disabled = isVerify;
+  if (els.authConfirmPassword) els.authConfirmPassword.disabled = isVerify;
+
+  if (!options.keepValues) {
+    if (els.authEmail) els.authEmail.value = '';
+    if (els.authPassword) els.authPassword.value = '';
+    if (els.authConfirmPassword) els.authConfirmPassword.value = '';
+    if (els.authOtp) els.authOtp.value = '';
+    pendingOtpEmail = '';
+  }
+
+  const focusTarget = isVerify ? els.authOtp : els.authEmail;
+  if (focusTarget) focusTarget.focus();
+}
 
 // Password reset functions
 function showForgotPasswordForm() {
   // Hide login form, show forgot password form (step 1)
-  els.authEmail.parentElement.parentElement.style.display = 'none';
+  if (els.authMainForm) els.authMainForm.style.display = 'none';
   els.forgotPasswordForm.style.display = 'block';
   els.forgotAlert.hidden = true;
   els.forgotAlert.textContent = '';
@@ -290,7 +339,7 @@ function showForgotPasswordForm() {
 
 function showResetPasswordForm(token) {
   // Show reset password form (step 2 - from email link)
-  els.authEmail.parentElement.parentElement.style.display = 'none';
+  if (els.authMainForm) els.authMainForm.style.display = 'none';
   els.forgotPasswordForm.style.display = 'none';
   els.resetPasswordForm.style.display = 'block';
   els.resetToken.value = token || '';
@@ -302,8 +351,7 @@ function showLoginForm() {
   // Hide all forms, show login form
   els.forgotPasswordForm.style.display = 'none';
   els.resetPasswordForm.style.display = 'none';
-  els.authEmail.parentElement.parentElement.style.display = 'block';
-  resetOtpFlow();
+  setAuthMode('login');
   els.authAlert.hidden = true;
   els.authAlert.textContent = '';
 }
@@ -411,153 +459,146 @@ async function handleAuthSubmit() {
   
   const email = els.authEmail.value.trim();
   const password = els.authPassword ? els.authPassword.value : '';
+  const confirmPassword = els.authConfirmPassword ? els.authConfirmPassword.value : '';
   
   if (!email) return showAuthAlert('error', 'Email is required');
 
-  const verifyingOtp = els.authOtpField && !els.authOtpField.hidden;
-  const endpoint = verifyingOtp ? '/api/auth/verify-otp' : '/api/auth/login';
-  const body = verifyingOtp
-    ? { email: pendingOtpEmail || email, otp: (els.authOtp.value || '').trim() }
-    : { email, password };
+  if (authMode === 'login') {
+    if (!password) return showAuthAlert('error', 'Password is required');
+    return handleLogin(email, password);
+  }
 
-  if (verifyingOtp && !body.otp) return showAuthAlert('error', 'Verification code is required');
-  if (!verifyingOtp && !password) return showAuthAlert('error', 'Password is required');
-  
+  if (authMode === 'signup') {
+    if (!password) return showAuthAlert('error', 'Password is required');
+    if (password.length < 6) return showAuthAlert('error', 'Password must be at least 6 characters');
+    if (password !== confirmPassword) return showAuthAlert('error', 'Passwords do not match');
+    return handleSignup(email, password);
+  }
+
+  if (authMode === 'verify-signup') {
+    const otp = (els.authOtp.value || '').trim();
+    if (!otp) return showAuthAlert('error', 'Verification code is required');
+    return handleSignupOtpVerify(pendingOtpEmail || email, otp);
+  }
+}
+
+async function parseJsonResponse(res) {
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(text.includes('Internal Server Error') ? 'Server error. Please try again.' : text.slice(0, 100));
+  }
+}
+
+function completeLogin(data) {
+  authToken = data.access_token;
+  currentUser = data.user;
+  localStorage.setItem('vms_token', authToken);
+  localStorage.setItem('vms_user', JSON.stringify(currentUser));
+
+  if (els.authEmail) els.authEmail.value = '';
+  if (els.authPassword) els.authPassword.value = '';
+  if (els.authConfirmPassword) els.authConfirmPassword.value = '';
+  if (els.authOtp) els.authOtp.value = '';
+  pendingOtpEmail = '';
+  setAuthMode('login', { keepValues: true });
+  showAuthAlert('ok', 'Logged in successfully!');
+
+  setTimeout(async () => {
+    updateAuthUI();
+    setView('jobs');
+    await loadCeipalStatus();
+    await loadJobs();
+  }, 800);
+}
+
+async function handleLogin(email, password) {
   try {
     if (els.authSubmitBtn) {
       els.authSubmitBtn.disabled = true;
-      els.authSubmitBtn.textContent = verifyingOtp ? 'Verifying...' : 'Signing In...';
+      els.authSubmitBtn.textContent = 'Logging in...';
     }
 
-    const res = await fetch(`${API_BASE}${endpoint}`, {
+    const res = await fetch(`${API_BASE}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
+      body: JSON.stringify({ email, password })
     });
-    
-    const text = await res.text();
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      // Server returned HTML error page
-      throw new Error(text.includes('Internal Server Error') ? 'Server error. Please try again.' : text.slice(0, 100));
-    }
-    
+
+    const data = await parseJsonResponse(res);
     if (!res.ok) {
       throw new Error(data.detail || data.message || `Error: ${res.status}`);
     }
-    
-    // Store token and user
-    authToken = data.access_token;
-    currentUser = data.user;
-    localStorage.setItem('vms_token', authToken);
-    localStorage.setItem('vms_user', JSON.stringify(currentUser));
-    
-    // Clear form
-    els.authEmail.value = '';
-    els.authEmail.disabled = false;
-    if (els.authPassword) els.authPassword.value = '';
-    if (els.authPassword) els.authPassword.disabled = false;
-    if (els.authPasswordField) els.authPasswordField.hidden = false;
-    if (els.authOtp) els.authOtp.value = '';
-    if (els.authOtpField) els.authOtpField.hidden = true;
-    if (els.authBackBtn) els.authBackBtn.hidden = true;
-    if (els.authSendCodeBtn) els.authSendCodeBtn.hidden = false;
-    els.authSubmitBtn.textContent = 'Sign In';
-    pendingOtpEmail = '';
-    
-    // Show success message briefly then switch to jobs
-    showAuthAlert('ok', 'Logged in successfully!');
-    
-    setTimeout(async () => {
-      updateAuthUI();
-      setView('jobs');  // Redirect to VMS interface
-      await loadCeipalStatus();
-      await loadJobs();
-    }, 800);
-    
+
+    completeLogin(data);
   } catch (e) {
     showAuthAlert('error', e.message);
-    if (els.authSubmitBtn) {
-      els.authSubmitBtn.textContent = verifyingOtp ? 'Verify Code' : 'Sign In';
-    }
+    if (els.authSubmitBtn) els.authSubmitBtn.textContent = 'Login';
   } finally {
     if (els.authSubmitBtn) els.authSubmitBtn.disabled = false;
   }
 }
 
-async function handleSendCode() {
-  clearAuthAlert();
-
-  const email = els.authEmail.value.trim();
-  if (!email) return showAuthAlert('error', 'Email is required');
-
+async function handleSignup(email, password) {
   try {
-    if (els.authSendCodeBtn) {
-      els.authSendCodeBtn.disabled = true;
-      els.authSendCodeBtn.textContent = 'Sending...';
+    if (els.authSubmitBtn) {
+      els.authSubmitBtn.disabled = true;
+      els.authSubmitBtn.textContent = 'Sending OTP...';
     }
 
-    const res = await fetch(`${API_BASE}/api/auth/request-otp`, {
+    const res = await fetch(`${API_BASE}/api/auth/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email })
+      body: JSON.stringify({ email, password })
     });
 
-    const text = await res.text();
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      throw new Error(text.includes('Internal Server Error') ? 'Server error. Please try again.' : text.slice(0, 100));
-    }
-
+    const data = await parseJsonResponse(res);
     if (!res.ok) {
       throw new Error(data.detail || data.message || `Error: ${res.status}`);
     }
 
     pendingOtpEmail = email;
-    els.authEmail.disabled = true;
-    if (els.authPassword) {
-      els.authPassword.value = '';
-      els.authPassword.disabled = true;
-    }
-    if (els.authPasswordField) els.authPasswordField.hidden = true;
-    if (els.authOtpField) els.authOtpField.hidden = false;
-    if (els.authOtp) {
-      els.authOtp.value = '';
-      els.authOtp.focus();
-    }
-    if (els.authBackBtn) els.authBackBtn.hidden = false;
-    if (els.authSendCodeBtn) els.authSendCodeBtn.hidden = true;
-    if (els.authSubmitBtn) els.authSubmitBtn.textContent = 'Verify Code';
-    showAuthAlert('ok', data.message || 'Email has been sent. Please check your inbox.');
+    setAuthMode('verify-signup', { keepValues: true });
+    showAuthAlert('ok', data.message || 'OTP sent. Please check your email.');
   } catch (e) {
     showAuthAlert('error', e.message);
+    if (els.authSubmitBtn) els.authSubmitBtn.textContent = 'Sign Up';
   } finally {
-    if (els.authSendCodeBtn) {
-      els.authSendCodeBtn.disabled = false;
-      els.authSendCodeBtn.textContent = 'Send Code';
+    if (els.authSubmitBtn) els.authSubmitBtn.disabled = false;
+  }
+}
+
+async function handleSignupOtpVerify(email, otp) {
+  try {
+    if (els.authSubmitBtn) {
+      els.authSubmitBtn.disabled = true;
+      els.authSubmitBtn.textContent = 'Verifying...';
     }
+
+    const res = await fetch(`${API_BASE}/api/auth/verify-registration-otp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, otp })
+    });
+
+    const data = await parseJsonResponse(res);
+    if (!res.ok) {
+      throw new Error(data.detail || data.message || `Error: ${res.status}`);
+    }
+
+    setAuthMode('login');
+    showAuthAlert('ok', data.message || 'Account verified. You can now log in.');
+  } catch (e) {
+    showAuthAlert('error', e.message);
+    if (els.authSubmitBtn) els.authSubmitBtn.textContent = 'Verify OTP';
+  } finally {
+    if (els.authSubmitBtn) els.authSubmitBtn.disabled = false;
   }
 }
 
 function resetOtpFlow() {
-  pendingOtpEmail = '';
-  els.authEmail.disabled = false;
-  if (els.authPassword) {
-    els.authPassword.disabled = false;
-    els.authPassword.value = '';
-  }
-  if (els.authPasswordField) els.authPasswordField.hidden = false;
-  if (els.authOtp) els.authOtp.value = '';
-  if (els.authOtpField) els.authOtpField.hidden = true;
-  if (els.authBackBtn) els.authBackBtn.hidden = true;
-  if (els.authSendCodeBtn) els.authSendCodeBtn.hidden = false;
-  if (els.authSubmitBtn) els.authSubmitBtn.textContent = 'Sign In';
-  clearAuthAlert();
-  els.authEmail.focus();
+  setAuthMode(authMode === 'verify-signup' ? 'signup' : 'login', { keepValues: true });
 }
 
 // Modified API function that includes auth token
@@ -855,7 +896,7 @@ function setView(view) {
 
   if (view === 'auth') {
     els.pageTitle.textContent = 'Authentication';
-    els.pageSubtitle.textContent = 'Sign in with your password or request an email code.';
+    els.pageSubtitle.textContent = 'Login or sign up with email verification.';
   }
   if (view === 'jobs') {
     els.pageTitle.textContent = 'Jobs';
@@ -1727,12 +1768,15 @@ if (els.authSubmitBtn) {
   els.authSubmitBtn.addEventListener('click', handleAuthSubmit);
 }
 
-if (els.authSendCodeBtn) {
-  els.authSendCodeBtn.addEventListener('click', handleSendCode);
-}
-
 if (els.authBackBtn) {
   els.authBackBtn.addEventListener('click', resetOtpFlow);
+}
+
+if (els.authToggleLink) {
+  els.authToggleLink.addEventListener('click', (e) => {
+    e.preventDefault();
+    setAuthMode(authMode === 'login' ? 'signup' : 'login');
+  });
 }
 
 // Password reset event listeners
