@@ -48,9 +48,12 @@ const els = {
   systemNavBtn: document.getElementById('systemNavBtn'),
   authTitle: document.getElementById('authTitle'),
   authEmail: document.getElementById('authEmail'),
+  authPasswordField: document.getElementById('authPasswordField'),
+  authPassword: document.getElementById('authPassword'),
   authOtpField: document.getElementById('authOtpField'),
   authOtp: document.getElementById('authOtp'),
   authSubmitBtn: document.getElementById('authSubmitBtn'),
+  authSendCodeBtn: document.getElementById('authSendCodeBtn'),
   authBackBtn: document.getElementById('authBackBtn'),
   authAlert: document.getElementById('authAlert'),
   forgotPasswordLink: document.getElementById('forgotPasswordLink'),
@@ -300,6 +303,7 @@ function showLoginForm() {
   els.forgotPasswordForm.style.display = 'none';
   els.resetPasswordForm.style.display = 'none';
   els.authEmail.parentElement.parentElement.style.display = 'block';
+  resetOtpFlow();
   els.authAlert.hidden = true;
   els.authAlert.textContent = '';
 }
@@ -406,18 +410,25 @@ async function handleAuthSubmit() {
   clearAuthAlert();
   
   const email = els.authEmail.value.trim();
+  const password = els.authPassword ? els.authPassword.value : '';
   
   if (!email) return showAuthAlert('error', 'Email is required');
 
   const verifyingOtp = els.authOtpField && !els.authOtpField.hidden;
-  const endpoint = verifyingOtp ? '/api/auth/verify-otp' : '/api/auth/request-otp';
+  const endpoint = verifyingOtp ? '/api/auth/verify-otp' : '/api/auth/login';
   const body = verifyingOtp
     ? { email: pendingOtpEmail || email, otp: (els.authOtp.value || '').trim() }
-    : { email };
+    : { email, password };
 
   if (verifyingOtp && !body.otp) return showAuthAlert('error', 'Verification code is required');
+  if (!verifyingOtp && !password) return showAuthAlert('error', 'Password is required');
   
   try {
+    if (els.authSubmitBtn) {
+      els.authSubmitBtn.disabled = true;
+      els.authSubmitBtn.textContent = verifyingOtp ? 'Verifying...' : 'Signing In...';
+    }
+
     const res = await fetch(`${API_BASE}${endpoint}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -436,20 +447,6 @@ async function handleAuthSubmit() {
     if (!res.ok) {
       throw new Error(data.detail || data.message || `Error: ${res.status}`);
     }
-
-    if (!verifyingOtp) {
-      pendingOtpEmail = email;
-      els.authEmail.disabled = true;
-      if (els.authOtpField) els.authOtpField.hidden = false;
-      if (els.authOtp) {
-        els.authOtp.value = '';
-        els.authOtp.focus();
-      }
-      if (els.authBackBtn) els.authBackBtn.hidden = false;
-      els.authSubmitBtn.textContent = 'Verify Code';
-      showAuthAlert('ok', data.message || 'Verification code sent. Please check your email.');
-      return;
-    }
     
     // Store token and user
     authToken = data.access_token;
@@ -460,10 +457,14 @@ async function handleAuthSubmit() {
     // Clear form
     els.authEmail.value = '';
     els.authEmail.disabled = false;
+    if (els.authPassword) els.authPassword.value = '';
+    if (els.authPassword) els.authPassword.disabled = false;
+    if (els.authPasswordField) els.authPasswordField.hidden = false;
     if (els.authOtp) els.authOtp.value = '';
     if (els.authOtpField) els.authOtpField.hidden = true;
     if (els.authBackBtn) els.authBackBtn.hidden = true;
-    els.authSubmitBtn.textContent = 'Send Code';
+    if (els.authSendCodeBtn) els.authSendCodeBtn.hidden = false;
+    els.authSubmitBtn.textContent = 'Sign In';
     pendingOtpEmail = '';
     
     // Show success message briefly then switch to jobs
@@ -478,16 +479,83 @@ async function handleAuthSubmit() {
     
   } catch (e) {
     showAuthAlert('error', e.message);
+    if (els.authSubmitBtn) {
+      els.authSubmitBtn.textContent = verifyingOtp ? 'Verify Code' : 'Sign In';
+    }
+  } finally {
+    if (els.authSubmitBtn) els.authSubmitBtn.disabled = false;
+  }
+}
+
+async function handleSendCode() {
+  clearAuthAlert();
+
+  const email = els.authEmail.value.trim();
+  if (!email) return showAuthAlert('error', 'Email is required');
+
+  try {
+    if (els.authSendCodeBtn) {
+      els.authSendCodeBtn.disabled = true;
+      els.authSendCodeBtn.textContent = 'Sending...';
+    }
+
+    const res = await fetch(`${API_BASE}/api/auth/request-otp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email })
+    });
+
+    const text = await res.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(text.includes('Internal Server Error') ? 'Server error. Please try again.' : text.slice(0, 100));
+    }
+
+    if (!res.ok) {
+      throw new Error(data.detail || data.message || `Error: ${res.status}`);
+    }
+
+    pendingOtpEmail = email;
+    els.authEmail.disabled = true;
+    if (els.authPassword) {
+      els.authPassword.value = '';
+      els.authPassword.disabled = true;
+    }
+    if (els.authPasswordField) els.authPasswordField.hidden = true;
+    if (els.authOtpField) els.authOtpField.hidden = false;
+    if (els.authOtp) {
+      els.authOtp.value = '';
+      els.authOtp.focus();
+    }
+    if (els.authBackBtn) els.authBackBtn.hidden = false;
+    if (els.authSendCodeBtn) els.authSendCodeBtn.hidden = true;
+    if (els.authSubmitBtn) els.authSubmitBtn.textContent = 'Verify Code';
+    showAuthAlert('ok', data.message || 'Email has been sent. Please check your inbox.');
+  } catch (e) {
+    showAuthAlert('error', e.message);
+  } finally {
+    if (els.authSendCodeBtn) {
+      els.authSendCodeBtn.disabled = false;
+      els.authSendCodeBtn.textContent = 'Send Code';
+    }
   }
 }
 
 function resetOtpFlow() {
   pendingOtpEmail = '';
   els.authEmail.disabled = false;
+  if (els.authPassword) {
+    els.authPassword.disabled = false;
+    els.authPassword.value = '';
+  }
+  if (els.authPasswordField) els.authPasswordField.hidden = false;
   if (els.authOtp) els.authOtp.value = '';
   if (els.authOtpField) els.authOtpField.hidden = true;
   if (els.authBackBtn) els.authBackBtn.hidden = true;
-  if (els.authSubmitBtn) els.authSubmitBtn.textContent = 'Send Code';
+  if (els.authSendCodeBtn) els.authSendCodeBtn.hidden = false;
+  if (els.authSubmitBtn) els.authSubmitBtn.textContent = 'Sign In';
   clearAuthAlert();
   els.authEmail.focus();
 }
@@ -787,7 +855,7 @@ function setView(view) {
 
   if (view === 'auth') {
     els.pageTitle.textContent = 'Authentication';
-    els.pageSubtitle.textContent = 'Sign in with your email verification code.';
+    els.pageSubtitle.textContent = 'Sign in with your password or request an email code.';
   }
   if (view === 'jobs') {
     els.pageTitle.textContent = 'Jobs';
@@ -1657,6 +1725,10 @@ if (els.logoutBtn) {
 
 if (els.authSubmitBtn) {
   els.authSubmitBtn.addEventListener('click', handleAuthSubmit);
+}
+
+if (els.authSendCodeBtn) {
+  els.authSendCodeBtn.addEventListener('click', handleSendCode);
 }
 
 if (els.authBackBtn) {

@@ -1271,8 +1271,15 @@ async def request_login_otp(request_data: OtpRequest, request: Request):
         "ip_address": get_client_ip(request),
     }
 
-    await asyncio.to_thread(send_login_otp_email, email_lower, otp)
-    return {"message": "Verification code sent. Please check your email.", "expires_minutes": OTP_EXPIRE_MINUTES}
+    email_sent = await asyncio.to_thread(send_login_otp_email, email_lower, otp)
+    if not email_sent:
+        _email_otp_tokens.pop(email_lower, None)
+        raise HTTPException(
+            status_code=503,
+            detail="We could not send the verification code. Please contact support.",
+        )
+
+    return {"message": "Email has been sent. Please check your inbox.", "expires_minutes": OTP_EXPIRE_MINUTES}
 
 
 @app.post("/api/auth/verify-otp", response_model=Token)
@@ -1320,8 +1327,34 @@ async def verify_login_otp(request_data: OtpVerify):
 
 @app.post("/api/auth/login", response_model=Token)
 async def login(user_data: UserLogin):
-    """Legacy password login is disabled; use email OTP sign-in."""
-    raise HTTPException(status_code=410, detail="Password login has been replaced by email OTP sign-in.")
+    """Login existing users with email and password."""
+    email_lower = user_data.email.lower().strip()
+    users = load_users_from_json()
+    user = users.get(email_lower)
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+    if user.get("is_active") != "true":
+        raise HTTPException(status_code=400, detail="Inactive user")
+    if not verify_password(user_data.password, user["hashed_password"]):
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+
+    access_token = create_access_token(
+        data={"sub": user["email"]},
+        expires_delta=timedelta(days=SESSION_EXPIRE_DAYS),
+    )
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "id": user["id"],
+            "email": user["email"],
+            "full_name": user["full_name"],
+            "is_active": user["is_active"],
+            "created_at": user["created_at"]
+        }
+    }
 
 class ForgotPasswordRequest(BaseModel):
     email: str
