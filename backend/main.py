@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, status, Form, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, status, Form, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPBasic, HTTPBasicCredentials
@@ -21,6 +21,10 @@ from jose import JWTError, jwt
 from uuid import uuid4
 import asyncio
 import tempfile
+import secrets
+import hashlib
+import smtplib
+from email.message import EmailMessage
 from pymongo import MongoClient
 from pymongo.server_api import ServerApi
 from bson.objectid import ObjectId
@@ -40,11 +44,12 @@ jobs_collection = None
 job_status_tracker_collection = None
 closure_audit_collection = None
 manual_jobs_collection = None
+submission_logs_collection = None
 fs = None
 
 def init_mongodb():
     """Initialize MongoDB connection"""
-    global mongo_client, db, users_collection, whitelist_collection, candidates_collection, notifications_collection, jobs_collection, job_status_tracker_collection, closure_audit_collection, manual_jobs_collection, fs
+    global mongo_client, db, users_collection, whitelist_collection, candidates_collection, notifications_collection, jobs_collection, job_status_tracker_collection, closure_audit_collection, manual_jobs_collection, submission_logs_collection, fs
     
     print(f"[MongoDB] Checking configuration...")
     print(f"[MongoDB] MONGODB_URI present: {bool(MONGODB_URI)}")
@@ -67,6 +72,7 @@ def init_mongodb():
         job_status_tracker_collection = db.job_status_tracker  # Fresh tracker for closure detection (separate from legacy `jobs`)
         closure_audit_collection = db.closure_audit  # Audit log for detected closures (dry-run + live)
         manual_jobs_collection = db.manual_jobs  # Direct API-ingested jobs
+        submission_logs_collection = db.submission_logs  # Immutable audit log for candidate submissions
         
         # Initialize GridFS for file storage
         import gridfs
@@ -83,22 +89,29 @@ def init_mongodb():
 # Initialize MongoDB on startup
 mongodb_enabled = init_mongodb()
 
-# SendGrid email setup for password reset
+# SendGrid email setup for OTP, password reset, and notifications
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
-SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL", "noreply@radixsol.com")
+SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL", "notifications@radixsol.com")
 APP_URL = os.getenv("APP_URL", "https://vms-1-xlkv.onrender.com")  # Your Render app URL
+
+# Optional SMTP fallback for local development when SendGrid is not configured.
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.office365.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", SMTP_USERNAME or SENDGRID_FROM_EMAIL)
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() in {"1", "true", "yes", "y"}
 
 # Job closure notification config — defaults to dry-run for safety after the 2000+ false-notification incident.
 # Flip JOB_CLOSURE_NOTIFICATIONS_ENABLED=true on Render only after watching audit logs confirm real transitions.
 JOB_CLOSURE_NOTIFICATIONS_ENABLED = os.getenv("JOB_CLOSURE_NOTIFICATIONS_ENABLED", "false").lower() == "true"
 JOB_CLOSURE_PER_RUN_CAP = int(os.getenv("JOB_CLOSURE_PER_RUN_CAP", "25"))
 
-# Recipients for new-submission notification emails. Comma-separated env var; defaults include
-# the team mailbox plus admin so internal stakeholders see every submission.
+# Recipients for new-submission notification emails. Comma-separated env var.
 SUBMISSION_NOTIFICATION_RECIPIENTS = [
     addr.strip() for addr in os.getenv(
         "SUBMISSION_NOTIFICATION_RECIPIENTS",
-        "support.vms@radixsol.com,admin@radixsol.com",
+        "it.support@radixsol.com",
     ).split(",") if addr.strip()
 ]
 
@@ -106,40 +119,157 @@ SUBMISSION_NOTIFICATION_RECIPIENTS = [
 # Structure: {token: {email: str, expires: datetime, used: bool}}
 _password_reset_tokens = {}
 
-def send_password_reset_email(email: str, reset_token: str) -> bool:
-    """Send password reset email via SendGrid"""
-    if not SENDGRID_API_KEY:
-        print(f"[Email] SendGrid not configured. Token for {email}: {reset_token}")
+# In-memory OTP storage. MongoDB is intentionally not required because codes are short-lived.
+# Structure: {email: {otp_hash: str, expires: datetime, attempts: int, user_agent: str}}
+_email_otp_tokens = {}
+
+OTP_EXPIRE_MINUTES = int(os.getenv("OTP_EXPIRE_MINUTES", "10"))
+OTP_MAX_ATTEMPTS = int(os.getenv("OTP_MAX_ATTEMPTS", "5"))
+
+
+def _hash_otp(otp: str) -> str:
+    return hashlib.sha256(otp.encode("utf-8")).hexdigest()
+
+
+def _smtp_configured() -> bool:
+    return bool(SMTP_HOST and SMTP_PORT and SMTP_USERNAME and SMTP_PASSWORD and SMTP_FROM_EMAIL)
+
+
+def send_sendgrid_email(to_emails, subject: str, html_content: str, text_content: Optional[str] = None) -> bool:
+    """Send an email using SendGrid."""
+    recipients = to_emails if isinstance(to_emails, list) else [to_emails]
+    recipients = [addr for addr in recipients if addr]
+    if not recipients:
+        print("[Email] No recipients provided")
         return False
-    
+    if not SENDGRID_API_KEY:
+        print(f"[Email] SendGrid not configured. Would send '{subject}' to {recipients}")
+        return False
+
     try:
         from sendgrid import SendGridAPIClient
         from sendgrid.helpers.mail import Mail
-        
-        # Build reset URL
-        reset_url = f"{APP_URL}?token={reset_token}"
-        
+
         message = Mail(
             from_email=SENDGRID_FROM_EMAIL,
-            to_emails=email,
-            subject='Password Reset - Vendor Management System',
-            html_content=f'''
-                <h2>Password Reset Request</h2>
-                <p>You requested a password reset for your Vendor Management System account.</p>
-                <p><a href="{reset_url}" style="padding: 12px 24px; background: #7c3aed; color: white; text-decoration: none; border-radius: 6px;">Reset Password</a></p>
-                <p>Or copy this link: {reset_url}</p>
-                <p>This link expires in 1 hour.</p>
-                <p>If you didn't request this, please ignore this email.</p>
-            '''
+            to_emails=recipients,
+            subject=subject,
+            html_content=html_content,
+            plain_text_content=text_content,
         )
-        
+
+        import time
         sg = SendGridAPIClient(SENDGRID_API_KEY)
+        t0 = time.monotonic()
         response = sg.send(message)
-        print(f"[Email] Password reset sent to {email}, status: {response.status_code}")
-        return response.status_code == 202
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        status_code = getattr(response, "status_code", None)
+        msg_id = None
+        try:
+            headers = getattr(response, "headers", {}) or {}
+            msg_id = headers.get("X-Message-Id") if hasattr(headers, "get") else None
+        except Exception:
+            pass
+        print(f"[Email] SendGrid responded in {elapsed_ms}ms status={status_code} msg_id={msg_id} recipients={recipients}")
+        return status_code == 202
     except Exception as e:
-        print(f"[Email] Error sending email: {e}")
+        import traceback
+        print(f"[Email] SendGrid send failed: {e}")
+        print(f"[Email] Traceback: {traceback.format_exc()}")
         return False
+
+
+def send_smtp_email(to_emails, subject: str, html_content: str, text_content: Optional[str] = None) -> bool:
+    """Send an email using SMTP settings when configured."""
+    recipients = to_emails if isinstance(to_emails, list) else [to_emails]
+    recipients = [addr for addr in recipients if addr]
+    if not recipients:
+        print("[Email] No recipients provided")
+        return False
+    if not _smtp_configured():
+        print(f"[Email] Outlook SMTP not configured. Would send '{subject}' to {recipients}")
+        return False
+
+    try:
+        message = EmailMessage()
+        message["From"] = SMTP_FROM_EMAIL
+        message["To"] = ", ".join(recipients)
+        message["Subject"] = subject
+        message.set_content(text_content or html_content)
+        message.add_alternative(html_content, subtype="html")
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
+            if SMTP_USE_TLS:
+                smtp.starttls()
+            smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            smtp.send_message(message)
+        print(f"[Email] SMTP email sent to {recipients}: {subject}")
+        return True
+    except Exception as e:
+        print(f"[Email] SMTP send failed: {e}")
+        return False
+
+
+def send_app_email(to_emails, subject: str, html_content: str, text_content: Optional[str] = None) -> bool:
+    """Production email path is SendGrid; SMTP remains a local fallback."""
+    if send_sendgrid_email(to_emails, subject, html_content, text_content):
+        return True
+    return send_smtp_email(to_emails, subject, html_content, text_content)
+
+
+def send_login_otp_email(email: str, otp: str) -> bool:
+    html_content = f"""
+        <h2>Your VMS verification code</h2>
+        <p>Use this one-time code to sign in:</p>
+        <p style="font-size: 28px; font-weight: bold; letter-spacing: 4px;">{html.escape(otp)}</p>
+        <p>This code expires in {OTP_EXPIRE_MINUTES} minutes.</p>
+        <p>If you did not request this code, you can ignore this email.</p>
+    """
+    sent = send_app_email(
+        email,
+        "Your VMS sign-in code",
+        html_content,
+        text_content=f"Your VMS sign-in code is {otp}. It expires in {OTP_EXPIRE_MINUTES} minutes.",
+    )
+    if not sent:
+        if globals().get("DEBUG", False) or globals().get("TESTING_MODE", False):
+            print(f"[Auth] OTP for {email}: {otp} (email not configured or failed)")
+        else:
+            print(f"[Auth] OTP email failed for {email}")
+    return sent
+
+
+def cleanup_expired_otps():
+    now = datetime.now()
+    expired = [email for email, data in _email_otp_tokens.items() if data["expires"] < now]
+    for email in expired:
+        del _email_otp_tokens[email]
+    if expired:
+        print(f"[Auth] Cleaned up {len(expired)} expired OTPs")
+
+def send_password_reset_email(email: str, reset_token: str) -> bool:
+    """Send password reset email via SendGrid"""
+    reset_url = f"{APP_URL}?token={reset_token}"
+    html_content = f'''
+        <h2>Password Reset Request</h2>
+        <p>You requested a password reset for your Vendor Management System account.</p>
+        <p><a href="{html.escape(reset_url)}" style="padding: 12px 24px; background: #7c3aed; color: white; text-decoration: none; border-radius: 6px;">Reset Password</a></p>
+        <p>Or copy this link: {html.escape(reset_url)}</p>
+        <p>This link expires in 1 hour.</p>
+        <p>If you didn't request this, please ignore this email.</p>
+    '''
+    sent = send_app_email(
+        email,
+        'Password Reset - Vendor Management System',
+        html_content,
+        text_content=f"Reset your VMS password: {reset_url}\nThis link expires in 1 hour.",
+    )
+    if not sent:
+        if globals().get("DEBUG", False) or globals().get("TESTING_MODE", False):
+            print(f"[Email] Password reset email failed. Token for {email}: {reset_token}")
+        else:
+            print(f"[Email] Password reset email failed for {email}")
+    return sent
 
 def cleanup_expired_tokens():
     """Remove expired password reset tokens"""
@@ -151,46 +281,45 @@ def cleanup_expired_tokens():
         print(f"[Auth] Cleaned up {len(expired)} expired reset tokens")
 
 def send_submission_notification_email(candidate_data: dict, vendor_info: dict) -> bool:
-    """Send candidate submission notification to admin via SendGrid"""
-    if not SENDGRID_API_KEY:
-        print(f"[Email] SendGrid not configured. Cannot send submission notification.")
-        return False
-    
+    """Send candidate submission notification to admin via configured email provider."""
     try:
-        from sendgrid import SendGridAPIClient
-        from sendgrid.helpers.mail import Mail
-        
         # Build email content
-        candidate_name = candidate_data.get('name', 'N/A')
-        job_title = candidate_data.get('job_title', 'N/A')
-        job_id = candidate_data.get('job_id', 'N/A')
-        vendor_name = vendor_info.get('full_name', 'N/A')
-        vendor_email = vendor_info.get('email', 'N/A')
-        bill_rate = candidate_data.get('bill_rate', 'N/A')
-        location = candidate_data.get('current_location', 'N/A')
-        skills = candidate_data.get('primary_skills', 'N/A')
-        candidate_email = candidate_data.get('email', 'N/A')
-        candidate_phone = candidate_data.get('phone', 'N/A')
+        candidate_name = str(candidate_data.get('name') or 'N/A')
+        job_title = str(candidate_data.get('job_title') or 'N/A')
+        job_id = str(candidate_data.get('job_id') or 'N/A')
+        vendor_name = str(vendor_info.get('full_name') or 'N/A')
+        vendor_email = str(vendor_info.get('email') or 'N/A')
+        bill_rate = str(candidate_data.get('bill_rate') or 'N/A')
+        location = str(candidate_data.get('current_location') or 'N/A')
+        skills = str(candidate_data.get('primary_skills') or 'N/A')
+        candidate_email = str(candidate_data.get('email') or 'N/A')
+        candidate_phone = str(candidate_data.get('phone') or 'N/A')
+        submitted_at = str(candidate_data.get('submitted_date') or 'N/A')
+        ip_address = str(candidate_data.get('submission_ip_address') or 'N/A')
+        user_agent = str(candidate_data.get('submission_user_agent') or 'N/A')
         
         html_content = f'''
             <h2>New Candidate Submission</h2>
-            <p>A new candidate has been submitted by <strong>{vendor_name}</strong> ({vendor_email}).</p>
+            <p>A new candidate has been submitted by <strong>{html.escape(vendor_name)}</strong> ({html.escape(vendor_email)}).</p>
             
             <h3>Candidate Details:</h3>
             <table style="border-collapse: collapse; width: 100%; max-width: 600px;">
-                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Name:</td><td style="padding: 8px; border: 1px solid #ddd;">{candidate_name}</td></tr>
-                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Email:</td><td style="padding: 8px; border: 1px solid #ddd;">{candidate_email}</td></tr>
-                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Phone:</td><td style="padding: 8px; border: 1px solid #ddd;">{candidate_phone}</td></tr>
-                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Job Title:</td><td style="padding: 8px; border: 1px solid #ddd;">{job_title}</td></tr>
-                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Job ID:</td><td style="padding: 8px; border: 1px solid #ddd;">{job_id}</td></tr>
-                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Bill Rate:</td><td style="padding: 8px; border: 1px solid #ddd;">{bill_rate}</td></tr>
-                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Location:</td><td style="padding: 8px; border: 1px solid #ddd;">{location}</td></tr>
-                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Skills:</td><td style="padding: 8px; border: 1px solid #ddd;">{skills}</td></tr>
-                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Submitted By:</td><td style="padding: 8px; border: 1px solid #ddd;">{vendor_name} ({vendor_email})</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Name:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(candidate_name)}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Email:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(candidate_email)}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Phone:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(candidate_phone)}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Job Title:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(job_title)}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Job ID:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(job_id)}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Bill Rate:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(bill_rate)}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Location:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(location)}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Skills:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(skills)}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Submitted By:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(vendor_name)} ({html.escape(vendor_email)})</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Submitted At:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(submitted_at)}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">IP Address:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(ip_address)}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">User Agent:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(user_agent)}</td></tr>
             </table>
             
             <p style="margin-top: 20px;">
-                <a href="{APP_URL}" style="padding: 12px 24px; background: #7c3aed; color: white; text-decoration: none; border-radius: 6px;">View in VMS Dashboard</a>
+                <a href="{html.escape(APP_URL)}" style="padding: 12px 24px; background: #7c3aed; color: white; text-decoration: none; border-radius: 6px;">View in VMS Dashboard</a>
             </p>
             
             <p style="color: #666; font-size: 12px; margin-top: 30px;">
@@ -199,26 +328,22 @@ def send_submission_notification_email(candidate_data: dict, vendor_info: dict) 
         '''
         
         recipients = SUBMISSION_NOTIFICATION_RECIPIENTS or [ADMIN_EMAIL]
-        message = Mail(
-            from_email=SENDGRID_FROM_EMAIL,
-            to_emails=recipients,
-            subject=f'New Candidate Submission: {candidate_name} for {job_title}',
-            html_content=html_content
-        )
+        subject = f'New Candidate Submission: {candidate_name} for {job_title}'
 
-        import time
-        sg = SendGridAPIClient(SENDGRID_API_KEY)
-        t0 = time.monotonic()
-        response = sg.send(message)
-        elapsed_ms = int((time.monotonic() - t0) * 1000)
-        msg_id = None
-        try:
-            headers = getattr(response, "headers", {}) or {}
-            msg_id = headers.get("X-Message-Id") if hasattr(headers, "get") else None
-        except Exception:
-            pass
-        print(f"[SubmissionMail] SendGrid responded in {elapsed_ms}ms status={response.status_code} msg_id={msg_id} recipients={recipients}")
-        return response.status_code == 202
+        return send_app_email(
+            recipients,
+            subject,
+            html_content,
+            text_content=(
+                f"New candidate submission\n"
+                f"Candidate: {candidate_name}\n"
+                f"Email: {candidate_email}\n"
+                f"Phone: {candidate_phone}\n"
+                f"Job: {job_title} ({job_id})\n"
+                f"Submitted by: {vendor_name} ({vendor_email})\n"
+                f"Submitted at: {submitted_at}"
+            ),
+        )
     except Exception as e:
         import traceback
         print(f"[Email] Error sending submission notification: {e}")
@@ -759,6 +884,7 @@ Base = declarative_base()
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+SESSION_EXPIRE_DAYS = int(os.getenv("SESSION_EXPIRE_DAYS", "7"))
 
 
 # Password hashing - use bcrypt directly (passlib incompatible with bcrypt 4.x)
@@ -995,6 +1121,13 @@ class UserLogin(BaseModel):
     email: str
     password: str
 
+class OtpRequest(BaseModel):
+    email: str
+
+class OtpVerify(BaseModel):
+    email: str
+    otp: str
+
 class UserResponse(BaseModel):
     id: str
     email: str
@@ -1081,37 +1214,97 @@ def verify_admin_credentials(email: str, password: str) -> None:
 # Auth Endpoints
 @app.post("/api/auth/register", response_model=Token)
 async def register(user_data: UserCreate):
-    """Register a new user - only whitelisted emails allowed (JSON storage)"""
+    """Legacy password registration is disabled; admins should whitelist emails instead."""
+    raise HTTPException(status_code=410, detail="Password registration has been replaced by admin whitelisting and email OTP sign-in.")
+
+def get_or_create_otp_user(email: str) -> dict:
+    """Return an active whitelisted user, creating a profile on first OTP login."""
     global _users_cache
-    
-    # Check if email is in whitelist
-    if user_data.email.lower() not in WHITELISTED_USERS:
-        raise HTTPException(status_code=403, detail="Email not authorized. Contact admin for access.")
-    
-    # Check if user already exists
-    if user_data.email.lower() in _users_cache:
-        raise HTTPException(status_code=400, detail="Email already registered")
-    
-    # Create new user
-    user_id = str(uuid4())
-    hashed_password = get_password_hash(user_data.password)
-    
-    user = {
-        "id": user_id,
-        "email": user_data.email,
-        "full_name": user_data.full_name,
-        "hashed_password": hashed_password,
-        "is_active": "true",
-        "created_at": datetime.now().isoformat()
+
+    email = (email or "").strip()
+    email_lower = email.lower()
+    _users_cache = load_users_from_json()
+    user = _users_cache.get(email_lower)
+
+    if not user:
+        if email_lower not in WHITELISTED_USERS:
+            raise HTTPException(status_code=401, detail="Email is not authorized for portal access")
+
+        print(f"[Auth] Auto-creating OTP user: {email}")
+        user_id = str(uuid4())
+        user = {
+            "id": user_id,
+            "email": email,
+            "full_name": email.split('@')[0],
+            "hashed_password": get_password_hash(secrets.token_urlsafe(32)),
+            "is_active": "true",
+            "created_at": datetime.now().isoformat()
+        }
+        _users_cache[email_lower] = user
+        save_users_to_json(_users_cache)
+
+    if user.get("is_active") != "true":
+        raise HTTPException(status_code=400, detail="Inactive user")
+    return user
+
+
+@app.post("/api/auth/request-otp")
+async def request_login_otp(request_data: OtpRequest, request: Request):
+    """Send a one-time email verification code to a whitelisted user."""
+    cleanup_expired_otps()
+
+    email = request_data.email.strip()
+    email_lower = email.lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid email is required")
+
+    # Do not create a user until the OTP is verified, but require whitelist before sending.
+    if email_lower not in WHITELISTED_USERS:
+        raise HTTPException(status_code=401, detail="Email is not authorized for portal access")
+
+    otp = f"{secrets.randbelow(1000000):06d}"
+    _email_otp_tokens[email_lower] = {
+        "otp_hash": _hash_otp(otp),
+        "expires": datetime.now() + timedelta(minutes=OTP_EXPIRE_MINUTES),
+        "attempts": 0,
+        "user_agent": request.headers.get("user-agent", ""),
+        "ip_address": get_client_ip(request),
     }
-    
-    # Save to JSON file
-    _users_cache[user_data.email.lower()] = user
-    save_users_to_json(_users_cache)
-    
-    # Create access token
-    access_token = create_access_token(data={"sub": user["email"]})
-    
+
+    await asyncio.to_thread(send_login_otp_email, email_lower, otp)
+    return {"message": "Verification code sent. Please check your email.", "expires_minutes": OTP_EXPIRE_MINUTES}
+
+
+@app.post("/api/auth/verify-otp", response_model=Token)
+async def verify_login_otp(request_data: OtpVerify):
+    """Verify email OTP and return a 7-day JWT session."""
+    cleanup_expired_otps()
+
+    email_lower = request_data.email.lower().strip()
+    otp = (request_data.otp or "").strip()
+    token_data = _email_otp_tokens.get(email_lower)
+
+    if not token_data:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+    if token_data["expires"] < datetime.now():
+        del _email_otp_tokens[email_lower]
+        raise HTTPException(status_code=400, detail="Verification code has expired")
+    if token_data["attempts"] >= OTP_MAX_ATTEMPTS:
+        del _email_otp_tokens[email_lower]
+        raise HTTPException(status_code=429, detail="Too many failed attempts. Request a new code.")
+
+    token_data["attempts"] += 1
+    if _hash_otp(otp) != token_data["otp_hash"]:
+        raise HTTPException(status_code=400, detail="Invalid verification code")
+
+    user = get_or_create_otp_user(email_lower)
+    del _email_otp_tokens[email_lower]
+
+    access_token = create_access_token(
+        data={"sub": user["email"]},
+        expires_delta=timedelta(days=SESSION_EXPIRE_DAYS),
+    )
+
     return {
         "access_token": access_token,
         "token_type": "bearer",
@@ -1124,58 +1317,11 @@ async def register(user_data: UserCreate):
         }
     }
 
+
 @app.post("/api/auth/login", response_model=Token)
 async def login(user_data: UserLogin):
-    """Login user and return JWT token - auto-creates whitelisted users on first login (JSON storage)"""
-    global _users_cache
-    
-    email_lower = user_data.email.lower()
-    user = _users_cache.get(email_lower)
-    
-    # If user doesn't exist, check if email is whitelisted and auto-create
-    if not user:
-        if email_lower not in WHITELISTED_USERS:
-            raise HTTPException(status_code=401, detail="Incorrect email or password")
-        
-        # Auto-create user on first login (whitelisted email)
-        print(f"[Auth] Auto-creating new user: {user_data.email}")
-        user_id = str(uuid4())
-        hashed_password = get_password_hash(user_data.password)
-        
-        user = {
-            "id": user_id,
-            "email": user_data.email,
-            "full_name": user_data.email.split('@')[0],
-            "hashed_password": hashed_password,
-            "is_active": "true",
-            "created_at": datetime.now().isoformat()
-        }
-        
-        # Save to JSON file for persistence
-        _users_cache[email_lower] = user
-        save_users_to_json(_users_cache)
-        print(f"[Auth] User created successfully: {user_data.email}")
-    
-    if not verify_password(user_data.password, user["hashed_password"]):
-        raise HTTPException(status_code=401, detail="Incorrect email or password")
-    
-    if user["is_active"] != "true":
-        raise HTTPException(status_code=400, detail="Inactive user")
-    
-    # Create access token
-    access_token = create_access_token(data={"sub": user["email"]})
-    
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "user": {
-            "id": user["id"],
-            "email": user["email"],
-            "full_name": user["full_name"],
-            "is_active": user["is_active"],
-            "created_at": user["created_at"]
-        }
-    }
+    """Legacy password login is disabled; use email OTP sign-in."""
+    raise HTTPException(status_code=410, detail="Password login has been replaced by email OTP sign-in.")
 
 class ForgotPasswordRequest(BaseModel):
     email: str
@@ -1765,6 +1911,39 @@ def clear_excel_jobs_cache():
     _excel_jobs_cache = None
     _excel_jobs_cache_time = None
     print("[Excel] Cache cleared")
+
+
+def get_client_ip(request: Request) -> Optional[str]:
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
+    if request.client:
+        return request.client.host
+    return None
+
+
+def record_submission_log(audit_doc: dict) -> None:
+    """Persist a candidate-submission audit log in MongoDB or JSON fallback."""
+    if mongodb_enabled and submission_logs_collection is not None:
+        submission_logs_collection.insert_one(audit_doc)
+        print(f"[SubmissionAudit] Logged submission {audit_doc.get('id')} in MongoDB")
+        return
+
+    logs_file = os.path.join(DATA_DIR, "submission_logs.json")
+    existing = []
+    if os.path.exists(logs_file):
+        try:
+            with open(logs_file, "r") as f:
+                existing = json.load(f)
+        except Exception as e:
+            print(f"[SubmissionAudit] Could not read existing JSON log: {e}")
+    existing.append(audit_doc)
+    with open(logs_file, "w") as f:
+        json.dump(existing, f, indent=2, default=str)
+    print(f"[SubmissionAudit] Logged submission {audit_doc.get('id')} in JSON")
 
 
 def first_present(*values) -> str:
@@ -2991,6 +3170,7 @@ async def get_ceipal_reports():
 
 @app.post("/api/candidates/submit")
 async def submit_candidate(
+    request: Request,
     candidate_name: str = Form(...),
     email: str = Form(...), 
     phone: str = Form(...),
@@ -3051,6 +3231,9 @@ async def submit_candidate(
         
         # Generate unique candidate ID
         candidate_id = f"candidate_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid4())[:8]}"
+        submitted_at = datetime.now().isoformat()
+        submission_ip_address = get_client_ip(request)
+        submission_user_agent = request.headers.get("user-agent", "")
         
         # Store candidate in MongoDB with submitter info
         candidate_doc = {
@@ -3062,11 +3245,13 @@ async def submit_candidate(
             "resume_storage_id": resume_storage_id,
             "resume_storage_type": storage_type,
             "resume_filename": filename,
-            "submitted_date": datetime.now().isoformat(),
+            "submitted_date": submitted_at,
             "status": "submitted",
             "submitted_by_user_id": current_user.id,
             "submitted_by_email": current_user.email,
             "submitted_by_name": current_user.full_name,
+            "submission_ip_address": submission_ip_address,
+            "submission_user_agent": submission_user_agent,
             "bill_rate": bill_rate,
             "current_location": current_location,
             "primary_skills": primary_skills,
@@ -3091,6 +3276,36 @@ async def submit_candidate(
             with open(candidates_file, 'w') as f:
                 json.dump(existing, f, indent=2, default=str)
             print(f"[Submissions] Candidate {candidate_id} stored in JSON (MongoDB not available)")
+
+        audit_doc = {
+            "id": f"submission_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid4())[:8]}",
+            "candidate_id": candidate_id,
+            "candidate_name": candidate_name,
+            "candidate_email": email,
+            "candidate_phone": phone,
+            "job_id": job_id,
+            "job_title": job_title,
+            "submitted_at": submitted_at,
+            "submitted_by_user_id": current_user.id,
+            "submitted_by_name": current_user.full_name,
+            "submitted_by_email": current_user.email,
+            "ip_address": submission_ip_address,
+            "user_agent": submission_user_agent,
+            "metadata": {
+                "bill_rate": bill_rate,
+                "current_location": current_location,
+                "primary_skills": primary_skills,
+                "years_experience": years_experience,
+                "tentative_start_date": tentative_start_date,
+                "rto": rto,
+                "resume_filename": filename,
+                "resume_storage_type": storage_type,
+            },
+        }
+        try:
+            record_submission_log(audit_doc)
+        except Exception as e:
+            print(f"[SubmissionAudit] Failed to write audit log for {candidate_id}: {e}")
         
         # Send email notification to admin
         vendor_info = {
@@ -3194,6 +3409,32 @@ async def get_all_candidates(
     except Exception as e:
         print(f"[Submissions] Error fetching candidates: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch candidates: {str(e)}")
+
+
+@app.get("/api/submission-logs")
+async def get_submission_logs(current_user: UserDB = Depends(get_current_user)):
+    """Admin-only submission audit log."""
+    is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Only admin can view submission logs")
+
+    try:
+        logs = []
+        if mongodb_enabled and submission_logs_collection is not None:
+            cursor = submission_logs_collection.find().sort("submitted_at", -1).limit(500)
+            for doc in cursor:
+                doc["_id"] = str(doc["_id"])
+                logs.append(doc)
+        else:
+            logs_file = os.path.join(DATA_DIR, "submission_logs.json")
+            if os.path.exists(logs_file):
+                with open(logs_file, "r") as f:
+                    logs = json.load(f)
+                logs = sorted(logs, key=lambda row: row.get("submitted_at", ""), reverse=True)[:500]
+        return {"logs": logs, "total": len(logs)}
+    except Exception as e:
+        print(f"[SubmissionAudit] Error fetching logs: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch submission logs: {str(e)}")
 
 @app.patch("/api/candidates/{candidate_id}/status")
 async def update_candidate_status(

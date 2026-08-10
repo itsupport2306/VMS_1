@@ -61,29 +61,27 @@
       <section class="content" id="viewAuth">
         <div class="panel" style="text-align: center; max-width: 420px; margin: 0 auto;">
           <img src="/assets/logo.png" alt="Radixsol Logo" style="width: 120px; height: auto; margin-bottom: 20px;" />
-          <div class="panel__title" id="authTitle">Login</div>
-          <div class="panel__desc">Enter your credentials to continue</div>
+          <div class="panel__title" id="authTitle">Email Sign In</div>
+          <div class="panel__desc">Enter your email and verify the one-time code sent to your inbox.</div>
           
           <div class="form" style="margin-top: 24px;">
             <div class="field">
               <label>Email</label>
               <input id="authEmail" class="input" type="email" placeholder="name@example.com" />
             </div>
-            <div class="field">
-              <label>Password</label>
-              <input id="authPassword" class="input" type="password" placeholder="Enter password" />
+            <div class="field" id="authOtpField" hidden>
+              <label>Verification Code</label>
+              <input id="authOtp" class="input" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="Enter 6-digit code" />
             </div>
             <div class="alert" id="authAlert" hidden></div>
             <div class="row" style="gap: 12px; margin-top: 20px;">
-              <button class="btn" id="authSubmitBtn" style="flex: 1;">Login</button>
-            </div>
-            <div style="margin-top: 16px; text-align: center;">
-              <a href="#" id="forgotPasswordLink" style="color: #7c3aed; font-size: 14px; text-decoration: none;">Forgot Password?</a>
+              <button class="btn btn--secondary" id="authBackBtn" style="flex: 0 0 auto;" hidden>Back</button>
+              <button class="btn" id="authSubmitBtn" style="flex: 1;">Send Code</button>
             </div>
           </div>
           
           <!-- Step 1: Forgot Password - Enter Email -->
-          <div class="form" id="forgotPasswordForm" style="margin-top: 24px; display: none;">
+          <div class="form" id="forgotPasswordForm" style="margin-top: 24px; display: none;" hidden>
             <div class="panel__title" style="margin-bottom: 16px;">Forgot Password?</div>
             <div class="panel__desc" style="margin-bottom: 16px; font-size: 14px;">Enter your email and we'll send you a password reset link.</div>
             <div class="field">
@@ -100,7 +98,7 @@
           </div>
 
           <!-- Step 2: Reset Password - Enter New Password (with token from email) -->
-          <div class="form" id="resetPasswordForm" style="margin-top: 24px; display: none;">
+          <div class="form" id="resetPasswordForm" style="margin-top: 24px; display: none;" hidden>
             <div class="panel__title" style="margin-bottom: 16px;">Reset Password</div>
             <div class="panel__desc" style="margin-bottom: 16px; font-size: 14px;">Enter your new password.</div>
             <input type="hidden" id="resetToken" />
@@ -130,14 +128,6 @@
             <input id="searchInput" class="input" placeholder="Search by title, department, location…" />
           </div>
           <div class="field">
-            <label>Status</label>
-            <select id="statusFilter" class="input">
-              <option value="">All</option>
-              <option value="active">Active</option>
-              <option value="open">Open</option>
-            </select>
-          </div>
-          <div class="field">
             <label>State</label>
             <select id="stateFilter" class="input">
               <option value="">All</option>
@@ -147,6 +137,14 @@
             <label>Specialty</label>
             <select id="specialtyFilter" class="input">
               <option value="">All</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Status</label>
+            <select id="statusFilter" class="input">
+              <option value="">All</option>
+              <option value="active">Active</option>
+              <option value="open">Open</option>
             </select>
           </div>
         </div>

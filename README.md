@@ -41,6 +41,34 @@ VMS/
 pip install -r requirements.txt
 ```
 
+### 2. Configure Environment
+Copy `.env.example` to `.env` and set the values for your deployment.
+
+#### Email OTP Sign-In
+Users sign in with an email verification code instead of a password. The email must be present in the admin whitelist before a code can be requested. After successful OTP verification, the portal issues a bearer token that stays valid for 7 days by default.
+
+Configure these values for SendGrid:
+
+```env
+SESSION_EXPIRE_DAYS=7
+OTP_EXPIRE_MINUTES=10
+OTP_MAX_ATTEMPTS=5
+
+SENDGRID_API_KEY=your_sendgrid_api_key_here
+SENDGRID_FROM_EMAIL=notifications@radixsol.com
+APP_URL=https://your-production-vms-url.example.com
+```
+
+In `DEBUG` or `TESTING_MODE`, the backend logs OTP codes when email delivery is unavailable so the sign-in flow can be tested locally. Production should use SendGrid and should keep debug logging disabled.
+
+#### Admin Submission Notifications
+Candidate submission notifications use SendGrid from `SENDGRID_FROM_EMAIL`. Set the admin recipients as a comma-separated list:
+
+```env
+SUBMISSION_NOTIFICATION_RECIPIENTS=it.support@radixsol.com
+```
+
+Each successful candidate submission is also written to a separate submission audit log with submitter name, submitter email, candidate details, timestamp, IP address when available, user agent, resume metadata, and job metadata. MongoDB deployments store this in the `submission_logs` collection. Local/fallback deployments store it in `DATA_DIR/submission_logs.json`.
 
 ### 3. Database Setup
 ```bash
@@ -89,6 +117,11 @@ python main.py all
 - `POST /api/candidates/submit` - Submit candidate with resume
 - `GET /api/candidates/job/{job_id}` - Get candidates for specific job
 - `GET /api/candidates` - Get all candidates
+- `GET /api/submission-logs` - Admin-only candidate submission audit log
+
+### Authentication
+- `POST /api/auth/request-otp` - Request an email verification code
+- `POST /api/auth/verify-otp` - Verify code and receive a 7-day bearer token
 
 ## Frontend Features
 

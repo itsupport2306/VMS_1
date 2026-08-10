@@ -48,8 +48,10 @@ const els = {
   systemNavBtn: document.getElementById('systemNavBtn'),
   authTitle: document.getElementById('authTitle'),
   authEmail: document.getElementById('authEmail'),
-  authPassword: document.getElementById('authPassword'),
+  authOtpField: document.getElementById('authOtpField'),
+  authOtp: document.getElementById('authOtp'),
   authSubmitBtn: document.getElementById('authSubmitBtn'),
+  authBackBtn: document.getElementById('authBackBtn'),
   authAlert: document.getElementById('authAlert'),
   forgotPasswordLink: document.getElementById('forgotPasswordLink'),
   forgotPasswordForm: document.getElementById('forgotPasswordForm'),
@@ -105,6 +107,7 @@ let activeJob = null;
 let authToken = localStorage.getItem('vms_token') || null;
 let currentUser = JSON.parse(localStorage.getItem('vms_user') || 'null');
 let isRegisterMode = false;
+let pendingOtpEmail = '';
 
 const ADMIN_EMAIL = 'Admin@radixsol.com';
 
@@ -254,6 +257,7 @@ function updateAuthUI() {
 function logout() {
   authToken = null;
   currentUser = null;
+  pendingOtpEmail = '';
   localStorage.removeItem('vms_token');
   localStorage.removeItem('vms_user');
   
@@ -402,13 +406,16 @@ async function handleAuthSubmit() {
   clearAuthAlert();
   
   const email = els.authEmail.value.trim();
-  const password = els.authPassword.value;
   
   if (!email) return showAuthAlert('error', 'Email is required');
-  if (!password) return showAuthAlert('error', 'Password is required');
-  
-  const body = { email, password };
-  const endpoint = '/api/auth/login';
+
+  const verifyingOtp = els.authOtpField && !els.authOtpField.hidden;
+  const endpoint = verifyingOtp ? '/api/auth/verify-otp' : '/api/auth/request-otp';
+  const body = verifyingOtp
+    ? { email: pendingOtpEmail || email, otp: (els.authOtp.value || '').trim() }
+    : { email };
+
+  if (verifyingOtp && !body.otp) return showAuthAlert('error', 'Verification code is required');
   
   try {
     const res = await fetch(`${API_BASE}${endpoint}`, {
@@ -429,6 +436,20 @@ async function handleAuthSubmit() {
     if (!res.ok) {
       throw new Error(data.detail || data.message || `Error: ${res.status}`);
     }
+
+    if (!verifyingOtp) {
+      pendingOtpEmail = email;
+      els.authEmail.disabled = true;
+      if (els.authOtpField) els.authOtpField.hidden = false;
+      if (els.authOtp) {
+        els.authOtp.value = '';
+        els.authOtp.focus();
+      }
+      if (els.authBackBtn) els.authBackBtn.hidden = false;
+      els.authSubmitBtn.textContent = 'Verify Code';
+      showAuthAlert('ok', data.message || 'Verification code sent. Please check your email.');
+      return;
+    }
     
     // Store token and user
     authToken = data.access_token;
@@ -438,7 +459,12 @@ async function handleAuthSubmit() {
     
     // Clear form
     els.authEmail.value = '';
-    els.authPassword.value = '';
+    els.authEmail.disabled = false;
+    if (els.authOtp) els.authOtp.value = '';
+    if (els.authOtpField) els.authOtpField.hidden = true;
+    if (els.authBackBtn) els.authBackBtn.hidden = true;
+    els.authSubmitBtn.textContent = 'Send Code';
+    pendingOtpEmail = '';
     
     // Show success message briefly then switch to jobs
     showAuthAlert('ok', 'Logged in successfully!');
@@ -453,6 +479,17 @@ async function handleAuthSubmit() {
   } catch (e) {
     showAuthAlert('error', e.message);
   }
+}
+
+function resetOtpFlow() {
+  pendingOtpEmail = '';
+  els.authEmail.disabled = false;
+  if (els.authOtp) els.authOtp.value = '';
+  if (els.authOtpField) els.authOtpField.hidden = true;
+  if (els.authBackBtn) els.authBackBtn.hidden = true;
+  if (els.authSubmitBtn) els.authSubmitBtn.textContent = 'Send Code';
+  clearAuthAlert();
+  els.authEmail.focus();
 }
 
 // Modified API function that includes auth token
@@ -750,7 +787,7 @@ function setView(view) {
 
   if (view === 'auth') {
     els.pageTitle.textContent = 'Authentication';
-    els.pageSubtitle.textContent = 'Please login or register to continue.';
+    els.pageSubtitle.textContent = 'Sign in with your email verification code.';
   }
   if (view === 'jobs') {
     els.pageTitle.textContent = 'Jobs';
@@ -1622,6 +1659,10 @@ if (els.authSubmitBtn) {
   els.authSubmitBtn.addEventListener('click', handleAuthSubmit);
 }
 
+if (els.authBackBtn) {
+  els.authBackBtn.addEventListener('click', resetOtpFlow);
+}
+
 // Password reset event listeners
 if (els.forgotPasswordLink) {
   els.forgotPasswordLink.addEventListener('click', (e) => {
@@ -1655,7 +1696,7 @@ if (els.resetSubmitBtn) {
 // Check for reset token in URL (user clicked email link)
 const urlParams = new URLSearchParams(window.location.search);
 const resetToken = urlParams.get('token');
-if (resetToken) {
+if (resetToken && els.resetPasswordForm) {
   // Show reset password form directly
   showResetPasswordForm(resetToken);
   // Clear token from URL
