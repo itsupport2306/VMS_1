@@ -25,6 +25,7 @@ import secrets
 import hashlib
 import smtplib
 from email.message import EmailMessage
+from urllib.parse import urlencode
 from pymongo import MongoClient
 from pymongo.server_api import ServerApi
 from bson.objectid import ObjectId
@@ -270,8 +271,8 @@ def cleanup_expired_otps():
         print(f"[Auth] Cleaned up {len(expired)} expired OTPs")
 
 def send_password_reset_email(email: str, reset_token: str) -> bool:
-    """Send password reset email via SendGrid"""
-    reset_url = f"{APP_URL}?token={reset_token}"
+    """Send a password reset email through the configured app mailer."""
+    reset_url = f"{APP_URL.rstrip('/')}?{urlencode({'token': reset_token})}"
     html_content = f'''
         <h2>Password Reset Request</h2>
         <p>You requested a password reset for your Vendor Management System account.</p>
@@ -1487,14 +1488,19 @@ async def forgot_password(request: ForgotPasswordRequest):
     cleanup_expired_tokens()
     
     email_lower = request.email.lower().strip()
+    if not email_lower or "@" not in email_lower:
+        raise HTTPException(status_code=400, detail="Valid email is required")
     
     # Check if email is whitelisted
     if email_lower not in WHITELISTED_USERS:
         # Don't reveal if email exists for security
         return {"message": "If the email is registered, a password reset link has been sent."}
     
+    users = load_users_from_json()
+    user = users.get(email_lower)
+
     # Check if user exists (has logged in before)
-    if email_lower not in _users_cache:
+    if not user or user.get("is_active") != "true":
         return {"message": "If the email is registered, a password reset link has been sent."}
     
     # Generate reset token
@@ -1508,15 +1514,18 @@ async def forgot_password(request: ForgotPasswordRequest):
     }
     
     # Send email
-    email_sent = send_password_reset_email(email_lower, reset_token)
+    email_sent = await asyncio.to_thread(send_password_reset_email, email_lower, reset_token)
     
     if email_sent:
         print(f"[Auth] Password reset email sent to {email_lower}")
         return {"message": "Password reset email sent. Please check your inbox."}
     else:
-        # If email fails, still return success but log the token for debugging
-        print(f"[Auth] Password reset token for {email_lower}: {reset_token}")
-        return {"message": "Password reset email sent. Please check your inbox."}
+        _password_reset_tokens.pop(reset_token, None)
+        print(f"[Auth] Password reset email failed for {email_lower}")
+        raise HTTPException(
+            status_code=503,
+            detail="We could not send the password reset email. Please contact support.",
+        )
 
 @app.post("/api/auth/reset-password")
 async def reset_password_with_token(data: ResetPasswordWithToken):
@@ -1546,12 +1555,18 @@ async def reset_password_with_token(data: ResetPasswordWithToken):
     if len(data.password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
     
+    users = load_users_from_json()
+    if email_lower not in users:
+        _password_reset_tokens.pop(token, None)
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+
     # Update password
     hashed_password = get_password_hash(data.password)
-    
-    if email_lower in _users_cache:
-        _users_cache[email_lower]["hashed_password"] = hashed_password
-        save_users_to_json(_users_cache)
+
+    users[email_lower]["hashed_password"] = hashed_password
+    if not save_users_to_json(users):
+        raise HTTPException(status_code=500, detail="Could not update password")
+    _users_cache = load_users_from_json()
     
     # Mark token as used
     token_data["used"] = True

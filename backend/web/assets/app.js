@@ -286,9 +286,18 @@ function setAuthMode(mode, options = {}) {
   authMode = mode;
   clearAuthAlert();
 
-  if (els.forgotPasswordForm) els.forgotPasswordForm.style.display = 'none';
-  if (els.resetPasswordForm) els.resetPasswordForm.style.display = 'none';
-  if (els.authMainForm) els.authMainForm.style.display = 'block';
+  if (els.forgotPasswordForm) {
+    els.forgotPasswordForm.hidden = true;
+    els.forgotPasswordForm.style.display = 'none';
+  }
+  if (els.resetPasswordForm) {
+    els.resetPasswordForm.hidden = true;
+    els.resetPasswordForm.style.display = 'none';
+  }
+  if (els.authMainForm) {
+    els.authMainForm.hidden = false;
+    els.authMainForm.style.display = 'block';
+  }
 
   const isSignup = mode === 'signup';
   const isVerify = mode === 'verify-signup';
@@ -331,25 +340,45 @@ function setAuthMode(mode, options = {}) {
 // Password reset functions
 function showForgotPasswordForm() {
   // Hide login form, show forgot password form (step 1)
-  if (els.authMainForm) els.authMainForm.style.display = 'none';
+  if (els.authMainForm) {
+    els.authMainForm.hidden = true;
+    els.authMainForm.style.display = 'none';
+  }
+  if (els.resetPasswordForm) {
+    els.resetPasswordForm.hidden = true;
+    els.resetPasswordForm.style.display = 'none';
+  }
+  els.forgotPasswordForm.hidden = false;
   els.forgotPasswordForm.style.display = 'block';
   els.forgotAlert.hidden = true;
   els.forgotAlert.textContent = '';
+  if (els.forgotEmail) {
+    els.forgotEmail.value = els.authEmail ? els.authEmail.value.trim() : '';
+    els.forgotEmail.focus();
+  }
 }
 
 function showResetPasswordForm(token) {
   // Show reset password form (step 2 - from email link)
-  if (els.authMainForm) els.authMainForm.style.display = 'none';
+  if (els.authMainForm) {
+    els.authMainForm.hidden = true;
+    els.authMainForm.style.display = 'none';
+  }
+  els.forgotPasswordForm.hidden = true;
   els.forgotPasswordForm.style.display = 'none';
+  els.resetPasswordForm.hidden = false;
   els.resetPasswordForm.style.display = 'block';
   els.resetToken.value = token || '';
   els.resetAlert.hidden = true;
   els.resetAlert.textContent = '';
+  if (els.resetPassword) els.resetPassword.focus();
 }
 
 function showLoginForm() {
   // Hide all forms, show login form
+  els.forgotPasswordForm.hidden = true;
   els.forgotPasswordForm.style.display = 'none';
+  els.resetPasswordForm.hidden = true;
   els.resetPasswordForm.style.display = 'none';
   setAuthMode('login');
   els.authAlert.hidden = true;
