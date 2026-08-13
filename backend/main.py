@@ -116,6 +116,56 @@ SUBMISSION_NOTIFICATION_RECIPIENTS = [
     ).split(",") if addr.strip()
 ]
 
+BILL_RATE_DISPLAY_MULTIPLIER = 0.94
+
+
+def _format_discounted_rate_amount(amount: float) -> str:
+    if amount.is_integer():
+        return str(int(amount))
+    return f"{amount:.2f}"
+
+
+def display_bill_rate(rate_value) -> str:
+    """Return the vendor-facing bill rate with the actual rate reduced by 6%."""
+    text = str(rate_value or "").strip()
+    if not text or text.lower() in {"nan", "none", "null", "n/a"}:
+        return ""
+
+    number_pattern = re.compile(r"\d+(?:,\d{3})*(?:\.\d+)?")
+    if not number_pattern.search(text):
+        return text
+
+    has_currency = "$" in text or re.search(r"\bUSD\b", text, flags=re.IGNORECASE)
+
+    def discount_match(match: re.Match) -> str:
+        raw_number = match.group(0)
+        try:
+            actual_amount = float(raw_number.replace(",", ""))
+        except ValueError:
+            return raw_number
+        return _format_discounted_rate_amount(actual_amount * BILL_RATE_DISPLAY_MULTIPLIER)
+
+    discounted_text = number_pattern.sub(discount_match, text)
+    if has_currency:
+        return discounted_text
+    return f"${discounted_text}"
+
+
+def sanitize_candidate_bill_rate(candidate: dict) -> dict:
+    if not candidate.get("bill_rate_discount_applied"):
+        candidate["bill_rate"] = display_bill_rate(candidate.get("bill_rate")) or "N/A"
+    candidate.pop("bill_rate_discount_applied", None)
+    return candidate
+
+
+def sanitize_submission_log_bill_rate(log_doc: dict) -> dict:
+    metadata = log_doc.get("metadata")
+    if isinstance(metadata, dict):
+        if not metadata.get("bill_rate_discount_applied"):
+            metadata["bill_rate"] = display_bill_rate(metadata.get("bill_rate")) or "N/A"
+        metadata.pop("bill_rate_discount_applied", None)
+    return log_doc
+
 # In-memory password reset token storage (expires after 1 hour)
 # Structure: {token: {email: str, expires: datetime, used: bool}}
 _password_reset_tokens = {}
@@ -312,7 +362,10 @@ def send_submission_notification_email(candidate_data: dict, vendor_info: dict) 
         job_id = str(candidate_data.get('job_id') or 'N/A')
         vendor_name = str(vendor_info.get('full_name') or 'N/A')
         vendor_email = str(vendor_info.get('email') or 'N/A')
-        bill_rate = str(candidate_data.get('bill_rate') or 'N/A')
+        if candidate_data.get("bill_rate_discount_applied"):
+            bill_rate = str(candidate_data.get('bill_rate') or 'N/A')
+        else:
+            bill_rate = display_bill_rate(candidate_data.get('bill_rate')) or 'N/A'
         location = str(candidate_data.get('current_location') or 'N/A')
         skills = str(candidate_data.get('primary_skills') or 'N/A')
         candidate_email = str(candidate_data.get('email') or 'N/A')
@@ -1928,6 +1981,7 @@ def load_excel_jobs_from_file(file_path: str) -> List[Job]:
                 status = get_val(row, ['Status', 'Job Status'])
                 end_client = get_val(row, ['EndClient', 'End Client', 'Client', 'EndClient '])
                 salary = get_val(row, ['Salary', 'Pay', 'Rate', 'Bill Rate'])
+                displayed_salary = display_bill_rate(salary)
                 job_description = get_val(row, ['Job Description', 'Description', 'Desc'])
                 
                 # Other fields for description
@@ -1991,7 +2045,7 @@ def load_excel_jobs_from_file(file_path: str) -> List[Job]:
                     department=f"Job Code: {job_code}",
                     location=full_location if full_location else "Not specified",
                     employment_type="Contract",  # Default or can be derived
-                    salary_range=salary if salary and salary.lower() != 'nan' else None,
+                    salary_range=displayed_salary or None,
                     posted_date=datetime.now(),  # Default to now
                     status=status if status and status.lower() != 'nan' else "Active",
                     end_client=end_client if end_client and end_client.lower() != 'nan' else None,
@@ -2146,7 +2200,7 @@ def summarize_json_job_description(raw_description: str) -> Optional[str]:
     start_date = first_present(data.get("startDate"))
     end_date = first_present(data.get("endDate"))
     shift = first_present(shift_details.get("shift_1_name"))
-    bill_rate = first_present(data.get("billRate"))
+    bill_rate = display_bill_rate(first_present(data.get("billRate")))
 
     lead_parts = [part for part in [profession, specialty] if part]
     lead = " - ".join(lead_parts) if lead_parts else job_type
@@ -2212,7 +2266,7 @@ def build_job_from_direct_input(payload: DirectJobCreateRequest) -> Job:
         department=payload.specialty.strip(),
         location=full_location or "Not specified",
         employment_type="Contract",
-        salary_range=payload.billrate.strip() or None,
+        salary_range=display_bill_rate(payload.billrate) or None,
         posted_date=datetime.now(),
         status=payload.status.strip(),
         job_id=job_id,
@@ -2232,6 +2286,9 @@ def load_manual_jobs() -> List[Job]:
             for doc in manual_jobs_collection.find().sort("created_at", -1):
                 doc.pop("_id", None)
                 doc.pop("created_at", None)
+                if not doc.get("bill_rate_discount_applied"):
+                    doc["salary_range"] = display_bill_rate(doc.get("salary_range")) or None
+                doc.pop("bill_rate_discount_applied", None)
                 jobs.append(Job(**doc))
             return jobs
 
@@ -2242,6 +2299,9 @@ def load_manual_jobs() -> List[Job]:
             raw_jobs = json.load(f)
 
         for job_data in raw_jobs:
+            if not job_data.get("bill_rate_discount_applied"):
+                job_data["salary_range"] = display_bill_rate(job_data.get("salary_range")) or None
+            job_data.pop("bill_rate_discount_applied", None)
             jobs.append(Job(**job_data))
     except Exception as e:
         print(f"[Manual Jobs] Failed to load direct-input jobs: {e}")
@@ -2252,6 +2312,7 @@ def load_manual_jobs() -> List[Job]:
 def upsert_manual_job(job: Job) -> None:
     """Persist one direct-input job by job ID."""
     job_payload = job.dict()
+    job_payload["bill_rate_discount_applied"] = True
 
     if mongodb_enabled and manual_jobs_collection is not None:
         manual_jobs_collection.update_one(
@@ -2965,55 +3026,12 @@ class CeipalClient:
                     description_parts.append(f"Duration: {duration}")
                 description = " | ".join(description_parts) if description_parts else job_data.get("JobTitle", "")
             
-            # MSP Fee mapping (actual fee + 1% as requested)
-            msp_fees = {
-                "AHSA": 7.25,
-                "Triage/RTG": 6.50,
-                "PTH": 6.0,
-                "Supplemental": 8.0,
-                "Aya": 4.0,
-                "Aya Healthcare": 4.0,
-                "HWL": 7.50,
-                "Medical Solutions": 7.0,
-                "Careerstaff": 7.50,
-                "DNA": 7.25,
-                "Stability": 6.50,
-                "Snapcare": 6.0,
-                "Adaptive": 7.75,
-                "Sunburst": 6.0,
-                "Staffing Engine": 7.0,
-                "Medefis": 7.25,
-                "Windsor": 6.0,
-                "WAE (Gracedale Nursing Home)": 6.0,
-                "Hallmark and Vibra Healthcare": 7.0,
-                "Expedient": 6.0,
-                "TRS": 7.0,
-                "Favorite Healthcare": 8.0,
-                "OHT": 6.0,
-            }
-            
-            # Get client name and calculate updated bill rate
-            client_name = job_data.get("Client", "")
+            # Calculate displayed bill rate by hiding the actual rate behind a flat 6% reduction.
             actual_bill_rate_str = job_data.get("ClientBillRateSalary", job_data.get("BillRate", "0"))
-            
-            # Parse actual bill rate (handle formats like "USD/76" or "76")
-            actual_rate = 0.0
-            try:
-                # Extract numeric value from string
-                rate_match = re.search(r'[\d.]+', str(actual_bill_rate_str))
-                if rate_match:
-                    actual_rate = float(rate_match.group())
-            except:
-                actual_rate = 0.0
-            
-            # Calculate updated bill rate: subtract (MSP fee + 1%) from actual rate
-            total_fee_percent = msp_fees.get(client_name, 7.0)  # Default 7% if client not found
-            updated_rate = actual_rate - ((total_fee_percent * actual_rate) / 100)
-            
-            # Format salary range with updated rate (hide actual)
-            if updated_rate > 0:
-                salary_range_display = f"${updated_rate:.2f}/hr"
-            else:
+            salary_range_display = display_bill_rate(actual_bill_rate_str)
+            if salary_range_display and "/hr" not in salary_range_display.lower():
+                salary_range_display = f"{salary_range_display}/hr"
+            if not salary_range_display:
                 salary_range_display = "Contact for rate"
             
             # Get actual job code
@@ -3392,6 +3410,7 @@ async def submit_candidate(
         submitted_at = datetime.now().isoformat()
         submission_ip_address = get_client_ip(request)
         submission_user_agent = request.headers.get("user-agent", "")
+        displayed_bill_rate = display_bill_rate(bill_rate) or "N/A"
         
         # Store candidate in MongoDB with submitter info
         candidate_doc = {
@@ -3410,7 +3429,8 @@ async def submit_candidate(
             "submitted_by_name": current_user.full_name,
             "submission_ip_address": submission_ip_address,
             "submission_user_agent": submission_user_agent,
-            "bill_rate": bill_rate,
+            "bill_rate": displayed_bill_rate,
+            "bill_rate_discount_applied": True,
             "current_location": current_location,
             "primary_skills": primary_skills,
             "job_title": job_title,
@@ -3450,7 +3470,8 @@ async def submit_candidate(
             "ip_address": submission_ip_address,
             "user_agent": submission_user_agent,
             "metadata": {
-                "bill_rate": bill_rate,
+                "bill_rate": displayed_bill_rate,
+                "bill_rate_discount_applied": True,
                 "current_location": current_location,
                 "primary_skills": primary_skills,
                 "years_experience": years_experience,
@@ -3506,6 +3527,7 @@ async def get_candidates_for_job(job_id: str):
             cursor = candidates_collection.find({"job_id": job_id})
             for doc in cursor:
                 doc["_id"] = str(doc["_id"])  # Convert ObjectId to string
+                sanitize_candidate_bill_rate(doc)
                 job_candidates.append(doc)
         else:
             # Fallback to JSON file
@@ -3514,6 +3536,8 @@ async def get_candidates_for_job(job_id: str):
                 with open(candidates_file, 'r') as f:
                     all_candidates = json.load(f)
                     job_candidates = [c for c in all_candidates if c.get("job_id") == job_id]
+                    for c in job_candidates:
+                        sanitize_candidate_bill_rate(c)
         
         return {"candidates": job_candidates, "total": len(job_candidates)}
     except Exception as e:
@@ -3538,6 +3562,7 @@ async def get_all_candidates(
             
             for doc in cursor:
                 doc["_id"] = str(doc["_id"])
+                sanitize_candidate_bill_rate(doc)
                 # Build submitted_by info from stored data
                 doc["submitted_by"] = {
                     "id": doc.get("submitted_by_user_id"),
@@ -3557,6 +3582,7 @@ async def get_all_candidates(
                         candidates = [c for c in all_candidates if c.get("submitted_by_user_id") == current_user.id]
                     
                     for c in candidates:
+                        sanitize_candidate_bill_rate(c)
                         c["submitted_by"] = {
                             "id": c.get("submitted_by_user_id"),
                             "full_name": c.get("submitted_by_name"),
@@ -3582,6 +3608,7 @@ async def get_submission_logs(current_user: UserDB = Depends(get_current_user)):
             cursor = submission_logs_collection.find().sort("submitted_at", -1).limit(500)
             for doc in cursor:
                 doc["_id"] = str(doc["_id"])
+                sanitize_submission_log_bill_rate(doc)
                 logs.append(doc)
         else:
             logs_file = os.path.join(DATA_DIR, "submission_logs.json")
@@ -3589,6 +3616,8 @@ async def get_submission_logs(current_user: UserDB = Depends(get_current_user)):
                 with open(logs_file, "r") as f:
                     logs = json.load(f)
                 logs = sorted(logs, key=lambda row: row.get("submitted_at", ""), reverse=True)[:500]
+                for log_doc in logs:
+                    sanitize_submission_log_bill_rate(log_doc)
         return {"logs": logs, "total": len(logs)}
     except Exception as e:
         print(f"[SubmissionAudit] Error fetching logs: {e}")
