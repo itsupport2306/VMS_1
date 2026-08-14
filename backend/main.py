@@ -118,7 +118,7 @@ SUBMISSION_NOTIFICATION_RECIPIENTS = [
     ).split(",") if addr.strip()
 ]
 
-BILL_RATE_DISPLAY_MULTIPLIER = 0.94
+BILL_RATE_DISPLAY_MULTIPLIER = 0.93
 
 
 def _format_discounted_rate_amount(amount: float) -> str:
@@ -128,7 +128,7 @@ def _format_discounted_rate_amount(amount: float) -> str:
 
 
 def display_bill_rate(rate_value) -> str:
-    """Return the vendor-facing bill rate with the actual rate reduced by 6%."""
+    """Return the vendor-facing bill rate with the actual rate reduced by 7%."""
     text = str(rate_value or "").strip()
     if not text or text.lower() in {"nan", "none", "null", "n/a"}:
         return ""
@@ -3284,7 +3284,7 @@ class CeipalClient:
                     description_parts.append(f"Duration: {duration}")
                 description = " | ".join(description_parts) if description_parts else job_data.get("JobTitle", "")
             
-            # Calculate displayed bill rate by hiding the actual rate behind a flat 6% reduction.
+            # Calculate displayed bill rate by hiding the actual rate behind a flat 7% reduction.
             actual_bill_rate_str = job_data.get("ClientBillRateSalary", job_data.get("BillRate", "0"))
             salary_range_display = display_bill_rate(actual_bill_rate_str)
             if salary_range_display and "/hr" not in salary_range_display.lower():
