@@ -452,7 +452,7 @@ def show_enterprise_job_board():
                             <span class="badge badge-primary">{job.get('department', 'N/A')}</span>
                             <span class="badge badge-success">{job.get('employment_type', 'N/A')}</span>
                             <span class="badge badge-warning">{job.get('location', 'N/A')}</span>
-                            {f'<span class="badge badge-primary">💰 {job.get("salary_range", "Not specified")}</span>' if job.get('salary_range') else ''}
+                            {f'<span class="badge badge-primary">💰 Bill Rate: {job.get("salary_range", "Not specified")}</span>' if job.get('salary_range') else ''}
                         </div>
                         
                         <div class="job-meta">
@@ -683,7 +683,7 @@ def show_job_details():
             <span class="badge badge-primary">{job.get('department', 'N/A')}</span>
             <span class="badge badge-success">{job.get('employment_type', 'N/A')}</span>
             <span class="badge badge-warning">{job.get('location', 'N/A')}</span>
-            {f'<span class="badge badge-primary">💰 {job.get("salary_range", "Not specified")}</span>' if job.get('salary_range') else ''}
+            {f'<span class="badge badge-primary">💰 Bill Rate: {job.get("salary_range", "Not specified")}</span>' if job.get('salary_range') else ''}
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -715,7 +715,7 @@ def show_job_details():
         "Department": job.get('department', 'N/A'),
         "Location": job.get('location', 'N/A'),
         "Employment Type": job.get('employment_type', 'N/A'),
-        "Salary Range": job.get('salary_range', 'Not specified'),
+        "Bill Rate": job.get('salary_range', 'Not specified'),
         "Posted Date": job.get('posted_date', 'N/A'),
         "Status": job.get('status', 'N/A')
     }
@@ -900,7 +900,7 @@ def show_analytics():
             ]].copy()
             display_df.columns = [
                 'Title', 'Department', 'Location', 'Type', 
-                'Salary Range', 'Status', 'Posted Date'
+                'Bill Rate', 'Status', 'Posted Date'
             ]
             st.dataframe(display_df, use_container_width=True)
     else:

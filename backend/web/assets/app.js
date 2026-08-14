@@ -987,7 +987,7 @@ function openJobDetailModal(job) {
     job.location ? `Location: ${job.location}` : null,
     job.employment_type ? `Type: ${job.employment_type}` : null,
     job.status ? `Status: ${job.status}` : null,
-    job.salary_range ? `Salary: ${job.salary_range}` : null,
+    job.salary_range ? `Bill Rate: ${job.salary_range}` : null,
   ].filter(Boolean);
   els.jobDetailMeta.textContent = parts.join(' • ') || '—';
   
@@ -1937,7 +1937,11 @@ function updateNotificationUI() {
     if (notificationsData.notifications.length === 0) {
       list.innerHTML = '<div class="notification-empty">No notifications</div>';
     } else {
-      list.innerHTML = notificationsData.notifications.map(n => `
+      list.innerHTML = notificationsData.notifications.map(n => {
+        const isPosted = n.type === 'job_posted';
+        const title = isPosted ? 'New Job Posted' : 'Job Closed';
+        const desc = isPosted ? 'Accepting submissions' : `${n.candidate_count || 0} candidate(s) submitted`;
+        return `
         <div class="notification-item ${n.read ? '' : 'unread'}" data-id="${n.id}">
           <div class="notification-icon">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1946,12 +1950,13 @@ function updateNotificationUI() {
             </svg>
           </div>
           <div class="notification-content">
-            <div class="notification-title">Job Closed: ${escapeHtml(n.job_title || 'Unknown Job')}</div>
-            <div class="notification-desc">${n.candidate_count} candidate(s) submitted</div>
+            <div class="notification-title">${title}: ${escapeHtml(n.job_title || 'Unknown Job')}</div>
+            <div class="notification-desc">${desc}</div>
             <div class="notification-time">${formatTimeAgo(n.created_at)}</div>
           </div>
         </div>
-      `).join('');
+      `;
+      }).join('');
       
       // Add click handlers
       list.querySelectorAll('.notification-item').forEach(item => {

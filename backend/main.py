@@ -107,6 +107,8 @@ SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() in {"1", "true", "yes",
 # Flip JOB_CLOSURE_NOTIFICATIONS_ENABLED=true on Render only after watching audit logs confirm real transitions.
 JOB_CLOSURE_NOTIFICATIONS_ENABLED = os.getenv("JOB_CLOSURE_NOTIFICATIONS_ENABLED", "false").lower() == "true"
 JOB_CLOSURE_PER_RUN_CAP = int(os.getenv("JOB_CLOSURE_PER_RUN_CAP", "25"))
+JOB_POSTING_NOTIFICATIONS_ENABLED = os.getenv("JOB_POSTING_NOTIFICATIONS_ENABLED", "true").lower() == "true"
+JOB_POSTING_PER_RUN_CAP = int(os.getenv("JOB_POSTING_PER_RUN_CAP", "25"))
 
 # Recipients for new-submission notification emails. Comma-separated env var.
 SUBMISSION_NOTIFICATION_RECIPIENTS = [
@@ -165,6 +167,33 @@ def sanitize_submission_log_bill_rate(log_doc: dict) -> dict:
             metadata["bill_rate"] = display_bill_rate(metadata.get("bill_rate")) or "N/A"
         metadata.pop("bill_rate_discount_applied", None)
     return log_doc
+
+
+def hide_compensation_details(text: str) -> str:
+    """Remove raw salary/pay/bill-rate text from job descriptions before display."""
+    if not text:
+        return ""
+    compensation_pattern = re.compile(
+        r"\b(bill\s*rate|salary|pay\s*rate|hourly\s*pay|weekly\s*pay|regular\s*pay|stipend)\b",
+        flags=re.IGNORECASE,
+    )
+    kept_lines = [
+        line for line in str(text).splitlines()
+        if not compensation_pattern.search(line)
+    ]
+    return "\n".join(kept_lines).strip()
+
+
+def sanitize_job_for_display(job, is_admin: bool = False) -> dict:
+    job_dict = job.dict() if hasattr(job, "dict") else dict(job)
+    if job_dict.get("salary_range") and not job_dict.get("bill_rate_discount_applied"):
+        job_dict["salary_range"] = display_bill_rate(job_dict.get("salary_range")) or None
+    job_dict["bill_rate_discount_applied"] = True
+    if "description" in job_dict:
+        description = hide_compensation_details(job_dict.get("description") or "")
+        job_dict["description"] = sanitize_job_description(description, is_admin)
+    job_dict.pop("bill_rate_discount_applied", None)
+    return job_dict
 
 # In-memory password reset token storage (expires after 1 hour)
 # Structure: {token: {email: str, expires: datetime, used: bool}}
@@ -543,6 +572,83 @@ def send_job_closure_notification_email(user_email: str, job_title: str, job_id:
         return False
 
 
+def send_job_posted_notification_email(
+    user_email: str,
+    job_title: str,
+    job_id: str,
+    location: str = "",
+) -> bool:
+    """Send a single new-job notification email via the configured mail provider."""
+    try:
+        location_row = ""
+        if location:
+            location_row = f'''
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Location:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(location)}</td></tr>
+            '''
+        html_content = f'''
+            <h2>New Job Posted</h2>
+            <p>A new job has been <strong>posted</strong> and is accepting submissions.</p>
+            <table style="border-collapse: collapse; width: 100%; max-width: 600px;">
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Job Title:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(job_title)}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Job ID:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(job_id)}</td></tr>
+                {location_row}
+            </table>
+            <p style="margin-top: 20px;">
+                <a href="{html.escape(APP_URL)}" style="padding: 12px 24px; background: #7c3aed; color: white; text-decoration: none; border-radius: 6px;">View Job</a>
+            </p>
+            <p style="color: #666; font-size: 12px; margin-top: 30px;">
+                This is an automated notification from the Vendor Management System.<br>
+                For questions, please contact admin@radixsol.com
+            </p>
+        '''
+        return send_app_email(
+            user_email,
+            subject=f'New Job Posted: {job_title}',
+            html_content=html_content,
+        )
+    except Exception as e:
+        print(f"[Email] Error sending posted-job notification to {user_email}: {e}")
+        return False
+
+
+def notify_users_about_job_posted(job: Job, source: str = "direct_api") -> int:
+    """Notify whitelisted users about a newly posted direct/manual job."""
+    if not mongodb_enabled or notifications_collection is None:
+        print("[JobPosted] Skipping direct posted-job notifications - MongoDB notifications unavailable.")
+        return 0
+    if not JOB_POSTING_NOTIFICATIONS_ENABLED:
+        print(f"[JobPosted] Posting notifications disabled - skipping {job.id}")
+        return 0
+    if not WHITELISTED_USERS:
+        load_whitelisted_users()
+    recipients = [u.lower() for u in WHITELISTED_USERS if u.lower() != ADMIN_EMAIL.lower()]
+    sent_count = 0
+    for user_email in recipients:
+        existing = notifications_collection.find_one({
+            "type": "job_posted",
+            "job_id": job.id,
+            "user_email": user_email,
+        })
+        if existing:
+            continue
+        email_sent = send_job_posted_notification_email(user_email, job.title, job.id, job.location)
+        notifications_collection.insert_one({
+            "id": str(uuid4()),
+            "type": "job_posted",
+            "job_id": job.id,
+            "job_title": job.title,
+            "user_email": user_email,
+            "email_sent": email_sent,
+            "source": source,
+            "created_at": datetime.now().isoformat(),
+            "read": False,
+        })
+        if email_sent:
+            sent_count += 1
+    print(f"[JobPosted] Notified {sent_count}/{len(recipients)} users about posted job {job.id}")
+    return sent_count
+
+
 def extract_ceipal_status_entries(reports_data) -> list:
     """Extract (job_id, status, title) from a raw Ceipal reports page WITHOUT filtering by status.
 
@@ -563,8 +669,9 @@ def extract_ceipal_status_entries(reports_data) -> list:
         job_id = row.get("JobCode") or row.get("job_id") or row.get("JobID")
         status = (row.get("JobStatus") or "").strip()
         title = (row.get("JobTitle") or "").strip()
+        location = (row.get("Location") or row.get("States") or "").strip()
         if job_id and status:
-            entries.append({"job_id": str(job_id), "status": status, "title": title})
+            entries.append({"job_id": str(job_id), "status": status, "title": title, "location": location})
     return entries
 
 
@@ -580,6 +687,7 @@ def _update_status_tracker(current_status_map: dict):
                 "job_id": job_id,
                 "status": info.get("status", ""),
                 "title": info.get("title", ""),
+                "location": info.get("location", ""),
                 "updated_at": now,
             }},
             upsert=True,
@@ -621,11 +729,20 @@ def detect_and_notify_closures(current_status_map: dict, fetch_complete: bool):
             return
 
         transitions = []
+        new_postings = []
         for job_id, curr in current_status_map.items():
             curr_status = (curr.get("status") or "").strip().lower()
+            prev_doc = prev_docs.get(job_id)
+            if curr_status in OPEN_STATUSES and not prev_doc:
+                new_postings.append({
+                    "job_id": job_id,
+                    "title": curr.get("title") or "Unknown Job",
+                    "status": curr.get("status"),
+                    "location": curr.get("location") or "",
+                })
+                continue
             if curr_status not in CLOSED_STATUSES:
                 continue
-            prev_doc = prev_docs.get(job_id)
             if not prev_doc:
                 continue  # job_id absent from previous tracker — not a transition we'll act on
             prev_status = (prev_doc.get("status") or "").strip().lower()
@@ -638,6 +755,8 @@ def detect_and_notify_closures(current_status_map: dict, fetch_complete: bool):
                 })
 
         print(f"[ClosureDetector] Detected {len(transitions)} genuine Open/Active → Closed transitions")
+
+        print(f"[ClosureDetector] Detected {len(new_postings)} new Open/Active job postings")
 
         if len(transitions) > JOB_CLOSURE_PER_RUN_CAP:
             print(f"[ClosureDetector] ABORT — {len(transitions)} closures exceeds cap of {JOB_CLOSURE_PER_RUN_CAP}. No notifications sent. Tracker NOT updated.")
@@ -652,9 +771,72 @@ def detect_and_notify_closures(current_status_map: dict, fetch_complete: bool):
                 })
             return
 
+        if len(new_postings) > JOB_POSTING_PER_RUN_CAP:
+            print(f"[ClosureDetector] ABORT postings - {len(new_postings)} new postings exceeds cap of {JOB_POSTING_PER_RUN_CAP}. No posted-job notifications sent. Tracker NOT updated.")
+            if closure_audit_collection is not None:
+                closure_audit_collection.insert_one({
+                    "id": str(uuid4()),
+                    "type": "posting_abort_cap_exceeded",
+                    "detected_count": len(new_postings),
+                    "cap": JOB_POSTING_PER_RUN_CAP,
+                    "sample_job_ids": [t["job_id"] for t in new_postings[:50]],
+                    "detected_at": datetime.now().isoformat(),
+                })
+            return
+
         if not WHITELISTED_USERS:
             load_whitelisted_users()
         recipients = [u.lower() for u in WHITELISTED_USERS if u.lower() != ADMIN_EMAIL.lower()]
+
+        for t in new_postings:
+            job_id = t["job_id"]
+            title = t["title"]
+            audit_doc = {
+                "id": str(uuid4()),
+                "type": "posting_detected",
+                "job_id": job_id,
+                "job_title": title,
+                "current_status": t["status"],
+                "recipients_count": len(recipients),
+                "detected_at": datetime.now().isoformat(),
+                "notifications_enabled": JOB_POSTING_NOTIFICATIONS_ENABLED,
+            }
+
+            if not JOB_POSTING_NOTIFICATIONS_ENABLED:
+                print(f"[ClosureDetector] Posting notifications disabled - would notify {len(recipients)} users about new job {job_id} ('{title}')")
+                if closure_audit_collection is not None:
+                    closure_audit_collection.insert_one(audit_doc)
+                continue
+
+            sent_count = 0
+            for user_email in recipients:
+                if notifications_collection is not None:
+                    existing = notifications_collection.find_one({
+                        "type": "job_posted",
+                        "job_id": job_id,
+                        "user_email": user_email,
+                    })
+                    if existing:
+                        continue
+                email_sent = send_job_posted_notification_email(user_email, title, job_id, t.get("location") or "")
+                if notifications_collection is not None:
+                    notifications_collection.insert_one({
+                        "id": str(uuid4()),
+                        "type": "job_posted",
+                        "job_id": job_id,
+                        "job_title": title,
+                        "user_email": user_email,
+                        "email_sent": email_sent,
+                        "created_at": datetime.now().isoformat(),
+                        "read": False,
+                    })
+                if email_sent:
+                    sent_count += 1
+
+            audit_doc["emails_sent"] = sent_count
+            if closure_audit_collection is not None:
+                closure_audit_collection.insert_one(audit_doc)
+            print(f"[ClosureDetector] Notified {sent_count}/{len(recipients)} users about new posting {job_id}")
 
         for t in transitions:
             job_id = t["job_id"]
@@ -1136,6 +1318,7 @@ class Job(BaseModel):
     profession: Optional[str] = None
     specialty: Optional[str] = None
     state: Optional[str] = None
+    bill_rate_discount_applied: bool = False
 
 class DirectJobCreateRequest(BaseModel):
     job_id: Optional[str] = None
@@ -1787,6 +1970,7 @@ async def create_job_from_payload(
     try:
         job = build_job_from_direct_input(payload)
         upsert_manual_job(job)
+        await asyncio.to_thread(notify_users_about_job_posted, job, "direct_api")
 
         return {
             "message": "Job stored successfully",
@@ -1829,6 +2013,7 @@ async def create_nexus_job(payload: DirectJobCreateRequest):
     try:
         job = build_job_from_direct_input(payload)
         upsert_manual_job(job)
+        await asyncio.to_thread(notify_users_about_job_posted, job, "nexus_api")
 
         return {
             "message": "Job stored successfully",
@@ -2053,6 +2238,7 @@ def load_excel_jobs_from_file(file_path: str) -> List[Job]:
                     profession=profession if profession and profession.lower() != 'nan' else None,
                     specialty=specialty if specialty and specialty.lower() != 'nan' else None,
                     state=state if state and state.lower() != 'nan' else None,
+                    bill_rate_discount_applied=True,
                 )
                 
                 jobs.append(job)
@@ -2274,6 +2460,7 @@ def build_job_from_direct_input(payload: DirectJobCreateRequest) -> Job:
         specialty=payload.specialty.strip(),
         state=payload.state.strip(),
         end_client=(payload.client or "").strip() or None,
+        bill_rate_discount_applied=True,
     )
 
 
@@ -2288,7 +2475,7 @@ def load_manual_jobs() -> List[Job]:
                 doc.pop("created_at", None)
                 if not doc.get("bill_rate_discount_applied"):
                     doc["salary_range"] = display_bill_rate(doc.get("salary_range")) or None
-                doc.pop("bill_rate_discount_applied", None)
+                doc["bill_rate_discount_applied"] = True
                 jobs.append(Job(**doc))
             return jobs
 
@@ -2301,7 +2488,7 @@ def load_manual_jobs() -> List[Job]:
         for job_data in raw_jobs:
             if not job_data.get("bill_rate_discount_applied"):
                 job_data["salary_range"] = display_bill_rate(job_data.get("salary_range")) or None
-            job_data.pop("bill_rate_discount_applied", None)
+            job_data["bill_rate_discount_applied"] = True
             jobs.append(Job(**job_data))
     except Exception as e:
         print(f"[Manual Jobs] Failed to load direct-input jobs: {e}")
@@ -3052,6 +3239,7 @@ class CeipalClient:
                 end_client=job_data.get("EndClient", None),
                 specialty=specialty.strip() or None,
                 state=states.strip() or None,
+                bill_rate_discount_applied=True,
             )
             jobs.append(job)
             
@@ -3085,10 +3273,11 @@ class CeipalClient:
                 department="Engineering",
                 location="New York, NY",
                 employment_type="Full-time",
-                salary_range="$100,000 - $140,000",
+                salary_range=None,
                 posted_date=datetime.now(),
                 status="active",
-                requirements="5+ years of software development experience, strong knowledge of modern frameworks."
+                requirements="5+ years of software development experience, strong knowledge of modern frameworks.",
+                bill_rate_discount_applied=True,
             ),
             Job(
                 id="ceipal_002",
@@ -3097,10 +3286,11 @@ class CeipalClient:
                 department="Business Analysis",
                 location="Remote",
                 employment_type="Contract",
-                salary_range="$80,000 - $100,000",
+                salary_range=None,
                 posted_date=datetime.now(),
                 status="active",
-                requirements="3+ years of business analysis experience, excellent communication skills."
+                requirements="3+ years of business analysis experience, excellent communication skills.",
+                bill_rate_discount_applied=True,
             ),
             Job(
                 id="ceipal_003",
@@ -3109,10 +3299,11 @@ class CeipalClient:
                 department="Project Management",
                 location="Chicago, IL",
                 employment_type="Full-time",
-                salary_range="$110,000 - $150,000",
+                salary_range=None,
                 posted_date=datetime.now(),
                 status="active",
-                requirements="PMP certification preferred, 5+ years of project management experience."
+                requirements="PMP certification preferred, 5+ years of project management experience.",
+                bill_rate_discount_applied=True,
             )
         ]
 
@@ -3158,13 +3349,7 @@ async def get_jobs(background_tasks: BackgroundTasks, current_user: UserDB = Dep
         # Check if user is admin for description sanitization
         is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
         
-        # Sanitize job descriptions for non-admin users (vendors)
-        sanitized_jobs = []
-        for job in all_jobs:
-            job_dict = job.dict() if hasattr(job, 'dict') else job
-            if not is_admin and 'description' in job_dict:
-                job_dict['description'] = sanitize_job_description(job_dict['description'], is_admin)
-            sanitized_jobs.append(job_dict)
+        sanitized_jobs = [sanitize_job_for_display(job, is_admin) for job in all_jobs]
         
         return JobListResponse(
             jobs=sanitized_jobs, 
@@ -3184,12 +3369,7 @@ async def get_jobs(background_tasks: BackgroundTasks, current_user: UserDB = Dep
             
             # Check if user is admin for fallback too
             is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
-            sanitized_jobs = []
-            for job in all_jobs:
-                job_dict = job.dict() if hasattr(job, 'dict') else job
-                if not is_admin and 'description' in job_dict:
-                    job_dict['description'] = sanitize_job_description(job_dict['description'], is_admin)
-                sanitized_jobs.append(job_dict)
+            sanitized_jobs = [sanitize_job_for_display(job, is_admin) for job in all_jobs]
             return JobListResponse(
                 jobs=sanitized_jobs, 
                 total=len(sanitized_jobs),
@@ -3215,7 +3395,7 @@ async def get_job(job_id: str):
             job = next((job for job in ceipal_jobs if job.id == job_id), None)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
-        return job
+        return sanitize_job_for_display(job)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch job: {str(e)}")
 
@@ -3224,7 +3404,8 @@ async def load_more_jobs(start_page: int = 26, max_pages: int = 25):
     """Load additional pages of jobs for infinite scroll"""
     try:
         more_jobs = await ceipal_client.fetch_more_jobs(start_page, max_pages)
-        return {"jobs": more_jobs, "total": len(more_jobs), "start_page": start_page}
+        sanitized_jobs = [sanitize_job_for_display(job) for job in more_jobs]
+        return {"jobs": sanitized_jobs, "total": len(sanitized_jobs), "start_page": start_page}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to load more jobs: {str(e)}")
 
