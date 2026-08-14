@@ -1940,7 +1940,10 @@ function updateNotificationUI() {
       list.innerHTML = notificationsData.notifications.map(n => {
         const isPosted = n.type === 'job_posted';
         const title = isPosted ? 'New Job Posted' : 'Job Closed';
-        const desc = isPosted ? 'Accepting submissions' : `${n.candidate_count || 0} candidate(s) submitted`;
+        const metaTags = Array.isArray(n.meta_tags) ? n.meta_tags.filter(Boolean) : [];
+        const desc = isPosted && metaTags.length
+          ? `<div class="card__meta">${metaTags.map(tag => `<span class="tag">${escapeHtml(tag)}</span>`).join('')}</div>`
+          : (isPosted ? 'Accepting submissions' : `${n.candidate_count || 0} candidate(s) submitted`);
         return `
         <div class="notification-item ${n.read ? '' : 'unread'}" data-id="${n.id}">
           <div class="notification-icon">

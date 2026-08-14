@@ -577,21 +577,27 @@ def send_job_posted_notification_email(
     job_title: str,
     job_id: str,
     location: str = "",
+    meta_tags: Optional[List[str]] = None,
 ) -> bool:
     """Send a single new-job notification email via the configured mail provider."""
     try:
-        location_row = ""
-        if location:
-            location_row = f'''
-                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Location:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(location)}</td></tr>
+        tags_html = ""
+        tags = [tag for tag in (meta_tags or []) if tag]
+        if tags:
+            tags_html = f'''
+                <div style="margin: 16px 0 8px;">
+                    {"".join(
+                        f'<span style="display:inline-block;margin:0 6px 8px 0;padding:6px 10px;border:1px solid #d1d5db;border-radius:999px;background:#f9fafb;color:#111827;font-size:13px;">{html.escape(tag)}</span>'
+                        for tag in tags
+                    )}
+                </div>
             '''
         html_content = f'''
             <h2>New Job Posted</h2>
             <p>A new job has been <strong>posted</strong> and is accepting submissions.</p>
+            {tags_html}
             <table style="border-collapse: collapse; width: 100%; max-width: 600px;">
                 <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Job Title:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(job_title)}</td></tr>
-                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Job ID:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(job_id)}</td></tr>
-                {location_row}
             </table>
             <p style="margin-top: 20px;">
                 <a href="{html.escape(APP_URL)}" style="padding: 12px 24px; background: #7c3aed; color: white; text-decoration: none; border-radius: 6px;">View Job</a>
@@ -611,7 +617,26 @@ def send_job_posted_notification_email(
         return False
 
 
-def notify_users_about_job_posted(job: Job, source: str = "direct_api") -> int:
+def build_job_posted_meta_tags(
+    specialty: str = "",
+    state: str = "",
+    employment_type: str = "",
+    status: str = "",
+    end_client: str = "",
+) -> List[str]:
+    tags = []
+    for value in [specialty, state, employment_type]:
+        text = str(value or "").strip()
+        if text:
+            tags.append(text)
+    if status:
+        tags.append(f"Status: {str(status).strip()}")
+    if end_client:
+        tags.append(f"End Client: {str(end_client).strip()}")
+    return tags
+
+
+def notify_users_about_job_posted(job, source: str = "direct_api") -> int:
     """Notify whitelisted users about a newly posted direct/manual job."""
     if not mongodb_enabled or notifications_collection is None:
         print("[JobPosted] Skipping direct posted-job notifications - MongoDB notifications unavailable.")
@@ -631,7 +656,14 @@ def notify_users_about_job_posted(job: Job, source: str = "direct_api") -> int:
         })
         if existing:
             continue
-        email_sent = send_job_posted_notification_email(user_email, job.title, job.id, job.location)
+        meta_tags = build_job_posted_meta_tags(
+            specialty=job.specialty or job.department,
+            state=job.state or "",
+            employment_type=job.employment_type,
+            status=job.status,
+            end_client=job.end_client or "",
+        )
+        email_sent = send_job_posted_notification_email(user_email, job.title, job.id, job.location, meta_tags)
         notifications_collection.insert_one({
             "id": str(uuid4()),
             "type": "job_posted",
@@ -640,6 +672,7 @@ def notify_users_about_job_posted(job: Job, source: str = "direct_api") -> int:
             "user_email": user_email,
             "email_sent": email_sent,
             "source": source,
+            "meta_tags": meta_tags,
             "created_at": datetime.now().isoformat(),
             "read": False,
         })
@@ -670,8 +703,27 @@ def extract_ceipal_status_entries(reports_data) -> list:
         status = (row.get("JobStatus") or "").strip()
         title = (row.get("JobTitle") or "").strip()
         location = (row.get("Location") or row.get("States") or "").strip()
+        specialty = (
+            row.get("Specialty")
+            or row.get("JobSpecialty")
+            or row.get("Speciality")
+            or row.get("JobSpeciality")
+            or ""
+        )
+        state = row.get("States") or row.get("State") or ""
+        employment_type = row.get("Duration") or row.get("EmploymentType") or "Contract"
+        end_client = row.get("EndClient") or ""
         if job_id and status:
-            entries.append({"job_id": str(job_id), "status": status, "title": title, "location": location})
+            entries.append({
+                "job_id": str(job_id),
+                "status": status,
+                "title": title,
+                "location": location,
+                "specialty": str(specialty).strip(),
+                "state": str(state).strip(),
+                "employment_type": str(employment_type).strip(),
+                "end_client": str(end_client).strip(),
+            })
     return entries
 
 
@@ -688,6 +740,10 @@ def _update_status_tracker(current_status_map: dict):
                 "status": info.get("status", ""),
                 "title": info.get("title", ""),
                 "location": info.get("location", ""),
+                "specialty": info.get("specialty", ""),
+                "state": info.get("state", ""),
+                "employment_type": info.get("employment_type", ""),
+                "end_client": info.get("end_client", ""),
                 "updated_at": now,
             }},
             upsert=True,
@@ -739,6 +795,13 @@ def detect_and_notify_closures(current_status_map: dict, fetch_complete: bool):
                     "title": curr.get("title") or "Unknown Job",
                     "status": curr.get("status"),
                     "location": curr.get("location") or "",
+                    "meta_tags": build_job_posted_meta_tags(
+                        specialty=curr.get("specialty") or "",
+                        state=curr.get("state") or "",
+                        employment_type=curr.get("employment_type") or "Contract",
+                        status=curr.get("status") or "",
+                        end_client=curr.get("end_client") or "",
+                    ),
                 })
                 continue
             if curr_status not in CLOSED_STATUSES:
@@ -797,6 +860,7 @@ def detect_and_notify_closures(current_status_map: dict, fetch_complete: bool):
                 "job_id": job_id,
                 "job_title": title,
                 "current_status": t["status"],
+                "meta_tags": t.get("meta_tags") or [],
                 "recipients_count": len(recipients),
                 "detected_at": datetime.now().isoformat(),
                 "notifications_enabled": JOB_POSTING_NOTIFICATIONS_ENABLED,
@@ -818,7 +882,13 @@ def detect_and_notify_closures(current_status_map: dict, fetch_complete: bool):
                     })
                     if existing:
                         continue
-                email_sent = send_job_posted_notification_email(user_email, title, job_id, t.get("location") or "")
+                email_sent = send_job_posted_notification_email(
+                    user_email,
+                    title,
+                    job_id,
+                    t.get("location") or "",
+                    t.get("meta_tags") or [],
+                )
                 if notifications_collection is not None:
                     notifications_collection.insert_one({
                         "id": str(uuid4()),
@@ -827,6 +897,7 @@ def detect_and_notify_closures(current_status_map: dict, fetch_complete: bool):
                         "job_title": title,
                         "user_email": user_email,
                         "email_sent": email_sent,
+                        "meta_tags": t.get("meta_tags") or [],
                         "created_at": datetime.now().isoformat(),
                         "read": False,
                     })
