@@ -751,6 +751,65 @@ function normalizeText(v) {
   return (v ?? '').toString().toLowerCase();
 }
 
+const STATE_NAME_TO_CODE = {
+  Alabama: 'AL',
+  Alaska: 'AK',
+  Arizona: 'AZ',
+  Arkansas: 'AR',
+  California: 'CA',
+  Colorado: 'CO',
+  Connecticut: 'CT',
+  Delaware: 'DE',
+  Florida: 'FL',
+  Georgia: 'GA',
+  Hawaii: 'HI',
+  Idaho: 'ID',
+  Illinois: 'IL',
+  Indiana: 'IN',
+  Iowa: 'IA',
+  Kansas: 'KS',
+  Kentucky: 'KY',
+  Louisiana: 'LA',
+  Maine: 'ME',
+  Maryland: 'MD',
+  Massachusetts: 'MA',
+  Michigan: 'MI',
+  Minnesota: 'MN',
+  Mississippi: 'MS',
+  Missouri: 'MO',
+  Montana: 'MT',
+  Nebraska: 'NE',
+  Nevada: 'NV',
+  'New Hampshire': 'NH',
+  'New Jersey': 'NJ',
+  'New Mexico': 'NM',
+  'New York': 'NY',
+  'North Carolina': 'NC',
+  'North Dakota': 'ND',
+  Ohio: 'OH',
+  Oklahoma: 'OK',
+  Oregon: 'OR',
+  Pennsylvania: 'PA',
+  'Rhode Island': 'RI',
+  'South Carolina': 'SC',
+  'South Dakota': 'SD',
+  Tennessee: 'TN',
+  Texas: 'TX',
+  Utah: 'UT',
+  Vermont: 'VT',
+  Virginia: 'VA',
+  Washington: 'WA',
+  'West Virginia': 'WV',
+  Wisconsin: 'WI',
+  Wyoming: 'WY',
+};
+
+const STATE_LOOKUP = Object.entries(STATE_NAME_TO_CODE).reduce((lookup, [name, code]) => {
+  lookup[normalizeText(name).trim()] = name;
+  lookup[normalizeText(code).trim()] = name;
+  return lookup;
+}, {});
+
 function escapeHtml(value) {
   return (value ?? '').toString().replace(/[&<>"']/g, ch => ({
     '&': '&amp;',
@@ -777,6 +836,12 @@ function getJobState(job) {
   return parts.length > 1 ? parts[parts.length - 1] : '';
 }
 
+function getCanonicalState(rawState) {
+  const value = (rawState || '').toString().trim();
+  if (!value) return '';
+  return STATE_LOOKUP[normalizeText(value).trim()] || value;
+}
+
 function getJobSpecialty(job) {
   if (job.specialty) return job.specialty.toString().trim();
   if (job.department && !/^job code:/i.test(job.department)) return job.department.toString().trim();
@@ -800,7 +865,7 @@ function updateSelectOptions(select, values) {
 }
 
 function updateJobFilterOptions() {
-  updateSelectOptions(els.stateFilter, allJobs.map(getJobState));
+  updateSelectOptions(els.stateFilter, allJobs.map(job => getCanonicalState(getJobState(job))));
   updateSelectOptions(els.specialtyFilter, allJobs.map(getJobSpecialty));
 }
 
@@ -811,7 +876,7 @@ function jobMatches(job) {
   const specialty = normalizeText(els.specialtyFilter ? els.specialtyFilter.value : '').trim();
 
   if (q) {
-    const hay = [job.title, job.department, job.location, job.employment_type, job.specialty, job.state].map(normalizeText).join(' ');
+    const hay = [job.title, job.department, job.location, job.employment_type, job.specialty, job.state, getCanonicalState(getJobState(job))].map(normalizeText).join(' ');
     if (!hay.includes(q)) return false;
   }
 
@@ -821,7 +886,7 @@ function jobMatches(job) {
   }
 
   if (state) {
-    const s = normalizeText(getJobState(job));
+    const s = normalizeText(getCanonicalState(getJobState(job)));
     if (s !== state) return false;
   }
 

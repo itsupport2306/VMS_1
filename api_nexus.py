@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import html
 import json
 from pathlib import Path
+import random
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -36,7 +37,10 @@ PAGE_SIZE = 50
 TIMEOUT = 30
 OUTPUT_CSV = "jobs.csv"
 DEFAULT_DETAIL_CONCURRENCY = 10
-DEFAULT_POST_CONCURRENCY = 5
+DEFAULT_POST_CONCURRENCY = 2
+DEFAULT_POST_BATCH_SIZE = 25
+DEFAULT_POST_MAX_RETRIES = 5
+DEFAULT_POST_MAX_RETRY_AFTER_SECONDS = 60
 DEFAULT_NEXUS_POLL_SECONDS = 300
 DEFAULT_CSV_POLL_SECONDS = 10
 CSV_JOB_ID_COLUMN = "job_id"
@@ -614,6 +618,86 @@ async def post_job_to_vms(
     return response.json()
 
 
+def parse_retry_after_seconds(response: Optional[httpx.Response]) -> Optional[float]:
+    if response is None:
+        return None
+    retry_after = (response.headers.get("Retry-After") or "").strip()
+    if not retry_after:
+        return None
+    try:
+        return max(0.0, float(retry_after))
+    except ValueError:
+        return None
+
+
+async def post_jobs_to_vms_bulk(
+    client: httpx.AsyncClient,
+    base_url: str,
+    job_payloads: List[Dict[str, str]],
+    token: Optional[str] = None,
+    send_notifications: bool = False,
+) -> Dict[str, Any]:
+    endpoint = "/api/admin/jobs/bulk" if token else "/api/nexus/jobs/bulk"
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    response = await client.post(
+        f"{base_url.rstrip('/')}{endpoint}",
+        headers=headers,
+        json={
+            "jobs": job_payloads,
+            "send_notifications": send_notifications,
+        },
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+async def post_jobs_to_vms_bulk_with_retries(
+    client: httpx.AsyncClient,
+    base_url: str,
+    job_payloads: List[Dict[str, str]],
+    token: Optional[str] = None,
+    send_notifications: bool = False,
+    max_retries: int = DEFAULT_POST_MAX_RETRIES,
+) -> Dict[str, Any]:
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return await post_jobs_to_vms_bulk(
+                client,
+                base_url,
+                job_payloads,
+                token=token,
+                send_notifications=send_notifications,
+            )
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            retryable = status_code == 429 or 500 <= status_code < 600
+            if not retryable or attempt >= max_retries:
+                raise
+            retry_after = parse_retry_after_seconds(exc.response)
+            wait_seconds = retry_after
+            if wait_seconds is None:
+                wait_seconds = min(2 ** (attempt - 1), DEFAULT_POST_MAX_RETRY_AFTER_SECONDS) + random.uniform(0, 1)
+            print(
+                f"Bulk post attempt {attempt} received HTTP {status_code}. "
+                f"Retrying {len(job_payloads)} queued job(s) after {wait_seconds:.1f}s."
+            )
+            await asyncio.sleep(wait_seconds)
+        except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ConnectError) as exc:
+            if attempt >= max_retries:
+                raise
+            wait_seconds = min(2 ** (attempt - 1), DEFAULT_POST_MAX_RETRY_AFTER_SECONDS) + random.uniform(0, 1)
+            print(
+                f"Bulk post attempt {attempt} hit transient transport error ({exc}). "
+                f"Retrying {len(job_payloads)} queued job(s) after {wait_seconds:.1f}s."
+            )
+            await asyncio.sleep(wait_seconds)
+
+
 async def produce_summary_jobs(
     client: httpx.AsyncClient,
     summary_queue: "asyncio.Queue[Optional[Tuple[int, Dict[str, Any]]]]",
@@ -714,42 +798,86 @@ async def post_worker(
     result: Dict[str, Any],
 ) -> None:
     while True:
+        batch_rows: List[Dict[str, Any]] = []
         row = await post_queue.get()
+        batch_rows.append(row)
+        for _ in range(DEFAULT_POST_BATCH_SIZE - 1):
+            try:
+                extra_row = post_queue.get_nowait()
+                batch_rows.append(extra_row)
+            except asyncio.QueueEmpty:
+                break
         try:
-            if row is None:
+            if batch_rows[0] is None:
                 return
 
-            summary_job = row["summary"]
-            detail_job = row["detail"]
-            job_id = get_row_job_id(row)
-            if not job_id:
-                result["failed"].append({"job_id": "unknown", "error": "missing job_id"})
-                print("Failed to post job unknown to VMS: missing job_id")
+            valid_entries: List[Tuple[str, Dict[str, Any], Dict[str, str]]] = []
+            for batch_row in batch_rows:
+                if batch_row is None:
+                    continue
+                summary_job = batch_row["summary"]
+                detail_job = batch_row["detail"]
+                job_id = get_row_job_id(batch_row)
+                if not job_id:
+                    result["failed"].append({"job_id": "unknown", "error": "missing job_id"})
+                    print("Failed to post job unknown to VMS: missing job_id")
+                    continue
+
+                status = await csv_store.posting_status(job_id)
+                if status != STATUS_POSTING:
+                    print(f"Skipped VMS post for job {job_id}; CSV status is {status or 'missing'}")
+                    continue
+
+                result["total"] += 1
+                try:
+                    payload = build_vms_payload(summary_job, detail_job)
+                    valid_entries.append((job_id, batch_row, payload))
+                except Exception as exc:
+                    await csv_store.mark_failed(job_id, str(exc))
+                    result["failed"].append({"job_id": job_id, "error": str(exc)})
+                    print(f"Failed to prepare job {job_id} for VMS: {exc}")
+
+            if not valid_entries:
                 continue
 
-            status = await csv_store.posting_status(job_id)
-            if status != STATUS_POSTING:
-                print(f"Skipped VMS post for job {job_id}; CSV status is {status or 'missing'}")
-                continue
-
-            result["total"] += 1
             try:
-                payload = build_vms_payload(summary_job, detail_job)
-                await post_job_to_vms(client, vms_base_url, payload, token=token)
-                await csv_store.mark_posted(job_id)
-                result["posted"] += 1
-                print(f"Posted to VMS for job {payload['job_id']} on post worker {worker_id}")
-            except (httpx.ReadTimeout, httpx.RemoteProtocolError) as exc:
-                result["failed"].append({"job_id": job_id, "error": str(exc)})
+                response = await post_jobs_to_vms_bulk_with_retries(
+                    client,
+                    vms_base_url,
+                    [payload for _, _, payload in valid_entries],
+                    token=token,
+                    send_notifications=False,
+                )
+                stored_job_ids = set(response.get("stored_job_ids", []))
+                failed_by_job_id = {
+                    (item.get("job_id") or ""): item.get("error", "unknown error")
+                    for item in response.get("failed", [])
+                }
+                for job_id, _, payload in valid_entries:
+                    if job_id in stored_job_ids:
+                        await csv_store.mark_posted(job_id)
+                        result["posted"] += 1
+                        print(f"Posted to VMS for job {payload['job_id']} on post worker {worker_id}")
+                    else:
+                        error_text = failed_by_job_id.get(job_id, "bulk request did not confirm storage")
+                        await csv_store.mark_failed(job_id, error_text)
+                        result["failed"].append({"job_id": job_id, "error": error_text})
+                        print(f"Failed to post job {job_id} to VMS: {error_text}")
+            except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ConnectError) as exc:
+                for job_id, _, _ in valid_entries:
+                    result["failed"].append({"job_id": job_id, "error": str(exc)})
                 print(
-                    f"Post result uncertain for job {job_id}; leaving CSV status as posting: {exc}"
+                    f"Post result uncertain for {len(valid_entries)} queued job(s); "
+                    f"leaving CSV status as posting: {exc}"
                 )
             except Exception as exc:
-                await csv_store.mark_failed(job_id, str(exc))
-                result["failed"].append({"job_id": job_id or "unknown", "error": str(exc)})
-                print(f"Failed to post job {job_id or 'unknown'} to VMS: {exc}")
+                for job_id, _, _ in valid_entries:
+                    await csv_store.mark_failed(job_id, str(exc))
+                    result["failed"].append({"job_id": job_id, "error": str(exc)})
+                    print(f"Failed to post job {job_id} to VMS: {exc}")
         finally:
-            post_queue.task_done()
+            for _ in batch_rows:
+                post_queue.task_done()
 
 
 async def fetch_and_optionally_sync_jobs(

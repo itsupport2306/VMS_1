@@ -49,4 +49,12 @@ api_nexus.py
 vms_database.db
 delete_jobs_from_csv.sh
 test.csv
+.py
+documentation.md
+job_ids.csv
+oauth_jobs_1.csv
+oauth_jobs.csv
+csv_al.py
+api_nexus_oauth_jobs.py
+
 

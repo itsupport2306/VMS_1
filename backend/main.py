@@ -1413,6 +1413,11 @@ class DirectJobCreateRequest(BaseModel):
         return values
 
 
+class BulkDirectJobCreateRequest(BaseModel):
+    jobs: List[DirectJobCreateRequest]
+    send_notifications: bool = False
+
+
 class AdminJobDeleteRequest(BaseModel):
     email: str
     password: str
@@ -2030,6 +2035,7 @@ async def upload_excel_jobs(
 
 @app.post("/api/admin/jobs")
 async def create_job_from_payload(
+    background_tasks: BackgroundTasks,
     payload: DirectJobCreateRequest,
     current_user: UserDB = Depends(get_current_user)
 ):
@@ -2041,7 +2047,7 @@ async def create_job_from_payload(
     try:
         job = build_job_from_direct_input(payload)
         upsert_manual_job(job)
-        await asyncio.to_thread(notify_users_about_job_posted, job, "direct_api")
+        queue_job_post_notifications(background_tasks, [job], "direct_api", True)
 
         return {
             "message": "Job stored successfully",
@@ -2051,6 +2057,41 @@ async def create_job_from_payload(
     except Exception as e:
         print(f"[Manual Jobs] Error storing direct-input job {payload.job_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to store job: {str(e)}")
+
+
+@app.post("/api/admin/jobs/bulk")
+async def create_jobs_from_payload_bulk(
+    payload: BulkDirectJobCreateRequest,
+    background_tasks: BackgroundTasks,
+    current_user: UserDB = Depends(get_current_user)
+):
+    """Create or update many jobs directly from API payload fields (admin only)."""
+    is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Only admin can create jobs")
+
+    stored_jobs: List[Job] = []
+    failed_jobs = []
+
+    for item in payload.jobs:
+        try:
+            stored_jobs.append(build_job_from_direct_input(item))
+        except Exception as exc:
+            job_ref = item.job_id or item.job_code or "unknown"
+            failed_jobs.append({"job_id": job_ref, "error": str(exc)})
+
+    try:
+        upsert_manual_jobs(stored_jobs)
+        queue_job_post_notifications(
+            background_tasks,
+            stored_jobs,
+            "direct_api_bulk",
+            payload.send_notifications,
+        )
+        return build_bulk_job_response(stored_jobs, failed_jobs, "direct_api_bulk")
+    except Exception as e:
+        print(f"[Manual Jobs] Error storing bulk direct-input jobs: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to store bulk jobs: {str(e)}")
 
 
 @app.delete("/api/admin/jobs/{job_id}")
@@ -2079,12 +2120,12 @@ async def delete_job_from_payload(
 
 
 @app.post("/api/nexus/jobs")
-async def create_nexus_job(payload: DirectJobCreateRequest):
+async def create_nexus_job(payload: DirectJobCreateRequest, background_tasks: BackgroundTasks):
     """Create or update a job from Nexus-style request parameters."""
     try:
         job = build_job_from_direct_input(payload)
         upsert_manual_job(job)
-        await asyncio.to_thread(notify_users_about_job_posted, job, "nexus_api")
+        queue_job_post_notifications(background_tasks, [job], "nexus_api", True)
 
         return {
             "message": "Job stored successfully",
@@ -2095,6 +2136,36 @@ async def create_nexus_job(payload: DirectJobCreateRequest):
         job_ref = payload.job_id or payload.job_code or "unknown"
         print(f"[Nexus Jobs] Error storing Nexus job {job_ref}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to store job: {str(e)}")
+
+
+@app.post("/api/nexus/jobs/bulk")
+async def create_nexus_jobs_bulk(
+    payload: BulkDirectJobCreateRequest,
+    background_tasks: BackgroundTasks,
+):
+    """Create or update many jobs from Nexus-style request parameters."""
+    stored_jobs: List[Job] = []
+    failed_jobs = []
+
+    for item in payload.jobs:
+        try:
+            stored_jobs.append(build_job_from_direct_input(item))
+        except Exception as exc:
+            job_ref = item.job_id or item.job_code or "unknown"
+            failed_jobs.append({"job_id": job_ref, "error": str(exc)})
+
+    try:
+        upsert_manual_jobs(stored_jobs)
+        queue_job_post_notifications(
+            background_tasks,
+            stored_jobs,
+            "nexus_api_bulk",
+            payload.send_notifications,
+        )
+        return build_bulk_job_response(stored_jobs, failed_jobs, "nexus_api_bulk")
+    except Exception as e:
+        print(f"[Nexus Jobs] Error storing bulk Nexus jobs: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to store bulk jobs: {str(e)}")
 
 @app.get("/api/admin/jobs/excel-files")
 async def list_uploaded_excel_files(current_user: UserDB = Depends(get_current_user)):
@@ -2569,15 +2640,28 @@ def load_manual_jobs() -> List[Job]:
 
 def upsert_manual_job(job: Job) -> None:
     """Persist one direct-input job by job ID."""
-    job_payload = job.dict()
-    job_payload["bill_rate_discount_applied"] = True
+    upsert_manual_jobs([job])
+
+
+def upsert_manual_jobs(jobs: List[Job]) -> None:
+    """Persist many direct-input jobs with a single backend write pass when possible."""
+    if not jobs:
+        return
+
+    job_payloads = []
+    for job in jobs:
+        job_payload = job.dict()
+        job_payload["bill_rate_discount_applied"] = True
+        job_payloads.append(job_payload)
 
     if mongodb_enabled and manual_jobs_collection is not None:
-        manual_jobs_collection.update_one(
-            {"id": job.id},
-            {"$set": {**job_payload, "created_at": datetime.now()}},
-            upsert=True,
-        )
+        created_at = datetime.now()
+        for job_payload in job_payloads:
+            manual_jobs_collection.update_one(
+                {"id": job_payload["id"]},
+                {"$set": {**job_payload, "created_at": created_at}},
+                upsert=True,
+            )
         return
 
     existing_jobs = []
@@ -2585,18 +2669,45 @@ def upsert_manual_job(job: Job) -> None:
         with open(MANUAL_JOBS_FILE, "r") as f:
             existing_jobs = json.load(f)
 
-    updated = False
+    existing_index = {}
     for idx, existing_job in enumerate(existing_jobs):
-        if existing_job.get("id") == job.id:
-            existing_jobs[idx] = job_payload
-            updated = True
-            break
+        existing_id = (existing_job.get("id") or "").strip()
+        if existing_id:
+            existing_index[existing_id] = idx
 
-    if not updated:
-        existing_jobs.insert(0, job_payload)
+    new_jobs = []
+    for job_payload in job_payloads:
+        job_id = (job_payload.get("id") or "").strip()
+        if job_id and job_id in existing_index:
+            existing_jobs[existing_index[job_id]] = job_payload
+        else:
+            new_jobs.append(job_payload)
 
     with open(MANUAL_JOBS_FILE, "w") as f:
-        json.dump(existing_jobs, f, indent=2, default=str)
+        json.dump(new_jobs + existing_jobs, f, indent=2, default=str)
+
+
+def build_bulk_job_response(stored_jobs: List[Job], failed_jobs: List[dict], source: str) -> dict:
+    return {
+        "message": "Bulk job store completed",
+        "source": source,
+        "stored_count": len(stored_jobs),
+        "failed_count": len(failed_jobs),
+        "stored_job_ids": [job.id for job in stored_jobs],
+        "failed": failed_jobs,
+    }
+
+
+def queue_job_post_notifications(
+    background_tasks: BackgroundTasks,
+    jobs: List[Job],
+    source: str,
+    send_notifications: bool,
+) -> None:
+    if not send_notifications:
+        return
+    for job in jobs:
+        background_tasks.add_task(notify_users_about_job_posted, job, source)
 
 
 def delete_manual_job(job_id: str) -> bool:
