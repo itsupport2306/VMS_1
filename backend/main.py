@@ -1276,6 +1276,7 @@ CEIPAL_EMAIL = os.getenv("CEIPAL_EMAIL", "amir@radixsol.com")
 CEIPAL_PASSWORD = os.getenv("CEIPAL_PASSWORD", "")
 CEIPAL_API_KEY = os.getenv("CEIPAL_API_KEY", "2693f0ed28f2250811fe40294e97e108a56afa9043e5336da4")
 CEIPAL_CACHE_DIR = os.getenv("CEIPAL_CACHE_DIR", "./data/cache")
+CEIPAL_ENABLED = False
 DEBUG = os.getenv("DEBUG", "False").lower() in {"1", "true", "yes", "y"}
 
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./data/uploads")
@@ -3500,93 +3501,42 @@ async def root():
 
 @app.get("/api/jobs", response_model=JobListResponse)
 async def get_jobs(background_tasks: BackgroundTasks, current_user: UserDB = Depends(get_current_user)):
-    """Get all active jobs from direct input, Excel files, and Ceipal."""
+    """Get all active jobs from direct input and Excel files."""
     try:
         manual_jobs = load_manual_jobs()
         print(f"[API] Loaded {len(manual_jobs)} jobs from direct API input")
 
-        # Load Excel jobs first
         excel_jobs = load_excel_jobs()
         print(f"[API] Loaded {len(excel_jobs)} jobs from Excel")
-        
-        # Get Ceipal jobs from cache
-        cached_jobs = ceipal_client._get_cached_jobs() or ceipal_client._jobs_cache or []
-        refresh_started = False
-
-        # Trigger background refresh if cache is empty or stale, but avoid re-queueing the same
-        # long-running sync on every poll request from the browser.
-        if ceipal_client.should_trigger_background_refresh(max_age_seconds=300):
-            ceipal_client.mark_background_refresh_requested()
-            background_tasks.add_task(ceipal_client.fetch_all_jobs_background)
-            refresh_started = True
-            print(f"[API] Triggered background job fetch. Current cache: {len(cached_jobs)} jobs")
-        
-        # Calculate pagination info (based on Ceipal data)
-        total_pages = ceipal_client._last_fetched_pages if hasattr(ceipal_client, '_last_fetched_pages') else 0
-        total_records = getattr(ceipal_client, '_last_total_records', 0)
-        is_refreshing = ceipal_client._background_fetch_running or refresh_started
-        cache_age_seconds = ceipal_client.get_cache_age_seconds()
-        
-        # Combine jobs with stable source priority: direct API, Excel, then Ceipal.
-        all_jobs = combine_jobs_with_priority(manual_jobs, excel_jobs, cached_jobs)
-        jobs_fetched = len(all_jobs)
-        
-        # Has more if Ceipal jobs are still loading
-        has_more = (len(cached_jobs) < total_records and total_records > 0) or total_pages == 0
-        
-        # Check if user is admin for description sanitization
+        all_jobs = combine_jobs_with_priority(manual_jobs, excel_jobs, [])
         is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
-        
         sanitized_jobs = [sanitize_job_for_display(job, is_admin) for job in all_jobs]
-        
+
         return JobListResponse(
-            jobs=sanitized_jobs, 
+            jobs=sanitized_jobs,
             total=len(sanitized_jobs),
-            total_pages=total_pages,
-            next_start_page=total_pages + 1,
-            has_more=has_more,
-            is_refreshing=is_refreshing,
-            cache_age_seconds=cache_age_seconds,
+            total_pages=1,
+            next_start_page=2,
+            has_more=False,
+            is_refreshing=False,
+            cache_age_seconds=None,
         )
     except Exception as e:
-        # If fetch fails, try to return any cached data as fallback
-        if ceipal_client._jobs_cache:
-            total_pages = ceipal_client._last_fetched_pages if hasattr(ceipal_client, '_last_fetched_pages') else 25
-             
-            manual_jobs = load_manual_jobs()
-            excel_jobs = load_excel_jobs()
-            all_jobs = combine_jobs_with_priority(manual_jobs, excel_jobs, ceipal_client._jobs_cache)
-            
-            # Check if user is admin for fallback too
-            is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
-            sanitized_jobs = [sanitize_job_for_display(job, is_admin) for job in all_jobs]
-            return JobListResponse(
-                jobs=sanitized_jobs, 
-                total=len(sanitized_jobs),
-                total_pages=total_pages,
-                next_start_page=total_pages + 1,
-                has_more=total_pages >= 25,
-                is_refreshing=ceipal_client._background_fetch_running,
-                cache_age_seconds=ceipal_client.get_cache_age_seconds(),
-            )
         raise HTTPException(status_code=500, detail=f"Failed to fetch jobs: {str(e)}")
 
 
 @app.get("/api/ceipal/status")
 async def get_ceipal_status():
-    """Lightweight Ceipal/cache status for the web UI without forcing upstream auth requests."""
-    cache_age_seconds = ceipal_client.get_cache_age_seconds()
     return {
-        "status": "refreshing" if ceipal_client._background_fetch_running else (
-            "ok" if ceipal_client.auth_token or ceipal_client._jobs_cache else "idle"
-        ),
-        "is_refreshing": ceipal_client._background_fetch_running,
-        "has_cached_jobs": bool(ceipal_client._jobs_cache),
-        "cached_jobs_count": len(ceipal_client._jobs_cache or []),
-        "cache_age_seconds": cache_age_seconds,
-        "last_fetched_pages": getattr(ceipal_client, "_last_fetched_pages", 0),
-        "total_records": getattr(ceipal_client, "_last_total_records", 0),
-        "last_auth_error": ceipal_client.last_auth_error,
+        "status": "disabled",
+        "enabled": CEIPAL_ENABLED,
+        "is_refreshing": False,
+        "has_cached_jobs": False,
+        "cached_jobs_count": 0,
+        "cache_age_seconds": None,
+        "last_fetched_pages": 0,
+        "total_records": 0,
+        "last_auth_error": None,
     }
 
 @app.get("/api/jobs/{job_id}", response_model=Job)
@@ -3596,13 +3546,10 @@ async def get_job(job_id: str):
         all_jobs = combine_jobs_with_priority(
             load_manual_jobs(),
             load_excel_jobs(),
-            ceipal_client._get_cached_jobs() or [],
+            [],
         )
 
         job = next((job for job in all_jobs if job.id == job_id), None)
-        if not job:
-            ceipal_jobs = await ceipal_client.fetch_jobs()
-            job = next((job for job in ceipal_jobs if job.id == job_id), None)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
         return sanitize_job_for_display(job)
@@ -3611,50 +3558,30 @@ async def get_job(job_id: str):
 
 @app.get("/api/jobs/load-more")
 async def load_more_jobs(start_page: int = 26, max_pages: int = 25):
-    """Load additional pages of jobs for infinite scroll"""
-    try:
-        more_result = await ceipal_client.fetch_more_jobs(start_page, max_pages)
-        more_jobs = more_result.get("jobs", [])
-        sanitized_jobs = [sanitize_job_for_display(job) for job in more_jobs]
-        return {
-            "jobs": sanitized_jobs,
-            "total": len(sanitized_jobs),
-            "start_page": start_page,
-            "next_start_page": more_result.get("next_start_page", start_page + max_pages),
-            "has_more": bool(more_result.get("has_more")),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to load more jobs: {str(e)}")
+    """CEIPAL pagination is disabled."""
+    return {
+        "jobs": [],
+        "total": 0,
+        "start_page": start_page,
+        "next_start_page": start_page,
+        "has_more": False,
+    }
 
 @app.get("/api/ceipal/test")
 async def test_ceipal_connection():
-    """Test Ceipal API connection and authentication"""
-    try:
-        auth_success = await ceipal_client.authenticate()
-        if auth_success:
-            return {
-                "status": "success",
-                "message": "Ceipal API authentication successful",
-                "auth_token": ceipal_client.auth_token[:20] + "..." if ceipal_client.auth_token else None,
-                "token_expires": ceipal_client.token_expires.isoformat() if ceipal_client.token_expires else None
-            }
-        else:
-            return {
-                "status": "error",
-                "message": "Ceipal API authentication failed",
-                "detail": ceipal_client.last_auth_error
-            }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ceipal API test failed: {str(e)}")
+    return {
+        "status": "disabled",
+        "enabled": CEIPAL_ENABLED,
+        "message": "Ceipal integration is disabled",
+    }
 
 @app.get("/api/ceipal/cache")
 async def get_ceipal_cache_status():
-    """Get metadata about the last cached Ceipal auth and reports responses."""
-    auth_cached = ceipal_client._read_json_cache("ceipal_auth_last.json")
-    reports_cached = ceipal_client._read_json_cache("ceipal_reports_last.json")
     return {
-        "auth_cached": auth_cached,
-        "reports_cached": reports_cached,
+        "enabled": CEIPAL_ENABLED,
+        "message": "Ceipal integration is disabled",
+        "auth_cached": None,
+        "reports_cached": None,
     }
 
 @app.get("/api/health")
@@ -3669,65 +3596,26 @@ async def health_check():
         "upload_dir_exists": os.path.exists(UPLOAD_DIR),
         "data_dir": DATA_DIR,
         "data_dir_exists": os.path.exists(DATA_DIR),
+        "ceipal_enabled": CEIPAL_ENABLED,
         "cache_dir": CEIPAL_CACHE_DIR,
         "cache_dir_exists": os.path.exists(CEIPAL_CACHE_DIR),
     }
 
 @app.post("/api/ceipal/refresh")
 async def force_refresh_jobs():
-    """Clear cache and force fresh job fetch from Ceipal"""
-    try:
-        ceipal_client.clear_cache()
-        jobs = await ceipal_client.fetch_jobs()
-        
-        # Read the cached first page to get pagination info
-        cache_data = ceipal_client._read_json_cache("ceipal_reports_last.json")
-        pagination_info = {}
-        if cache_data and cache_data.get("response"):
-            resp = cache_data["response"]
-            pagination_info = {
-                "record_count": resp.get("record_count"),
-                "page_count": resp.get("page_count"),
-                "limit": resp.get("limit"),
-                "has_next_page": resp.get("has_next_page"),
-                "has_prev_page": resp.get("has_prev_page"),
-                "next_page_exists": bool(resp.get("next_page")),
-            }
-        
-        return {
-            "message": "Jobs refreshed successfully",
-            "jobs_fetched": len(jobs),
-            "cached": False,
-            "pagination_from_page1": pagination_info
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to refresh jobs: {str(e)}")
+    return {
+        "status": "disabled",
+        "enabled": CEIPAL_ENABLED,
+        "message": "Ceipal integration is disabled",
+    }
 
 @app.get("/api/ceipal/reports")
 async def get_ceipal_reports():
-    """Get raw reports data from Ceipal API"""
-    try:
-        token = await ceipal_client.get_auth_token()
-        
-        async with httpx.AsyncClient() as client:
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
-            }
-            
-            response = await client.get(
-                f"{ceipal_client.reports_url}?response_type=1",
-                headers=headers
-            )
-            response.raise_for_status()
-            
-            return {
-                "status": "success",
-                "data": response.json()
-            }
-            
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch Ceipal reports: {str(e)}")
+    return {
+        "status": "disabled",
+        "enabled": CEIPAL_ENABLED,
+        "message": "Ceipal integration is disabled",
+    }
 
 @app.post("/api/candidates/submit")
 async def submit_candidate(

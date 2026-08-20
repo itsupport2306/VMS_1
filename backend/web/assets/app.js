@@ -1416,6 +1416,10 @@ function hideLoadingSpinner() {
 async function loadCeipalStatus() {
   try {
     const data = await apiGet('/api/ceipal/status');
+    if (data.status === 'disabled' || data.enabled === false) {
+      setStatus('warn', 'CEIPAL disabled');
+      return;
+    }
     if (data.is_refreshing) {
       setStatus('warn', 'Ceipal sync in progress');
       return;
@@ -1864,8 +1868,8 @@ els.statusFilter.addEventListener('change', renderJobs);
 if (els.stateFilter) els.stateFilter.addEventListener('change', renderJobs);
 if (els.specialtyFilter) els.specialtyFilter.addEventListener('change', renderJobs);
 els.refreshBtn.addEventListener('click', async () => {
-  await loadCeipalStatus();
   await loadJobs();
+  await loadCeipalStatus();
 });
 els.ceipalCacheBtn.addEventListener('click', async () => {
   try {
