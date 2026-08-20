@@ -482,12 +482,9 @@ async function handlePasswordReset() {
     els.resetPassword.value = '';
     els.resetPasswordConfirm.value = '';
     
-    // Show success and switch back to login
-    showResetAlert('ok', 'Password reset successfully! Please login with your new password.');
-    
-    setTimeout(() => {
-      showLoginForm();
-    }, 2000);
+    // Return to login immediately instead of waiting on an artificial delay.
+    showLoginForm();
+    showAuthAlert('ok', 'Password reset successfully! Please login with your new password.');
     
   } catch (e) {
     showResetAlert('error', e.message);
@@ -531,7 +528,7 @@ async function parseJsonResponse(res) {
   }
 }
 
-function completeLogin(data) {
+async function completeLogin(data) {
   authToken = data.access_token;
   currentUser = data.user;
   localStorage.setItem('vms_token', authToken);
@@ -543,14 +540,10 @@ function completeLogin(data) {
   if (els.authOtp) els.authOtp.value = '';
   pendingOtpEmail = '';
   setAuthMode('login', { keepValues: true });
-  showAuthAlert('ok', 'Logged in successfully!');
-
-  setTimeout(async () => {
-    updateAuthUI();
-    setView('jobs');
-    await loadCeipalStatus();
-    await loadJobs();
-  }, 800);
+  updateAuthUI();
+  setView('jobs');
+  await loadCeipalStatus();
+  await loadJobs();
 }
 
 async function handleLogin(email, password) {
@@ -571,7 +564,7 @@ async function handleLogin(email, password) {
       throw new Error(data.detail || data.message || `Error: ${res.status}`);
     }
 
-    completeLogin(data);
+    await completeLogin(data);
   } catch (e) {
     showAuthAlert('error', e.message);
     if (els.authSubmitBtn) els.authSubmitBtn.textContent = 'Login';
@@ -1233,7 +1226,7 @@ async function submitResume({ closeAfter }) {
     // Don't show candidate ID in success message
     showAlert('ok', `Submitted successfully by ${res.submitted_by || 'you'}.`);
     if (closeAfter) {
-      setTimeout(() => closeSubmitModal(), 650);
+      setTimeout(() => closeSubmitModal(), 150);
     } else {
       // prepare for another submission
       els.candName.value = '';

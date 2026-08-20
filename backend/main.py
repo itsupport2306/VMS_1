@@ -2842,6 +2842,38 @@ class CeipalClient:
     def mark_background_refresh_requested(self):
         self._last_background_trigger_time = datetime.now()
 
+    async def _get_reports_page_with_retry(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        headers: dict,
+        *,
+        context: str,
+        timeout: float = 60.0,
+        max_transport_retries: int = 3,
+    ) -> httpx.Response:
+        """Retry transient transport failures that Ceipal intermittently returns mid-pagination."""
+        transport_attempt = 0
+
+        while True:
+            try:
+                response = await client.get(url, headers=headers, timeout=timeout)
+                response.raise_for_status()
+                return response
+            except httpx.HTTPStatusError:
+                raise
+            except httpx.RequestError as e:
+                transport_attempt += 1
+                if transport_attempt > max_transport_retries:
+                    raise
+
+                wait_time = min(2 ** transport_attempt, 20)
+                print(
+                    f"[{context}] Transport error on {url}: {type(e).__name__}: {e}. "
+                    f"Retrying in {wait_time}s ({transport_attempt}/{max_transport_retries})..."
+                )
+                await asyncio.sleep(wait_time)
+
     def _cache_path(self, filename: str) -> str:
         return os.path.join(self.cache_dir, filename)
 
@@ -3039,8 +3071,12 @@ class CeipalClient:
                         print(f"[Ceipal] Fetching page {page}...")
                         
                         try:
-                            response = await client.get(url, headers=headers, timeout=60.0)
-                            response.raise_for_status()
+                            response = await self._get_reports_page_with_retry(
+                                client,
+                                url,
+                                headers,
+                                context="Ceipal",
+                            )
                             consecutive_429_errors = 0  # Reset on success
                         except httpx.HTTPStatusError as e:
                             if e.response.status_code == 429:
@@ -3167,8 +3203,12 @@ class CeipalClient:
                     print(f"[Background] Fetching page {page}...")
                     
                     try:
-                        response = await client.get(url, headers=headers, timeout=60.0)
-                        response.raise_for_status()
+                        response = await self._get_reports_page_with_retry(
+                            client,
+                            url,
+                            headers,
+                            context="Background",
+                        )
                         consecutive_429_errors = 0  # Reset on success
                         
                     except httpx.HTTPStatusError as e:
@@ -3302,8 +3342,12 @@ class CeipalClient:
                     print(f"[Ceipal] Loading more - page {page}...")
                     
                     try:
-                        response = await client.get(url, headers=headers, timeout=60.0)
-                        response.raise_for_status()
+                        response = await self._get_reports_page_with_retry(
+                            client,
+                            url,
+                            headers,
+                            context="Ceipal load-more",
+                        )
                         consecutive_429_errors = 0  # Reset on success
                     except httpx.HTTPStatusError as e:
                         if e.response.status_code == 429:
