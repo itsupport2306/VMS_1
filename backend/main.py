@@ -1439,6 +1439,8 @@ class JobListResponse(BaseModel):
     total_pages: int = 0
     next_start_page: int = 0
     has_more: bool = False
+    is_refreshing: bool = False
+    cache_age_seconds: Optional[int] = None
 
 class CandidateSubmission(BaseModel):
     candidate_name: str
@@ -2794,6 +2796,7 @@ class CeipalClient:
         # 429 retry loops. Safe to read/write without a lock since asyncio is single-threaded
         # and the check + set happens between awaits.
         self._background_fetch_running = False
+        self._last_background_trigger_time = None
         self._last_fetched_pages = 0  # Track how many pages were fetched
         os.makedirs(self.cache_dir, exist_ok=True)
 
@@ -2814,6 +2817,30 @@ class CeipalClient:
         """Clear the jobs cache to force fresh fetch"""
         self._jobs_cache = None
         self._jobs_cache_time = None
+
+    def get_cache_age_seconds(self) -> Optional[int]:
+        if not self._jobs_cache_time:
+            return None
+        return max(0, int((datetime.now() - self._jobs_cache_time).total_seconds()))
+
+    def is_cache_stale(self, max_age_seconds: int = 300) -> bool:
+        age_seconds = self.get_cache_age_seconds()
+        return age_seconds is None or age_seconds > max_age_seconds
+
+    def should_trigger_background_refresh(self, max_age_seconds: int = 300) -> bool:
+        if self._background_fetch_running:
+            return False
+        if not self._jobs_cache:
+            return True
+        if not self.is_cache_stale(max_age_seconds=max_age_seconds):
+            return False
+        if not self._last_background_trigger_time:
+            return True
+        seconds_since_last_trigger = (datetime.now() - self._last_background_trigger_time).total_seconds()
+        return seconds_since_last_trigger >= max_age_seconds
+
+    def mark_background_refresh_requested(self):
+        self._last_background_trigger_time = datetime.now()
 
     def _cache_path(self, filename: str) -> str:
         return os.path.join(self.cache_dir, filename)
@@ -3249,11 +3276,13 @@ class CeipalClient:
         finally:
             self._background_fetch_running = False
 
-    async def fetch_more_jobs(self, start_page: int, max_pages: int = 25) -> List[Job]:
-        """Fetch additional pages of jobs beyond initial load"""
+    async def fetch_more_jobs(self, start_page: int, max_pages: int = 25) -> dict:
+        """Fetch additional pages of jobs beyond initial load."""
         more_jobs: List[Job] = []
         consecutive_429_errors = 0
         max_429_retries = 3
+        next_start_page = start_page
+        has_more = False
         
         try:
             token = await self.get_auth_token()
@@ -3298,15 +3327,25 @@ class CeipalClient:
                     has_next_page_val = reports_data.get("has_next_page")
                     next_page_val = reports_data.get("next_page")
                     has_next = bool(has_next_page_val) or bool(next_page_val)
+                    next_start_page = page + 1
+                    has_more = has_next
                     
                     page += 1
                 
                 print(f"[Ceipal] Loaded {len(more_jobs)} more jobs from pages {start_page}-{page-1}")
-                return more_jobs
+                return {
+                    "jobs": more_jobs,
+                    "next_start_page": next_start_page,
+                    "has_more": has_more,
+                }
                 
         except Exception as e:
             print(f"[Ceipal] Error loading more jobs: {e}")
-            return []
+            return {
+                "jobs": [],
+                "next_start_page": start_page,
+                "has_more": False,
+            }
 
     async def _parse_jobs_from_reports(self, reports_data) -> List[Job]:
         """Parse Ceipal reports data into Job models.
@@ -3509,17 +3548,21 @@ async def get_jobs(background_tasks: BackgroundTasks, current_user: UserDB = Dep
         
         # Get Ceipal jobs from cache
         cached_jobs = ceipal_client._get_cached_jobs() or ceipal_client._jobs_cache or []
-        
-        # Trigger background refresh if cache is empty or older than 5 minutes
-        cache_age = datetime.now() - (ceipal_client._jobs_cache_time or datetime.min)
-        if not cached_jobs or cache_age > timedelta(minutes=5):
-            # Trigger background fetch without waiting (progressive loading)
+        refresh_started = False
+
+        # Trigger background refresh if cache is empty or stale, but avoid re-queueing the same
+        # long-running sync on every poll request from the browser.
+        if ceipal_client.should_trigger_background_refresh(max_age_seconds=300):
+            ceipal_client.mark_background_refresh_requested()
             background_tasks.add_task(ceipal_client.fetch_all_jobs_background)
+            refresh_started = True
             print(f"[API] Triggered background job fetch. Current cache: {len(cached_jobs)} jobs")
         
         # Calculate pagination info (based on Ceipal data)
         total_pages = ceipal_client._last_fetched_pages if hasattr(ceipal_client, '_last_fetched_pages') else 0
         total_records = getattr(ceipal_client, '_last_total_records', 0)
+        is_refreshing = ceipal_client._background_fetch_running or refresh_started
+        cache_age_seconds = ceipal_client.get_cache_age_seconds()
         
         # Combine jobs with stable source priority: direct API, Excel, then Ceipal.
         all_jobs = combine_jobs_with_priority(manual_jobs, excel_jobs, cached_jobs)
@@ -3538,7 +3581,9 @@ async def get_jobs(background_tasks: BackgroundTasks, current_user: UserDB = Dep
             total=len(sanitized_jobs),
             total_pages=total_pages,
             next_start_page=total_pages + 1,
-            has_more=has_more
+            has_more=has_more,
+            is_refreshing=is_refreshing,
+            cache_age_seconds=cache_age_seconds,
         )
     except Exception as e:
         # If fetch fails, try to return any cached data as fallback
@@ -3557,9 +3602,29 @@ async def get_jobs(background_tasks: BackgroundTasks, current_user: UserDB = Dep
                 total=len(sanitized_jobs),
                 total_pages=total_pages,
                 next_start_page=total_pages + 1,
-                has_more=total_pages >= 25
+                has_more=total_pages >= 25,
+                is_refreshing=ceipal_client._background_fetch_running,
+                cache_age_seconds=ceipal_client.get_cache_age_seconds(),
             )
         raise HTTPException(status_code=500, detail=f"Failed to fetch jobs: {str(e)}")
+
+
+@app.get("/api/ceipal/status")
+async def get_ceipal_status():
+    """Lightweight Ceipal/cache status for the web UI without forcing upstream auth requests."""
+    cache_age_seconds = ceipal_client.get_cache_age_seconds()
+    return {
+        "status": "refreshing" if ceipal_client._background_fetch_running else (
+            "ok" if ceipal_client.auth_token or ceipal_client._jobs_cache else "idle"
+        ),
+        "is_refreshing": ceipal_client._background_fetch_running,
+        "has_cached_jobs": bool(ceipal_client._jobs_cache),
+        "cached_jobs_count": len(ceipal_client._jobs_cache or []),
+        "cache_age_seconds": cache_age_seconds,
+        "last_fetched_pages": getattr(ceipal_client, "_last_fetched_pages", 0),
+        "total_records": getattr(ceipal_client, "_last_total_records", 0),
+        "last_auth_error": ceipal_client.last_auth_error,
+    }
 
 @app.get("/api/jobs/{job_id}", response_model=Job)
 async def get_job(job_id: str):
@@ -3585,9 +3650,16 @@ async def get_job(job_id: str):
 async def load_more_jobs(start_page: int = 26, max_pages: int = 25):
     """Load additional pages of jobs for infinite scroll"""
     try:
-        more_jobs = await ceipal_client.fetch_more_jobs(start_page, max_pages)
+        more_result = await ceipal_client.fetch_more_jobs(start_page, max_pages)
+        more_jobs = more_result.get("jobs", [])
         sanitized_jobs = [sanitize_job_for_display(job) for job in more_jobs]
-        return {"jobs": sanitized_jobs, "total": len(sanitized_jobs), "start_page": start_page}
+        return {
+            "jobs": sanitized_jobs,
+            "total": len(sanitized_jobs),
+            "start_page": start_page,
+            "next_start_page": more_result.get("next_start_page", start_page + max_pages),
+            "has_more": bool(more_result.get("has_more")),
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to load more jobs: {str(e)}")
 

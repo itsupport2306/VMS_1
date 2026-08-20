@@ -110,6 +110,7 @@ els.apiBase.textContent = `API: ${API_BASE}`;
 let allJobs = [];
 let activeJobId = null;
 let activeJob = null;
+let jobsPollTimeout = null;
 
 // Auth state
 let authToken = localStorage.getItem('vms_token') || null;
@@ -278,6 +279,16 @@ function logout() {
   
   // Clear jobs data so next user starts fresh
   allJobs = [];
+  hasMoreJobs = true;
+  nextStartPage = 26;
+  if (jobsPollTimeout) {
+    clearTimeout(jobsPollTimeout);
+    jobsPollTimeout = null;
+  }
+  if (jobsPollInterval) {
+    clearInterval(jobsPollInterval);
+    jobsPollInterval = null;
+  }
   
   updateAuthUI();
 }
@@ -1262,67 +1273,95 @@ if (els.submitCloseBtn) {
 
 let jobsPollInterval = null;
 
+function clearJobsPolling() {
+  if (jobsPollTimeout) {
+    clearTimeout(jobsPollTimeout);
+    jobsPollTimeout = null;
+  }
+  if (jobsPollInterval) {
+    clearInterval(jobsPollInterval);
+    jobsPollInterval = null;
+  }
+}
+
+function getJobsPollDelay(pollCount) {
+  if (pollCount < 3) return 4000;
+  if (pollCount < 8) return 7000;
+  return 12000;
+}
+
 async function loadJobs() {
   els.jobsGrid.innerHTML = '<div class="loading-jobs">Loading jobs...<br><small>Please wait...</small></div>';
   els.jobsEmpty.hidden = true;
   
   // Reset infinite scroll state
   isLoadingMore = false;
+  nextStartPage = 26;
   
   // Clear any existing poll
-  if (jobsPollInterval) {
-    clearInterval(jobsPollInterval);
-    jobsPollInterval = null;
-  }
+  clearJobsPolling();
   
   try {
     // Fetch jobs (returns immediately with cached data, background fetch continues)
     const data = await apiGetAuth('/api/jobs');
     allJobs = data.jobs || [];
     hasMoreJobs = data.has_more || false;
+    nextStartPage = data.next_start_page || nextStartPage;
     console.log(`[Jobs] Loaded ${allJobs.length} jobs. Has more: ${hasMoreJobs}`);
     updateJobFilterOptions();
     renderJobs();
     
-    // If no jobs yet or still fetching more, start polling
-    if (allJobs.length === 0 || hasMoreJobs) {
+    // Poll only while the backend says a refresh is actively running.
+    if (data.is_refreshing) {
       let pollCount = 0;
-      const maxPolls = 60; // Poll for up to 3 minutes (60 * 3s)
-      
-      jobsPollInterval = setInterval(async () => {
+      const maxPolls = 18; // Poll for roughly 3 minutes with backoff.
+
+      const pollJobs = async () => {
         pollCount++;
         console.log(`[Jobs] Polling for jobs... attempt ${pollCount}`);
-        
+
         try {
           const pollData = await apiGetAuth('/api/jobs');
           const newJobs = pollData.jobs || [];
-          
-          if (newJobs.length > allJobs.length) {
-            // New jobs found!
-            allJobs = newJobs;
-            hasMoreJobs = pollData.has_more || false;
+          const previousJobIds = allJobs.map(job => job.id).join('|');
+          const nextJobIds = newJobs.map(job => job.id).join('|');
+          const jobsChanged = previousJobIds !== nextJobIds;
+          const hadMoreJobs = hasMoreJobs;
+
+          allJobs = newJobs;
+          hasMoreJobs = pollData.has_more || false;
+          nextStartPage = pollData.next_start_page || nextStartPage;
+
+          if (jobsChanged || hadMoreJobs !== hasMoreJobs) {
             console.log(`[Jobs] Updated: now ${allJobs.length} jobs`);
             updateJobFilterOptions();
             renderJobs();
           }
-          
-          // Stop polling if we have jobs and no more to fetch
-          if (allJobs.length > 0 && !hasMoreJobs) {
-            console.log('[Jobs] All jobs loaded, stopping poll');
-            clearInterval(jobsPollInterval);
-            jobsPollInterval = null;
+
+          if (!pollData.is_refreshing) {
+            console.log('[Jobs] Background refresh complete, stopping poll');
+            clearJobsPolling();
+            return;
           }
-          
-          // Stop after max polls to avoid infinite polling
+
           if (pollCount >= maxPolls) {
             console.log('[Jobs] Max polls reached, stopping');
-            clearInterval(jobsPollInterval);
-            jobsPollInterval = null;
+            clearJobsPolling();
+            return;
           }
+
+          jobsPollTimeout = setTimeout(pollJobs, getJobsPollDelay(pollCount));
         } catch (err) {
           console.error('[Jobs] Poll error:', err);
+          if (pollCount < maxPolls) {
+            jobsPollTimeout = setTimeout(pollJobs, getJobsPollDelay(pollCount));
+          } else {
+            clearJobsPolling();
+          }
         }
-      }, 3000); // Poll every 3 seconds
+      };
+
+      jobsPollTimeout = setTimeout(pollJobs, getJobsPollDelay(pollCount));
     }
   } catch (e) {
     allJobs = [];
@@ -1383,9 +1422,20 @@ function hideLoadingSpinner() {
 
 async function loadCeipalStatus() {
   try {
-    const data = await apiGet('/api/ceipal/test');
-    if (data.status === 'success') setStatus('ok', 'Ceipal connected');
-    else setStatus('bad', `Ceipal failed: ${data.detail || data.message || 'unknown'}`);
+    const data = await apiGet('/api/ceipal/status');
+    if (data.is_refreshing) {
+      setStatus('warn', 'Ceipal sync in progress');
+      return;
+    }
+    if (data.last_auth_error) {
+      setStatus('bad', `Ceipal issue: ${data.last_auth_error}`);
+      return;
+    }
+    if (data.has_cached_jobs) {
+      setStatus('ok', 'Ceipal cache ready');
+      return;
+    }
+    setStatus('warn', 'Ceipal sync idle');
   } catch (e) {
     setStatus('bad', 'Backend offline');
   }
