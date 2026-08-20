@@ -33,7 +33,7 @@ from bson.objectid import ObjectId
 # Load environment variables
 load_dotenv()
 
-# MongoDB setup for persistent storage (works on Render free tier)
+# MongoDB setup for persistent storage
 MONGODB_URI = os.getenv("MONGODB_URI", "")
 mongo_client = None
 db = None
@@ -57,8 +57,8 @@ def init_mongodb():
     
     if not MONGODB_URI:
         print("[MongoDB] No MONGODB_URI environment variable set!")
-        print("[MongoDB] Set MONGODB_URI in Render Dashboard → Environment Variables")
-        print("[MongoDB] Using fallback JSON storage (data will be lost on redeploy)")
+        print("[MongoDB] Set MONGODB_URI in your deployment environment")
+        print("[MongoDB] Using fallback JSON storage")
         return False
     
     try:
@@ -93,7 +93,7 @@ mongodb_enabled = init_mongodb()
 # SendGrid email setup for OTP, password reset, and notifications
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
 SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL", "notifications@radixsol.com")
-APP_URL = os.getenv("APP_URL", "https://vms-1-xlkv.onrender.com")  # Your Render app URL
+APP_URL = os.getenv("APP_URL", "http://localhost:8000")
 
 # Optional SMTP fallback for local development when SendGrid is not configured.
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.office365.com")
@@ -103,8 +103,8 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", SMTP_USERNAME or SENDGRID_FROM_EMAIL)
 SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() in {"1", "true", "yes", "y"}
 
-# Job closure notification config — defaults to dry-run for safety after the 2000+ false-notification incident.
-# Flip JOB_CLOSURE_NOTIFICATIONS_ENABLED=true on Render only after watching audit logs confirm real transitions.
+# Job closure notification config defaults to dry-run for safety.
+# Flip JOB_CLOSURE_NOTIFICATIONS_ENABLED=true only after audit logs confirm real transitions.
 JOB_CLOSURE_NOTIFICATIONS_ENABLED = os.getenv("JOB_CLOSURE_NOTIFICATIONS_ENABLED", "false").lower() == "true"
 JOB_CLOSURE_PER_RUN_CAP = int(os.getenv("JOB_CLOSURE_PER_RUN_CAP", "25"))
 JOB_POSTING_NOTIFICATIONS_ENABLED = os.getenv("JOB_POSTING_NOTIFICATIONS_ENABLED", "true").lower() == "true"
@@ -758,7 +758,7 @@ def detect_and_notify_closures(current_status_map: dict, fetch_complete: bool):
       - Only runs on COMPLETE fetches (no rate-limit truncation, all records seen). Partial fetches skip entirely.
       - Only acts on explicit transitions for jobs present in BOTH previous tracker AND current fetch. Never infers closure from "missing" rows.
       - Per-run circuit breaker (JOB_CLOSURE_PER_RUN_CAP, default 25): if exceeded, abort + audit + DO NOT update tracker so next run can re-evaluate after the underlying issue is fixed.
-      - Default dry-run: writes to closure_audit only, no emails. Flip JOB_CLOSURE_NOTIFICATIONS_ENABLED=true on Render to go live.
+      - Default dry-run: writes to closure_audit only, no emails. Flip JOB_CLOSURE_NOTIFICATIONS_ENABLED=true only after verifying audit output.
       - First run with empty tracker fires nothing — just populates baseline.
       - Per-user dedupe via notifications_collection so retries can't double-send to the same recipient.
     """
@@ -1190,7 +1190,7 @@ migrate_users_to_mongodb()
 _users_cache = load_users_from_json()
 
 # Database setup
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:////opt/render/project/src/data/vms.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/vms.db")
 # Ensure directory exists for SQLite
 if DATABASE_URL.startswith("sqlite://"):
     # Extract path from sqlite:// URL
@@ -1356,11 +1356,11 @@ CEIPAL_REPORTS_URL = os.getenv("CEIPAL_REPORTS_URL", "https://bi.ceipal.com/Repo
 CEIPAL_EMAIL = os.getenv("CEIPAL_EMAIL", "amir@radixsol.com")
 CEIPAL_PASSWORD = os.getenv("CEIPAL_PASSWORD", "")
 CEIPAL_API_KEY = os.getenv("CEIPAL_API_KEY", "2693f0ed28f2250811fe40294e97e108a56afa9043e5336da4")
-CEIPAL_CACHE_DIR = os.getenv("CEIPAL_CACHE_DIR", "/opt/render/project/src/data/cache")
+CEIPAL_CACHE_DIR = os.getenv("CEIPAL_CACHE_DIR", "./data/cache")
 DEBUG = os.getenv("DEBUG", "False").lower() in {"1", "true", "yes", "y"}
 
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/opt/render/project/src/data/uploads")
-DATA_DIR = os.getenv("DATA_DIR", "/opt/render/project/src/data")
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./data/uploads")
+DATA_DIR = os.getenv("DATA_DIR", "./data")
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 10485760))  # 10MB
 
 # Excel Jobs File Configuration
@@ -4201,7 +4201,7 @@ async def notify_vendor_about_submission(
     print(f"[NotifyVendor] Dispatching SendGrid send to {vendor_email}")
     # Run the blocking SendGrid call in a worker thread so it doesn't block the FastAPI event loop
     # (the SendGrid Python SDK is synchronous and can take several seconds, which would otherwise
-    # stall every other request on this Render worker, making login + /api/jobs feel hung).
+    # stall every other request on this API worker, making login + /api/jobs feel hung).
     success, detail = await asyncio.to_thread(
         send_vendor_message_email,
         vendor_email,

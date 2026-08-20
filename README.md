@@ -92,6 +92,46 @@ streamlit run main.py
 ```
 The frontend will start on `http://localhost:8501`
 
+## Docker Deployment
+
+This repo now includes Docker files for a DigitalOcean-friendly deployment.
+
+### Run With Docker Compose
+
+```bash
+docker compose up --build
+```
+
+Available services:
+- Backend API: `http://localhost:8000`
+- Streamlit frontend: `http://localhost:8501`
+
+### Container Data Paths
+
+The backend container uses these paths:
+
+```env
+DATA_DIR=/app/data
+UPLOAD_DIR=/app/data/uploads
+CEIPAL_CACHE_DIR=/app/data/cache
+DATABASE_URL=sqlite:////app/data/vms.db
+```
+
+The `docker-compose.yml` file mounts `./data` into `/app/data` so SQLite, cache files, and uploads persist across restarts.
+
+### DigitalOcean Notes
+
+For a Droplet:
+
+```bash
+docker compose up -d --build
+```
+
+For App Platform:
+- Use the root `Dockerfile` for the backend service.
+- Use `frontend/Dockerfile` for the Streamlit frontend service.
+- Configure secrets and environment variables in DigitalOcean instead of storing them in the image.
+
 ### 5. Quick Start (All in One)
 ```bash
 # Setup everything

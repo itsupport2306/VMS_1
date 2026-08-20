@@ -7,9 +7,10 @@ import plotly.graph_objects as go
 from PIL import Image
 import io
 import base64
+import os
 
 # Configuration
-BACKEND_URL = "http://localhost:8000"
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 
 # Page Configuration
 st.set_page_config(
