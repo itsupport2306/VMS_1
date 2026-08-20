@@ -70,13 +70,7 @@ SUBMISSION_NOTIFICATION_RECIPIENTS=it.support@radixsol.com
 
 Each successful candidate submission is also written to a separate submission audit log with submitter name, submitter email, candidate details, timestamp, IP address when available, user agent, resume metadata, and job metadata. MongoDB deployments store this in the `submission_logs` collection. Local/fallback deployments store it in `DATA_DIR/submission_logs.json`.
 
-### 3. Database Setup
-```bash
-# Create SQLite database and tables
-python database/models.py
-```
-
-### 4. Run the Application
+### 3. Run the Application
 
 #### Backend Server
 ```bash
@@ -114,10 +108,9 @@ The backend container uses these paths:
 DATA_DIR=/app/data
 UPLOAD_DIR=/app/data/uploads
 CEIPAL_CACHE_DIR=/app/data/cache
-DATABASE_URL=sqlite:////app/data/vms.db
 ```
 
-The `docker-compose.yml` file mounts `./data` into `/app/data` so SQLite, cache files, and uploads persist across restarts.
+The `docker-compose.yml` file mounts `./data` into `/app/data` so cache files, JSON-backed runtime files, and uploads persist across restarts.
 
 ### DigitalOcean Notes
 
@@ -132,7 +125,7 @@ For App Platform:
 - Use `frontend/Dockerfile` for the Streamlit frontend service.
 - Configure secrets and environment variables in DigitalOcean instead of storing them in the image.
 
-### 5. Quick Start (All in One)
+### 4. Quick Start (All in One)
 ```bash
 # Setup everything
 python main.py setup
@@ -342,9 +335,9 @@ The system includes mock data for testing when ATS API is not configured.
    - Check if backend is running on port 8000
    - Verify CORS configuration
 
-2. **Database Connection Error**
-   - Verify DATABASE_URL in .env
-   - Check database server status
+2. **Data Storage Error**
+   - Verify `MONGODB_URI` in `.env`
+   - Verify `DATA_DIR`, `UPLOAD_DIR`, and `CEIPAL_CACHE_DIR`
 
 3. **ATS API Not Working**
    - Verify API credentials

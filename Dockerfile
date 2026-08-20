@@ -6,8 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8000 \
     DATA_DIR=/app/data \
     UPLOAD_DIR=/app/data/uploads \
-    CEIPAL_CACHE_DIR=/app/data/cache \
-    DATABASE_URL=sqlite:////app/data/vms.db
+    CEIPAL_CACHE_DIR=/app/data/cache
 
 WORKDIR /app
 

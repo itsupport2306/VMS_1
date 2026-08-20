@@ -13,7 +13,6 @@ services:
       DATA_DIR: /app/data
       UPLOAD_DIR: /app/data/uploads
       CEIPAL_CACHE_DIR: /app/data/cache
-      DATABASE_URL: sqlite:////app/data/vms.db
     volumes:
       - ./data:/app/data
     restart: unless-stopped

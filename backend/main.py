@@ -13,9 +13,6 @@ import json
 import html
 from dotenv import load_dotenv
 import re
-from sqlalchemy import create_engine, Column, String, DateTime, Integer, ForeignKey
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session, relationship
 import bcrypt
 from jose import JWTError, jwt
 from uuid import uuid4
@@ -1189,25 +1186,9 @@ migrate_users_to_mongodb()
 # In-memory user cache (loaded from MongoDB/JSON on startup)
 _users_cache = load_users_from_json()
 
-# Database setup
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/vms.db")
-# Ensure directory exists for SQLite
-if DATABASE_URL.startswith("sqlite://"):
-    # Extract path from sqlite:// URL
-    db_path = DATABASE_URL.replace("sqlite://", "")
-    if db_path.startswith("/"):
-        # Absolute path
-        db_dir = os.path.dirname(db_path)
-    else:
-        # Relative path (remove leading / if present after protocol)
-        db_path = db_path.lstrip("/")
-        db_dir = os.path.dirname(db_path)
-    if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
-
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+# Legacy SQLAlchemy SQLite support has been removed.
+# The application uses MongoDB/JSON-backed storage only.
+UserDB = Dict[str, Any]
 
 # JWT Configuration
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
@@ -1233,68 +1214,6 @@ def get_password_hash(password: str) -> str:
     hashed = bcrypt.hashpw(password_bytes, bcrypt.gensalt())
     return hashed.decode('utf-8')
 
-
-# Database Models
-class UserDB(Base):
-    __tablename__ = "users"
-    
-    id = Column(String, primary_key=True, index=True)
-    email = Column(String, unique=True, index=True, nullable=False)
-    full_name = Column(String, nullable=False)
-    hashed_password = Column(String, nullable=False)
-    is_active = Column(String, default="true")
-    created_at = Column(DateTime, default=datetime.utcnow)
-    
-    # Relationship
-    submissions = relationship("CandidateDB", back_populates="submitted_by")
-
-class CandidateDB(Base):
-    __tablename__ = "candidates"
-    
-    id = Column(String, primary_key=True, index=True)
-    name = Column(String, nullable=False)
-    email = Column(String, nullable=False)
-    phone = Column(String, nullable=False)
-    job_id = Column(String, nullable=False)
-    resume_path = Column(String, nullable=False)
-    submitted_date = Column(DateTime, default=datetime.utcnow)
-    status = Column(String, default="submitted")
-    # Track who submitted this candidate
-    submitted_by_user_id = Column(String, ForeignKey("users.id"), nullable=False)
-    submitted_by = relationship("UserDB", back_populates="submissions")
-    # New fields - all required
-    bill_rate = Column(String, nullable=False)
-    current_location = Column(String, nullable=False)
-    primary_skills = Column(String, nullable=False)
-    job_title = Column(String, nullable=False)
-    years_experience = Column(String, nullable=False)
-    tentative_start_date = Column(String, nullable=False)
-    rto = Column(String, nullable=False)
-    candidate_summary = Column(String, nullable=False)
-
-# Create tables
-Base.metadata.create_all(bind=engine)
-
-# Log database status on startup
-try:
-    db_path = DATABASE_URL.replace("sqlite://", "").lstrip("/")
-    if not db_path.startswith("/"):
-        db_path = "/" + db_path
-    if os.path.exists(db_path):
-        db_size = os.path.getsize(db_path)
-        print(f"[DB] Database exists: {db_path} ({db_size} bytes)")
-    else:
-        print(f"[DB] Database will be created at: {db_path}")
-except Exception as e:
-    print(f"[DB] Error checking database: {e}")
-
-# Dependency to get DB session
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 app = FastAPI(title="VMS Backend API", version="1.0.0")
 
@@ -3739,32 +3658,19 @@ async def get_ceipal_cache_status():
     }
 
 @app.get("/api/health")
-async def health_check(db: Session = Depends(get_db)):
-    """Health check endpoint to verify database persistence"""
-    import os
-    
-    # Get database file path
-    db_path = DATABASE_URL.replace("sqlite://", "").lstrip("/")
-    if not db_path.startswith("/"):
-        db_path = "/" + db_path
-    
-    # Check if database file exists
-    db_exists = os.path.exists(db_path)
-    db_size = os.path.getsize(db_path) if db_exists else 0
-    
-    # Get user count
-    try:
-        user_count = db.query(UserDB).count()
-    except:
-        user_count = 0
-    
+async def health_check():
+    """Health check endpoint for MongoDB/JSON-backed runtime state."""
+    users = load_users_from_json()
     return {
-        "database_path": db_path,
-        "database_exists": db_exists,
-        "database_size_bytes": db_size,
-        "user_count": user_count,
+        "storage_mode": "mongodb_json",
+        "mongodb_enabled": mongodb_enabled,
+        "user_count": len(users),
         "upload_dir": UPLOAD_DIR,
         "upload_dir_exists": os.path.exists(UPLOAD_DIR),
+        "data_dir": DATA_DIR,
+        "data_dir_exists": os.path.exists(DATA_DIR),
+        "cache_dir": CEIPAL_CACHE_DIR,
+        "cache_dir_exists": os.path.exists(CEIPAL_CACHE_DIR),
     }
 
 @app.post("/api/ceipal/refresh")
