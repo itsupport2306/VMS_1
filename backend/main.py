@@ -4,7 +4,7 @@ from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, root_validator
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import httpx
 import os
 from datetime import datetime, timedelta
