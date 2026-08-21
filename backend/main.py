@@ -1186,7 +1186,15 @@ def load_user_by_email(email: str, prefer_cache: bool = True) -> Optional[dict]:
         try:
             doc = users_collection.find_one({"email": email_lower})
             if doc is None:
-                return None
+                doc = users_collection.find_one({
+                    "email": {
+                        "$regex": f"^{re.escape(email_lower)}$",
+                        "$options": "i",
+                    }
+                })
+            if doc is None:
+                users = load_users_from_json(force_refresh=True)
+                return users.get(email_lower)
             user = _normalize_user_doc(doc)
             with _users_cache_lock:
                 if not _cache_is_fresh(_users_cache_time, USERS_CACHE_SECONDS):
@@ -1554,7 +1562,8 @@ async def get_current_user(token: str = Depends(HTTPBearer())):
         'email': user["email"],
         'full_name': user["full_name"],
         'is_active': user["is_active"],
-        'hashed_password': user["hashed_password"]
+        'hashed_password': user["hashed_password"],
+        'created_at': user["created_at"],
     })()
 
 

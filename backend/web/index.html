@@ -71,11 +71,17 @@
             </div>
             <div class="field" id="authPasswordField">
               <label>Password</label>
-              <input id="authPassword" class="input" type="password" placeholder="Enter password" />
+              <div class="input-wrap">
+                <input id="authPassword" class="input input--with-toggle" type="password" placeholder="Enter password" />
+                <button class="input-toggle" type="button" data-toggle-password="authPassword" aria-label="Show password" aria-pressed="false">Show</button>
+              </div>
             </div>
             <div class="field" id="authConfirmPasswordField" hidden>
               <label>Confirm Password</label>
-              <input id="authConfirmPassword" class="input" type="password" placeholder="Confirm password" />
+              <div class="input-wrap">
+                <input id="authConfirmPassword" class="input input--with-toggle" type="password" placeholder="Confirm password" />
+                <button class="input-toggle" type="button" data-toggle-password="authConfirmPassword" aria-label="Show password" aria-pressed="false">Show</button>
+              </div>
             </div>
             <div class="field" id="authOtpField" hidden>
               <label>Verification Code</label>
@@ -118,11 +124,17 @@
             <input type="hidden" id="resetToken" />
             <div class="field">
               <label>New Password</label>
-              <input id="resetPassword" class="input" type="password" placeholder="Enter new password" />
+              <div class="input-wrap">
+                <input id="resetPassword" class="input input--with-toggle" type="password" placeholder="Enter new password" />
+                <button class="input-toggle" type="button" data-toggle-password="resetPassword" aria-label="Show password" aria-pressed="false">Show</button>
+              </div>
             </div>
             <div class="field">
               <label>Confirm Password</label>
-              <input id="resetPasswordConfirm" class="input" type="password" placeholder="Confirm new password" />
+              <div class="input-wrap">
+                <input id="resetPasswordConfirm" class="input input--with-toggle" type="password" placeholder="Confirm new password" />
+                <button class="input-toggle" type="button" data-toggle-password="resetPasswordConfirm" aria-label="Show password" aria-pressed="false">Show</button>
+              </div>
             </div>
             <div class="alert" id="resetAlert" hidden></div>
             <div class="row" style="gap: 12px; margin-top: 20px;">

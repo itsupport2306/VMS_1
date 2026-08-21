@@ -74,6 +74,7 @@ const els = {
   resetSubmitBtn: document.getElementById('resetSubmitBtn'),
   resetAlert: document.getElementById('resetAlert'),
   backToLoginLink: document.getElementById('backToLoginLink'),
+  passwordToggles: document.querySelectorAll('[data-toggle-password]'),
   // Job Detail Modal
   jobDetailModal: document.getElementById('jobDetailModal'),
   jobDetailTitle: document.getElementById('jobDetailTitle'),
@@ -231,6 +232,24 @@ function clearAuthAlert() {
   els.authAlert.textContent = '';
 }
 
+function setPasswordVisibility(inputId, shouldShow) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+
+  input.type = shouldShow ? 'text' : 'password';
+  document.querySelectorAll(`[data-toggle-password="${inputId}"]`).forEach((btn) => {
+    btn.textContent = shouldShow ? 'Hide' : 'Show';
+    btn.setAttribute('aria-label', shouldShow ? 'Hide password' : 'Show password');
+    btn.setAttribute('aria-pressed', shouldShow ? 'true' : 'false');
+  });
+}
+
+function resetPasswordVisibility() {
+  ['authPassword', 'authConfirmPassword', 'resetPassword', 'resetPasswordConfirm'].forEach((inputId) => {
+    setPasswordVisibility(inputId, false);
+  });
+}
+
 function updateAuthUI() {
   if (authToken && currentUser) {
     // Logged in - show user info and logout
@@ -343,6 +362,8 @@ function setAuthMode(mode, options = {}) {
     if (els.authOtp) els.authOtp.value = '';
     pendingOtpEmail = '';
   }
+
+  resetPasswordVisibility();
 
   const focusTarget = isVerify ? els.authOtp : els.authEmail;
   if (focusTarget) focusTarget.focus();
@@ -539,6 +560,7 @@ async function completeLogin(data) {
   if (els.authConfirmPassword) els.authConfirmPassword.value = '';
   if (els.authOtp) els.authOtp.value = '';
   pendingOtpEmail = '';
+  resetPasswordVisibility();
   setAuthMode('login', { keepValues: true });
   updateAuthUI();
   setView('jobs');
@@ -1917,6 +1939,17 @@ if (els.authToggleLink) {
   els.authToggleLink.addEventListener('click', (e) => {
     e.preventDefault();
     setAuthMode(authMode === 'login' ? 'signup' : 'login');
+  });
+}
+
+if (els.passwordToggles) {
+  els.passwordToggles.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const inputId = btn.dataset.togglePassword;
+      const input = document.getElementById(inputId);
+      if (!input) return;
+      setPasswordVisibility(inputId, input.type === 'password');
+    });
   });
 }
 
