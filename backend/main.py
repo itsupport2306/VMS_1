@@ -21,6 +21,7 @@ import tempfile
 import secrets
 import hashlib
 import smtplib
+from threading import Lock
 from email.message import EmailMessage
 from urllib.parse import urlencode
 from pymongo import MongoClient
@@ -44,6 +45,24 @@ closure_audit_collection = None
 manual_jobs_collection = None
 submission_logs_collection = None
 fs = None
+
+
+def ensure_mongodb_indexes() -> None:
+    """Create the indexes required for fast auth lookups and manual job reads."""
+    index_specs = [
+        ("users.email", users_collection, "email", {"name": "users_email_idx", "unique": True}),
+        ("manual_jobs.created_at", manual_jobs_collection, [("created_at", -1)], {"name": "manual_jobs_created_at_desc_idx"}),
+        ("manual_jobs.id", manual_jobs_collection, "id", {"name": "manual_jobs_id_idx", "unique": True}),
+        ("manual_jobs.job_id", manual_jobs_collection, "job_id", {"name": "manual_jobs_job_id_idx"}),
+    ]
+    for label, collection, keys, kwargs in index_specs:
+        if collection is None:
+            continue
+        try:
+            collection.create_index(keys, **kwargs)
+            print(f"[MongoDB] Ensured index {label}")
+        except Exception as e:
+            print(f"[MongoDB] Failed to ensure index {label}: {e}")
 
 def init_mongodb():
     """Initialize MongoDB connection"""
@@ -78,6 +97,7 @@ def init_mongodb():
         
         # Test connection
         mongo_client.admin.command('ping')
+        ensure_mongodb_indexes()
         print("[MongoDB] Connected successfully (with GridFS)")
         return True
     except Exception as e:
@@ -116,6 +136,11 @@ SUBMISSION_NOTIFICATION_RECIPIENTS = [
 ]
 
 BILL_RATE_DISPLAY_MULTIPLIER = 0.93
+BILL_RATE_NUMBER_PATTERN = re.compile(r"\d+(?:,\d{3})*(?:\.\d+)?")
+COMPENSATION_PATTERN = re.compile(
+    r"\b(bill\s*rate|salary|pay\s*rate|hourly\s*pay|weekly\s*pay|regular\s*pay|stipend)\b",
+    flags=re.IGNORECASE,
+)
 
 
 def _format_discounted_rate_amount(amount: float) -> str:
@@ -130,8 +155,7 @@ def display_bill_rate(rate_value) -> str:
     if not text or text.lower() in {"nan", "none", "null", "n/a"}:
         return ""
 
-    number_pattern = re.compile(r"\d+(?:,\d{3})*(?:\.\d+)?")
-    if not number_pattern.search(text):
+    if not BILL_RATE_NUMBER_PATTERN.search(text):
         return text
 
     has_currency = "$" in text or re.search(r"\bUSD\b", text, flags=re.IGNORECASE)
@@ -144,7 +168,7 @@ def display_bill_rate(rate_value) -> str:
             return raw_number
         return _format_discounted_rate_amount(actual_amount * BILL_RATE_DISPLAY_MULTIPLIER)
 
-    discounted_text = number_pattern.sub(discount_match, text)
+    discounted_text = BILL_RATE_NUMBER_PATTERN.sub(discount_match, text)
     if has_currency:
         return discounted_text
     return f"${discounted_text}"
@@ -170,13 +194,9 @@ def hide_compensation_details(text: str) -> str:
     """Remove raw salary/pay/bill-rate text from job descriptions before display."""
     if not text:
         return ""
-    compensation_pattern = re.compile(
-        r"\b(bill\s*rate|salary|pay\s*rate|hourly\s*pay|weekly\s*pay|regular\s*pay|stipend)\b",
-        flags=re.IGNORECASE,
-    )
     kept_lines = [
         line for line in str(text).splitlines()
-        if not compensation_pattern.search(line)
+        if not COMPENSATION_PATTERN.search(line)
     ]
     return "\n".join(kept_lines).strip()
 
@@ -1030,6 +1050,49 @@ USERS_JSON_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "users.j
 load_whitelisted_users()
 
 # Migrate users from JSON to MongoDB if MongoDB is empty
+USERS_CACHE_SECONDS = int(os.getenv("USERS_CACHE_SECONDS", "300"))
+MANUAL_JOBS_CACHE_SECONDS = int(os.getenv("MANUAL_JOBS_CACHE_SECONDS", "300"))
+
+_users_cache: Dict[str, Dict[str, Any]] = {}
+_users_cache_time: Optional[datetime] = None
+_users_cache_lock = Lock()
+
+_manual_jobs_cache: Optional[List["Job"]] = None
+_manual_jobs_cache_time: Optional[datetime] = None
+_manual_jobs_cache_lock = Lock()
+
+
+def _cache_is_fresh(cache_time: Optional[datetime], ttl_seconds: int) -> bool:
+    return bool(cache_time and (datetime.now() - cache_time) < timedelta(seconds=ttl_seconds))
+
+
+def clear_users_cache() -> None:
+    global _users_cache, _users_cache_time
+    with _users_cache_lock:
+        _users_cache = {}
+        _users_cache_time = None
+    print("[Auth] User cache cleared")
+
+
+def clear_manual_jobs_cache() -> None:
+    global _manual_jobs_cache, _manual_jobs_cache_time
+    with _manual_jobs_cache_lock:
+        _manual_jobs_cache = None
+        _manual_jobs_cache_time = None
+    print("[Manual Jobs] Cache cleared")
+
+
+def _normalize_user_doc(doc: dict) -> dict:
+    return {
+        "id": doc["id"],
+        "email": doc["email"],
+        "full_name": doc["full_name"],
+        "hashed_password": doc["hashed_password"],
+        "is_active": doc["is_active"],
+        "created_at": doc.get("created_at", datetime.now().isoformat()),
+    }
+
+
 def migrate_users_to_mongodb():
     """Migrate users from local JSON to MongoDB if MongoDB is connected but empty"""
     global _users
@@ -1070,23 +1133,26 @@ def migrate_users_to_mongodb():
         print("[Migration] MongoDB not available, skipping migration")
 
 # Users loading function
-def load_users_from_json():
+def load_users_from_json(force_refresh: bool = False):
     """Load users from MongoDB or fallback to JSON file"""
+    global _users_cache, _users_cache_time
+
+    if not force_refresh and _users_cache and _cache_is_fresh(_users_cache_time, USERS_CACHE_SECONDS):
+        age = int((datetime.now() - _users_cache_time).total_seconds())
+        print(f"[Auth] Using cached users ({len(_users_cache)} users, cached {age}s ago)")
+        return _users_cache
+
     # Try MongoDB first
     if mongodb_enabled and users_collection is not None:
         try:
             users = {}
             for doc in users_collection.find():
                 email = doc["email"].lower()
-                users[email] = {
-                    "id": doc["id"],
-                    "email": doc["email"],
-                    "full_name": doc["full_name"],
-                    "hashed_password": doc["hashed_password"],
-                    "is_active": doc["is_active"],
-                    "created_at": doc.get("created_at", datetime.now().isoformat())
-                }
+                users[email] = _normalize_user_doc(doc)
             print(f"[Auth] Loaded {len(users)} users from MongoDB")
+            with _users_cache_lock:
+                _users_cache = users
+                _users_cache_time = datetime.now()
             return users
         except Exception as e:
             print(f"[Auth] Error loading users from MongoDB: {e}, falling back to JSON")
@@ -1095,10 +1161,44 @@ def load_users_from_json():
     if os.path.exists(USERS_JSON_FILE):
         try:
             with open(USERS_JSON_FILE, "r") as f:
-                return json.load(f)
+                users = json.load(f)
+            with _users_cache_lock:
+                _users_cache = users
+                _users_cache_time = datetime.now()
+            return users
         except Exception as e:
             print(f"[Auth] Error loading users JSON: {e}")
     return {}
+
+
+def load_user_by_email(email: str, prefer_cache: bool = True) -> Optional[dict]:
+    """Load one user without forcing a full collection scan."""
+    global _users_cache, _users_cache_time
+
+    email_lower = (email or "").strip().lower()
+    if not email_lower:
+        return None
+
+    if prefer_cache and _users_cache and _cache_is_fresh(_users_cache_time, USERS_CACHE_SECONDS):
+        return _users_cache.get(email_lower)
+
+    if mongodb_enabled and users_collection is not None:
+        try:
+            doc = users_collection.find_one({"email": email_lower})
+            if doc is None:
+                return None
+            user = _normalize_user_doc(doc)
+            with _users_cache_lock:
+                if not _cache_is_fresh(_users_cache_time, USERS_CACHE_SECONDS):
+                    _users_cache = {}
+                    _users_cache_time = datetime.now()
+                _users_cache[email_lower] = user
+            return user
+        except Exception as e:
+            print(f"[Auth] Error loading user {email_lower} from MongoDB: {e}, falling back to cache/JSON")
+
+    users = load_users_from_json(force_refresh=not prefer_cache)
+    return users.get(email_lower)
 
 def save_users_to_json(users):
     """Save users to MongoDB or fallback to JSON file"""
@@ -1120,6 +1220,7 @@ def save_users_to_json(users):
                     upsert=True
                 )
             print(f"[Auth] Saved {len(users)} users to MongoDB")
+            clear_users_cache()
             return True
         except Exception as e:
             print(f"[Auth] Error saving users to MongoDB: {e}, falling back to JSON")
@@ -1129,6 +1230,7 @@ def save_users_to_json(users):
         os.makedirs(os.path.dirname(USERS_JSON_FILE), exist_ok=True)
         with open(USERS_JSON_FILE, "w") as f:
             json.dump(users, f, indent=2)
+        clear_users_cache()
         return True
     except Exception as e:
         print(f"[Auth] Error saving users JSON: {e}")
@@ -1184,7 +1286,8 @@ seed_admin_user()
 migrate_users_to_mongodb()
 
 # In-memory user cache (loaded from MongoDB/JSON on startup)
-_users_cache = load_users_from_json()
+_users_cache = dict(_users)
+_users_cache_time = datetime.now()
 
 # Legacy SQLAlchemy SQLite support has been removed.
 # The application uses MongoDB/JSON-backed storage only.
@@ -1220,6 +1323,9 @@ app = FastAPI(title="VMS Backend API", version="1.0.0")
 # Background task to fetch jobs continuously
 async def scheduled_job_fetch():
     """Fetch jobs every 5 minutes in background"""
+    if not CEIPAL_ENABLED:
+        print("[Scheduled] Ceipal integration disabled; scheduler not started")
+        return
     while True:
         try:
             print("[Scheduled] Starting background job fetch...")
@@ -1234,9 +1340,11 @@ async def scheduled_job_fetch():
 @app.on_event("startup")
 async def startup_event():
     """Start background job fetch on startup"""
-    print("[Startup] Starting scheduled background job fetch...")
-    # Start the continuous background fetch task
-    asyncio.create_task(scheduled_job_fetch())
+    if CEIPAL_ENABLED:
+        print("[Startup] Starting scheduled background job fetch...")
+        asyncio.create_task(scheduled_job_fetch())
+    else:
+        print("[Startup] Ceipal integration disabled; background fetch skipped")
 
 # Web UI (HTML/CSS/JS)
 WEB_DIR = os.path.join(os.path.dirname(__file__), "web")
@@ -1429,13 +1537,11 @@ async def get_current_user(token: str = Depends(HTTPBearer())):
     except JWTError:
         raise credentials_exception
     
-    # Load fresh from JSON to ensure we have latest data
-    users = load_users_from_json()
     email_lower = token_data.email.lower()
-    user = users.get(email_lower)
+    user = await asyncio.to_thread(load_user_by_email, email_lower)
     
     if user is None:
-        print(f"[Auth] User not found for email: {email_lower}, available users: {list(users.keys())}")
+        print(f"[Auth] User not found for email: {email_lower}")
         raise credentials_exception
     if user.get("is_active") != "true":
         print(f"[Auth] User {email_lower} is inactive: {user.get('is_active')}")
@@ -1458,8 +1564,7 @@ def verify_admin_credentials(email: str, password: str) -> None:
     if email_lower != ADMIN_EMAIL.lower():
         raise HTTPException(status_code=403, detail="Only admin can delete jobs")
 
-    users = load_users_from_json()
-    user = users.get(email_lower)
+    user = load_user_by_email(email_lower)
     if not user:
         raise HTTPException(status_code=401, detail="Incorrect email or password")
     if user.get("is_active") != "true":
@@ -1482,8 +1587,7 @@ async def register(user_data: UserCreate, request: Request):
     if len(password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
 
-    users = load_users_from_json()
-    existing = users.get(email_lower)
+    existing = await asyncio.to_thread(load_user_by_email, email_lower)
     if existing and existing.get("is_active") == "true":
         raise HTTPException(status_code=400, detail="Account already exists. Please log in.")
 
@@ -1557,7 +1661,7 @@ async def verify_registration_otp(request_data: OtpVerify):
     global WHITELISTED_USERS, _users_cache
     WHITELISTED_USERS.add(email_lower)
     save_whitelisted_users()
-    _users_cache = load_users_from_json()
+    _users_cache = load_users_from_json(force_refresh=True)
     del _email_otp_tokens[email_lower]
 
     return {"message": "Account verified. You can now log in."}
@@ -1568,7 +1672,7 @@ def get_or_create_otp_user(email: str) -> dict:
 
     email = (email or "").strip()
     email_lower = email.lower()
-    _users_cache = load_users_from_json()
+    _users_cache = load_users_from_json(force_refresh=True)
     user = _users_cache.get(email_lower)
 
     if not user:
@@ -1674,8 +1778,7 @@ async def verify_login_otp(request_data: OtpVerify):
 async def login(user_data: UserLogin):
     """Login existing users with email and password."""
     email_lower = user_data.email.lower().strip()
-    users = load_users_from_json()
-    user = users.get(email_lower)
+    user = await asyncio.to_thread(load_user_by_email, email_lower)
 
     if not user:
         raise HTTPException(status_code=401, detail="Incorrect email or password")
@@ -2177,6 +2280,10 @@ CLIENT_NAMES_TO_FILTER = [
     "Supplemental Healthcare", "TRS Healthcare", "Windsor", "Expedient",
     "Snapcare", "MedicalSolutions", "OHT", "Gracedale"
 ]
+CLIENT_NAME_PATTERNS = [
+    re.compile(rf"\b{re.escape(client_name)}\b", flags=re.IGNORECASE)
+    for client_name in CLIENT_NAMES_TO_FILTER
+]
 
 # Excel jobs cache
 _excel_jobs_cache: Optional[List[Job]] = None
@@ -2528,8 +2635,15 @@ def build_job_from_direct_input(payload: DirectJobCreateRequest) -> Job:
     )
 
 
-def load_manual_jobs() -> List[Job]:
+def load_manual_jobs(force_refresh: bool = False) -> List[Job]:
     """Load jobs created through the direct API endpoint."""
+    global _manual_jobs_cache, _manual_jobs_cache_time
+
+    if not force_refresh and _manual_jobs_cache is not None and _cache_is_fresh(_manual_jobs_cache_time, MANUAL_JOBS_CACHE_SECONDS):
+        age = int((datetime.now() - _manual_jobs_cache_time).total_seconds())
+        print(f"[Manual Jobs] Using cached jobs ({len(_manual_jobs_cache)} jobs, cached {age}s ago)")
+        return _manual_jobs_cache
+
     jobs: List[Job] = []
 
     try:
@@ -2541,6 +2655,9 @@ def load_manual_jobs() -> List[Job]:
                     doc["salary_range"] = display_bill_rate(doc.get("salary_range")) or None
                 doc["bill_rate_discount_applied"] = True
                 jobs.append(Job(**doc))
+            with _manual_jobs_cache_lock:
+                _manual_jobs_cache = jobs
+                _manual_jobs_cache_time = datetime.now()
             return jobs
 
         if not os.path.exists(MANUAL_JOBS_FILE):
@@ -2554,6 +2671,9 @@ def load_manual_jobs() -> List[Job]:
                 job_data["salary_range"] = display_bill_rate(job_data.get("salary_range")) or None
             job_data["bill_rate_discount_applied"] = True
             jobs.append(Job(**job_data))
+        with _manual_jobs_cache_lock:
+            _manual_jobs_cache = jobs
+            _manual_jobs_cache_time = datetime.now()
     except Exception as e:
         print(f"[Manual Jobs] Failed to load direct-input jobs: {e}")
 
@@ -2584,6 +2704,7 @@ def upsert_manual_jobs(jobs: List[Job]) -> None:
                 {"$set": {**job_payload, "created_at": created_at}},
                 upsert=True,
             )
+        clear_manual_jobs_cache()
         return
 
     existing_jobs = []
@@ -2607,6 +2728,7 @@ def upsert_manual_jobs(jobs: List[Job]) -> None:
 
     with open(MANUAL_JOBS_FILE, "w") as f:
         json.dump(new_jobs + existing_jobs, f, indent=2, default=str)
+    clear_manual_jobs_cache()
 
 
 def build_bulk_job_response(stored_jobs: List[Job], failed_jobs: List[dict], source: str) -> dict:
@@ -2641,9 +2763,13 @@ def delete_manual_job(job_id: str) -> bool:
     if mongodb_enabled and manual_jobs_collection is not None:
         result = manual_jobs_collection.delete_one({"id": normalized_job_id})
         if result.deleted_count:
+            clear_manual_jobs_cache()
             return True
         result = manual_jobs_collection.delete_one({"job_id": normalized_job_id})
-        return result.deleted_count > 0
+        if result.deleted_count > 0:
+            clear_manual_jobs_cache()
+            return True
+        return False
 
     if not os.path.exists(MANUAL_JOBS_FILE):
         return False
@@ -2661,6 +2787,7 @@ def delete_manual_job(job_id: str) -> bool:
 
     with open(MANUAL_JOBS_FILE, "w") as f:
         json.dump(remaining_jobs, f, indent=2, default=str)
+    clear_manual_jobs_cache()
 
     return True
 
@@ -2685,11 +2812,8 @@ def sanitize_job_description(description: str, is_admin: bool = False) -> str:
         return description
     
     sanitized = description
-    for client_name in CLIENT_NAMES_TO_FILTER:
-        # Case-insensitive replacement with word boundaries
-        import re
-        pattern = r'\b' + re.escape(client_name) + r'\b'
-        sanitized = re.sub(pattern, '[Client Name Hidden]', sanitized, flags=re.IGNORECASE)
+    for pattern in CLIENT_NAME_PATTERNS:
+        sanitized = pattern.sub('[Client Name Hidden]', sanitized)
     
     return sanitized
 
@@ -3503,10 +3627,11 @@ async def root():
 async def get_jobs(background_tasks: BackgroundTasks, current_user: UserDB = Depends(get_current_user)):
     """Get all active jobs from direct input and Excel files."""
     try:
-        manual_jobs = load_manual_jobs()
+        manual_jobs, excel_jobs = await asyncio.gather(
+            asyncio.to_thread(load_manual_jobs),
+            asyncio.to_thread(load_excel_jobs),
+        )
         print(f"[API] Loaded {len(manual_jobs)} jobs from direct API input")
-
-        excel_jobs = load_excel_jobs()
         print(f"[API] Loaded {len(excel_jobs)} jobs from Excel")
         all_jobs = combine_jobs_with_priority(manual_jobs, excel_jobs, [])
         is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
@@ -3543,9 +3668,13 @@ async def get_ceipal_status():
 async def get_job(job_id: str):
     """Get specific job details"""
     try:
+        manual_jobs, excel_jobs = await asyncio.gather(
+            asyncio.to_thread(load_manual_jobs),
+            asyncio.to_thread(load_excel_jobs),
+        )
         all_jobs = combine_jobs_with_priority(
-            load_manual_jobs(),
-            load_excel_jobs(),
+            manual_jobs,
+            excel_jobs,
             [],
         )
 

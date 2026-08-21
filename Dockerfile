@@ -4,6 +4,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PORT=8000 \
+    WEB_CONCURRENCY=2 \
     DATA_DIR=/app/data \
     UPLOAD_DIR=/app/data/uploads \
     CEIPAL_CACHE_DIR=/app/data/cache
@@ -26,4 +27,4 @@ RUN mkdir -p /app/data/uploads /app/data/cache
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn backend.main:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["sh", "-c", "uvicorn backend.main:app --host 0.0.0.0 --port ${PORT} --workers ${WEB_CONCURRENCY}"]
