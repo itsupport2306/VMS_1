@@ -1082,15 +1082,34 @@ def clear_manual_jobs_cache() -> None:
     print("[Manual Jobs] Cache cleared")
 
 
-def _normalize_user_doc(doc: dict) -> dict:
+def _normalize_is_active(value: Any) -> str:
+    """Coerce legacy active flags into the string format used by the current API."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "false"
+    return "true" if str(value).strip().lower() in {"1", "true", "yes", "y"} else "false"
+
+
+def is_user_active(user: Optional[dict]) -> bool:
+    return _normalize_is_active((user or {}).get("is_active")) == "true"
+
+
+def _normalize_user_record(email_key: str, user_data: dict) -> dict:
+    email = (user_data.get("email") or email_key or "").strip().lower()
+    full_name = (user_data.get("full_name") or email.split("@")[0] or email).strip()
     return {
-        "id": doc["id"],
-        "email": doc["email"],
-        "full_name": doc["full_name"],
-        "hashed_password": doc["hashed_password"],
-        "is_active": doc["is_active"],
-        "created_at": doc.get("created_at", datetime.now().isoformat()),
+        "id": user_data.get("id") or str(uuid4()),
+        "email": email,
+        "full_name": full_name,
+        "hashed_password": user_data.get("hashed_password", ""),
+        "is_active": _normalize_is_active(user_data.get("is_active")),
+        "created_at": user_data.get("created_at", datetime.now().isoformat()),
     }
+
+
+def _normalize_user_doc(doc: dict) -> dict:
+    return _normalize_user_record(doc.get("email", ""), doc)
 
 
 def migrate_users_to_mongodb():
@@ -1161,11 +1180,29 @@ def load_users_from_json(force_refresh: bool = False):
     if os.path.exists(USERS_JSON_FILE):
         try:
             with open(USERS_JSON_FILE, "r") as f:
-                users = json.load(f)
+                raw_users = json.load(f)
+            if not isinstance(raw_users, dict):
+                print(f"[Auth] Users JSON must be an object, got {type(raw_users).__name__}; ignoring file")
+                return {}
+            users = {
+                (email or "").strip().lower(): _normalize_user_record(email, user_data)
+                for email, user_data in raw_users.items()
+                if isinstance(user_data, dict)
+            }
             with _users_cache_lock:
                 _users_cache = users
                 _users_cache_time = datetime.now()
             return users
+        except json.JSONDecodeError:
+            try:
+                with open(USERS_JSON_FILE, "r") as f:
+                    raw_text = f.read()
+                if "@" in raw_text and "hashed_password" not in raw_text:
+                    print("[Auth] Users JSON contains a plain email list, not password records; ignoring malformed file")
+                else:
+                    print("[Auth] Users JSON is malformed; ignoring file")
+            except Exception as read_error:
+                print(f"[Auth] Error reading malformed users JSON: {read_error}")
         except Exception as e:
             print(f"[Auth] Error loading users JSON: {e}")
     return {}
@@ -1210,11 +1247,17 @@ def load_user_by_email(email: str, prefer_cache: bool = True) -> Optional[dict]:
 
 def save_users_to_json(users):
     """Save users to MongoDB or fallback to JSON file"""
+    normalized_users = {
+        (email or "").strip().lower(): _normalize_user_record(email, user_data)
+        for email, user_data in users.items()
+        if isinstance(user_data, dict)
+    }
+
     # Try MongoDB first
     if mongodb_enabled and users_collection is not None:
         try:
             # Update each user individually (upsert)
-            for email, user_data in users.items():
+            for email, user_data in normalized_users.items():
                 users_collection.update_one(
                     {"email": email.lower()},
                     {"$set": {
@@ -1227,7 +1270,7 @@ def save_users_to_json(users):
                     }},
                     upsert=True
                 )
-            print(f"[Auth] Saved {len(users)} users to MongoDB")
+            print(f"[Auth] Saved {len(normalized_users)} users to MongoDB")
             clear_users_cache()
             return True
         except Exception as e:
@@ -1237,7 +1280,7 @@ def save_users_to_json(users):
     try:
         os.makedirs(os.path.dirname(USERS_JSON_FILE), exist_ok=True)
         with open(USERS_JSON_FILE, "w") as f:
-            json.dump(users, f, indent=2)
+            json.dump(normalized_users, f, indent=2)
         clear_users_cache()
         return True
     except Exception as e:
@@ -1551,7 +1594,7 @@ async def get_current_user(token: str = Depends(HTTPBearer())):
     if user is None:
         print(f"[Auth] User not found for email: {email_lower}")
         raise credentials_exception
-    if user.get("is_active") != "true":
+    if not is_user_active(user):
         print(f"[Auth] User {email_lower} is inactive: {user.get('is_active')}")
         raise HTTPException(status_code=400, detail="Inactive user")
     print(f"[Auth] User {email_lower} authenticated successfully")
@@ -1576,7 +1619,7 @@ def verify_admin_credentials(email: str, password: str) -> None:
     user = load_user_by_email(email_lower)
     if not user:
         raise HTTPException(status_code=401, detail="Incorrect email or password")
-    if user.get("is_active") != "true":
+    if not is_user_active(user):
         raise HTTPException(status_code=400, detail="Inactive user")
     if not verify_password(password, user["hashed_password"]):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
@@ -1597,7 +1640,7 @@ async def register(user_data: UserCreate, request: Request):
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
 
     existing = await asyncio.to_thread(load_user_by_email, email_lower)
-    if existing and existing.get("is_active") == "true":
+    if existing and is_user_active(existing):
         raise HTTPException(status_code=400, detail="Account already exists. Please log in.")
 
     otp = f"{secrets.randbelow(1000000):06d}"
@@ -1659,7 +1702,7 @@ async def verify_registration_otp(request_data: OtpVerify):
 
     users = load_users_from_json()
     existing = users.get(email_lower)
-    if existing and existing.get("is_active") == "true":
+    if existing and is_user_active(existing):
         del _email_otp_tokens[email_lower]
         raise HTTPException(status_code=400, detail="Account already exists. Please log in.")
 
@@ -1701,7 +1744,7 @@ def get_or_create_otp_user(email: str) -> dict:
         _users_cache[email_lower] = user
         save_users_to_json(_users_cache)
 
-    if user.get("is_active") != "true":
+    if not is_user_active(user):
         raise HTTPException(status_code=400, detail="Inactive user")
     return user
 
@@ -1786,12 +1829,33 @@ async def verify_login_otp(request_data: OtpVerify):
 @app.post("/api/auth/login", response_model=Token)
 async def login(user_data: UserLogin):
     """Login existing users with email and password."""
+    global _users_cache
+
     email_lower = user_data.email.lower().strip()
     user = await asyncio.to_thread(load_user_by_email, email_lower)
 
     if not user:
-        raise HTTPException(status_code=401, detail="Incorrect email or password")
-    if user.get("is_active") != "true":
+        if email_lower not in WHITELISTED_USERS:
+            raise HTTPException(status_code=401, detail="Incorrect email or password")
+
+        # Restore legacy behavior: whitelisted users without a stored password
+        # can be provisioned again on first password login.
+        print(f"[Auth] Recreating missing password user for whitelisted email: {email_lower}")
+        users = load_users_from_json(force_refresh=True)
+        user = {
+            "id": str(uuid4()),
+            "email": email_lower,
+            "full_name": email_lower.split("@")[0],
+            "hashed_password": get_password_hash(user_data.password),
+            "is_active": "true",
+            "created_at": datetime.now().isoformat(),
+        }
+        users[email_lower] = user
+        if not save_users_to_json(users):
+            raise HTTPException(status_code=500, detail="Could not restore account access")
+        _users_cache = load_users_from_json(force_refresh=True)
+
+    if not is_user_active(user):
         raise HTTPException(status_code=400, detail="Inactive user")
     if not verify_password(user_data.password, user["hashed_password"]):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
