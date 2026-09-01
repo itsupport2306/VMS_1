@@ -579,6 +579,16 @@ OPEN_STATUSES = {"open", "active"}
 CLOSED_STATUSES = {"closed", "inactive", "filled", "on hold", "cancelled"}
 
 
+def normalize_job_status(status_value: str | None, default: str = "Open") -> str:
+    """Collapse equivalent upstream open statuses into a single display value."""
+    status_text = (status_value or "").strip()
+    if not status_text:
+        return default
+    if status_text.lower() in OPEN_STATUSES:
+        return "Open"
+    return status_text
+
+
 def send_job_closure_notification_email(user_email: str, job_title: str, job_id: str) -> bool:
     """Send a single job-closure notification email via SendGrid."""
     if not SENDGRID_API_KEY:
@@ -2501,7 +2511,7 @@ def load_excel_jobs_from_file(file_path: str) -> List[Job]:
                     employment_type="Contract",  # Default or can be derived
                     salary_range=displayed_salary or None,
                     posted_date=datetime.now(),  # Default to now
-                    status=status if status and status.lower() != 'nan' else "Active",
+                    status=normalize_job_status(status if status and status.lower() != 'nan' else None),
                     end_client=end_client if end_client and end_client.lower() != 'nan' else None,
                     job_id=job_code,
                     profession=profession if profession and profession.lower() != 'nan' else None,
@@ -3761,7 +3771,7 @@ class CeipalClient:
                 employment_type=job_data.get("Duration", "Contract"),  # Duration as employment type
                 salary_range=salary_range_display,  # Show updated rate to vendors
                 posted_date=self._parse_date(job_data.get("JobCreated", job_data.get("CreatedDate"))),
-                status=job_data.get("JobStatus", "Open"),
+                status=normalize_job_status(job_data.get("JobStatus")),
                 end_client=job_data.get("EndClient", None),
                 specialty=specialty.strip() or None,
                 state=states.strip() or None,

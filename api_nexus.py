@@ -371,7 +371,7 @@ def build_vms_payload(summary_job: Dict[str, Any], detail_job: Dict[str, Any]) -
         "status": first_non_empty(
             detail_job.get("status"),
             summary_job.get("status"),
-            "Active",
+            "Open",
         ),
         "profession": first_non_empty(
             detail_job.get("profession"),

@@ -287,8 +287,11 @@ def show_enterprise_sidebar():
         total_jobs = jobs_data.get("total", 0)
         st.metric("Total Jobs", total_jobs)
         
-        active_jobs = len([j for j in jobs_data.get("jobs", []) if j.get("status") == "active"])
-        st.metric("Active Jobs", active_jobs)
+        open_jobs = len([
+            j for j in jobs_data.get("jobs", [])
+            if str(j.get("status", "")).strip().lower() in {"open", "active"}
+        ])
+        st.metric("Open Jobs", open_jobs)
 
 def show_enterprise_dashboard():
     """Show enterprise dashboard"""
