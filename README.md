@@ -62,13 +62,16 @@ APP_URL=https://your-production-vms-url.example.com
 In `DEBUG` or `TESTING_MODE`, the backend logs OTP codes when email delivery is unavailable so the sign-in flow can be tested locally. Production should use SendGrid and should keep debug logging disabled.
 
 #### Admin Submission Notifications
-Candidate submission notifications use SendGrid from `SENDGRID_FROM_EMAIL`. Set the admin recipients as a comma-separated list:
+Candidate submission notifications use SendGrid and can be forced to send from `notifications@radixsol.com` with `SENDGRID_FROM_EMAIL`. Set the admin recipients as a comma-separated list:
 
 ```env
+SENDGRID_FROM_EMAIL=notifications@radixsol.com
 SUBMISSION_NOTIFICATION_RECIPIENTS=it.support@radixsol.com
 ```
 
 Each successful candidate submission is also written to a separate submission audit log with submitter name, submitter email, candidate details, timestamp, IP address when available, user agent, resume metadata, and job metadata. MongoDB deployments store this in the `submission_logs` collection. Local/fallback deployments store it in `DATA_DIR/submission_logs.json`.
+
+The authenticated submission history view is available from `GET /api/submission-history`. It groups profiles by user and submission date, includes user details and per-user totals, and powers the browser submission history screen.
 
 ### 3. Run the Application
 
@@ -150,6 +153,7 @@ python main.py all
 - `POST /api/candidates/submit` - Submit candidate with resume
 - `GET /api/candidates/job/{job_id}` - Get candidates for specific job
 - `GET /api/candidates` - Get all candidates
+- `GET /api/submission-history` - Authenticated submission history grouped by user and date
 - `GET /api/submission-logs` - Admin-only candidate submission audit log
 
 ### Authentication

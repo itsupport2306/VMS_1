@@ -5,6 +5,7 @@ from fastapi.security import HTTPBearer, HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, root_validator
 from typing import Any, Dict, List, Optional
+from collections import defaultdict
 import httpx
 import os
 from datetime import datetime, timedelta
@@ -51,6 +52,8 @@ def ensure_mongodb_indexes() -> None:
     """Create the indexes required for fast auth lookups and manual job reads."""
     index_specs = [
         ("users.email", users_collection, "email", {"name": "users_email_idx", "unique": True}),
+        ("candidates.submitted_by_user_id", candidates_collection, "submitted_by_user_id", {"name": "candidates_submitted_by_user_id_idx"}),
+        ("candidates.submitted_date", candidates_collection, [("submitted_date", -1)], {"name": "candidates_submitted_date_desc_idx"}),
         ("manual_jobs.created_at", manual_jobs_collection, [("created_at", -1)], {"name": "manual_jobs_created_at_desc_idx"}),
         ("manual_jobs.id", manual_jobs_collection, "id", {"name": "manual_jobs_id_idx", "unique": True}),
         ("manual_jobs.job_id", manual_jobs_collection, "job_id", {"name": "manual_jobs_job_id_idx"}),
@@ -134,6 +137,7 @@ SUBMISSION_NOTIFICATION_RECIPIENTS = [
         "it.support@radixsol.com",
     ).split(",") if addr.strip()
 ]
+SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL", "notifications@radixsol.com")
 
 BILL_RATE_DISPLAY_MULTIPLIER = 0.93
 BILL_RATE_NUMBER_PATTERN = re.compile(r"\d+(?:,\d{3})*(?:\.\d+)?")
@@ -232,7 +236,7 @@ def _smtp_configured() -> bool:
     return bool(SMTP_HOST and SMTP_PORT and SMTP_USERNAME and SMTP_PASSWORD and SMTP_FROM_EMAIL)
 
 
-def send_sendgrid_email(to_emails, subject: str, html_content: str, text_content: Optional[str] = None) -> bool:
+def send_sendgrid_email(to_emails, subject: str, html_content: str, text_content: Optional[str] = None, from_email: Optional[str] = None) -> bool:
     """Send an email using SendGrid."""
     recipients = to_emails if isinstance(to_emails, list) else [to_emails]
     recipients = [addr for addr in recipients if addr]
@@ -248,7 +252,7 @@ def send_sendgrid_email(to_emails, subject: str, html_content: str, text_content
         from sendgrid.helpers.mail import Mail
 
         message = Mail(
-            from_email=SENDGRID_FROM_EMAIL,
+            from_email=from_email or SENDGRID_FROM_EMAIL,
             to_emails=recipients,
             subject=subject,
             html_content=html_content,
@@ -276,7 +280,7 @@ def send_sendgrid_email(to_emails, subject: str, html_content: str, text_content
         return False
 
 
-def send_smtp_email(to_emails, subject: str, html_content: str, text_content: Optional[str] = None) -> bool:
+def send_smtp_email(to_emails, subject: str, html_content: str, text_content: Optional[str] = None, from_email: Optional[str] = None) -> bool:
     """Send an email using SMTP settings when configured."""
     recipients = to_emails if isinstance(to_emails, list) else [to_emails]
     recipients = [addr for addr in recipients if addr]
@@ -289,7 +293,7 @@ def send_smtp_email(to_emails, subject: str, html_content: str, text_content: Op
 
     try:
         message = EmailMessage()
-        message["From"] = SMTP_FROM_EMAIL
+        message["From"] = from_email or SMTP_FROM_EMAIL
         message["To"] = ", ".join(recipients)
         message["Subject"] = subject
         message.set_content(text_content or html_content)
@@ -307,11 +311,11 @@ def send_smtp_email(to_emails, subject: str, html_content: str, text_content: Op
         return False
 
 
-def send_app_email(to_emails, subject: str, html_content: str, text_content: Optional[str] = None) -> bool:
+def send_app_email(to_emails, subject: str, html_content: str, text_content: Optional[str] = None, from_email: Optional[str] = None) -> bool:
     """Production email path is SendGrid; SMTP remains a local fallback."""
-    if send_sendgrid_email(to_emails, subject, html_content, text_content):
+    if send_sendgrid_email(to_emails, subject, html_content, text_content, from_email=from_email):
         return True
-    return send_smtp_email(to_emails, subject, html_content, text_content)
+    return send_smtp_email(to_emails, subject, html_content, text_content, from_email=from_email)
 
 
 def send_login_otp_email(email: str, otp: str) -> bool:
@@ -399,8 +403,8 @@ def cleanup_expired_tokens():
     if expired:
         print(f"[Auth] Cleaned up {len(expired)} expired reset tokens")
 
-def send_submission_notification_email(candidate_data: dict, vendor_info: dict) -> bool:
-    """Send candidate submission notification to admin via configured email provider."""
+def send_submission_notification_email(candidate_data: dict, vendor_info: dict, submission_summary: Optional[dict] = None) -> bool:
+    """Send candidate submission notification to admin with per-user activity details."""
     try:
         # Build email content
         candidate_name = str(candidate_data.get('name') or 'N/A')
@@ -419,12 +423,28 @@ def send_submission_notification_email(candidate_data: dict, vendor_info: dict) 
         submitted_at = str(candidate_data.get('submitted_date') or 'N/A')
         ip_address = str(candidate_data.get('submission_ip_address') or 'N/A')
         user_agent = str(candidate_data.get('submission_user_agent') or 'N/A')
+        submission_summary = submission_summary or {}
+        total_profiles = int(submission_summary.get("total_profiles_submitted") or 0)
+        profiles_on_date = int(submission_summary.get("profiles_submitted_on_date") or 0)
+        submission_date = str(submission_summary.get("submission_date") or submitted_at[:10] or 'N/A')
+        first_submission_at = str(submission_summary.get("first_submission_at") or submitted_at)
+        last_submission_at = str(submission_summary.get("last_submission_at") or submitted_at)
         
         html_content = f'''
-            <h2>New Candidate Submission</h2>
-            <p>A new candidate has been submitted by <strong>{html.escape(vendor_name)}</strong> ({html.escape(vendor_email)}).</p>
+            <h2>Profile Submission Activity Report</h2>
+            <p><strong>{html.escape(vendor_name)}</strong> ({html.escape(vendor_email)}) submitted a new profile.</p>
             
-            <h3>Candidate Details:</h3>
+            <h3>User Submission Summary:</h3>
+            <table style="border-collapse: collapse; width: 100%; max-width: 600px; margin-bottom: 18px;">
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">User Name:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(vendor_name)}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">User Email:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(vendor_email)}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Total Profiles Submitted:</td><td style="padding: 8px; border: 1px solid #ddd;">{total_profiles}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Profiles Submitted On {html.escape(submission_date)}:</td><td style="padding: 8px; border: 1px solid #ddd;">{profiles_on_date}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">First Submission Time:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(first_submission_at)}</td></tr>
+                <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Latest Submission Time:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(last_submission_at)}</td></tr>
+            </table>
+             
+            <h3>Submitted Profile Details:</h3>
             <table style="border-collapse: collapse; width: 100%; max-width: 600px;">
                 <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Name:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(candidate_name)}</td></tr>
                 <tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">Email:</td><td style="padding: 8px; border: 1px solid #ddd;">{html.escape(candidate_email)}</td></tr>
@@ -450,21 +470,26 @@ def send_submission_notification_email(candidate_data: dict, vendor_info: dict) 
         '''
         
         recipients = SUBMISSION_NOTIFICATION_RECIPIENTS or [ADMIN_EMAIL]
-        subject = f'New Candidate Submission: {candidate_name} for {job_title}'
+        subject = f'Submission Activity: {vendor_name} now at {total_profiles} profile(s)'
 
         return send_app_email(
             recipients,
             subject,
             html_content,
             text_content=(
-                f"New candidate submission\n"
+                f"Profile submission activity report\n"
+                f"User: {vendor_name} ({vendor_email})\n"
+                f"Total profiles submitted: {total_profiles}\n"
+                f"Profiles submitted on {submission_date}: {profiles_on_date}\n"
+                f"First submission time: {first_submission_at}\n"
+                f"Latest submission time: {last_submission_at}\n"
                 f"Candidate: {candidate_name}\n"
                 f"Email: {candidate_email}\n"
                 f"Phone: {candidate_phone}\n"
                 f"Job: {job_title} ({job_id})\n"
-                f"Submitted by: {vendor_name} ({vendor_email})\n"
                 f"Submitted at: {submitted_at}"
             ),
+            from_email=SENDGRID_FROM_EMAIL,
         )
     except Exception as e:
         import traceback
@@ -2588,6 +2613,125 @@ def record_submission_log(audit_doc: dict) -> None:
     print(f"[SubmissionAudit] Logged submission {audit_doc.get('id')} in JSON")
 
 
+def load_candidate_submissions(submitter_user_id: Optional[str] = None) -> List[dict]:
+    """Load candidate submissions with optional filtering by submitter."""
+    candidates: List[dict] = []
+
+    if mongodb_enabled and candidates_collection is not None:
+        query = {"submitted_by_user_id": submitter_user_id} if submitter_user_id else {}
+        cursor = candidates_collection.find(query).sort("submitted_date", -1)
+        for doc in cursor:
+            doc["_id"] = str(doc["_id"])
+            sanitize_candidate_bill_rate(doc)
+            candidates.append(doc)
+        return candidates
+
+    candidates_file = os.path.join(DATA_DIR, "candidates.json")
+    if os.path.exists(candidates_file):
+        with open(candidates_file, "r") as f:
+            loaded = json.load(f)
+        for candidate in loaded:
+            if submitter_user_id and candidate.get("submitted_by_user_id") != submitter_user_id:
+                continue
+            sanitize_candidate_bill_rate(candidate)
+            candidates.append(candidate)
+
+    candidates.sort(key=lambda row: row.get("submitted_date", ""), reverse=True)
+    return candidates
+
+
+def build_submission_history(candidates: List[dict]) -> List[dict]:
+    """Group candidate submissions by user and submission date."""
+    users = load_users_from_json()
+    grouped: Dict[str, dict] = {}
+
+    for candidate in candidates:
+        user_id = candidate.get("submitted_by_user_id") or "unknown"
+        user_email = (candidate.get("submitted_by_email") or "").strip().lower()
+        user_name = (candidate.get("submitted_by_name") or "Unknown User").strip() or "Unknown User"
+        submitted_at = str(candidate.get("submitted_date") or "")
+        submission_date = submitted_at[:10] if len(submitted_at) >= 10 else "unknown"
+        user_record = users.get(user_email) if user_email else None
+
+        if user_id not in grouped:
+            grouped[user_id] = {
+                "user": {
+                    "id": user_id if user_id != "unknown" else None,
+                    "full_name": user_record.get("full_name") if user_record else user_name,
+                    "email": user_record.get("email") if user_record else (user_email or None),
+                    "is_active": user_record.get("is_active") if user_record else None,
+                    "created_at": user_record.get("created_at") if user_record else None,
+                },
+                "summary": {
+                    "total_profiles_submitted": 0,
+                    "total_submission_days": 0,
+                    "first_submission_at": None,
+                    "last_submission_at": None,
+                },
+                "_dates": defaultdict(list),
+            }
+
+        group = grouped[user_id]
+        group["summary"]["total_profiles_submitted"] += 1
+        first_submission_at = group["summary"]["first_submission_at"]
+        last_submission_at = group["summary"]["last_submission_at"]
+        if submitted_at:
+            if not first_submission_at or submitted_at < first_submission_at:
+                group["summary"]["first_submission_at"] = submitted_at
+            if not last_submission_at or submitted_at > last_submission_at:
+                group["summary"]["last_submission_at"] = submitted_at
+        group["_dates"][submission_date].append(candidate)
+
+    history = []
+    for group in grouped.values():
+        dates = []
+        for submission_date, profiles in sorted(group["_dates"].items(), key=lambda item: item[0], reverse=True):
+            ordered_profiles = sorted(profiles, key=lambda row: row.get("submitted_date", ""), reverse=True)
+            dates.append({
+                "date": submission_date,
+                "total_profiles_submitted": len(ordered_profiles),
+                "first_submission_at": ordered_profiles[-1].get("submitted_date") if ordered_profiles else None,
+                "last_submission_at": ordered_profiles[0].get("submitted_date") if ordered_profiles else None,
+                "profiles": ordered_profiles,
+            })
+        group["summary"]["total_submission_days"] = len(dates)
+        group["dates"] = dates
+        group.pop("_dates", None)
+        history.append(group)
+
+    history.sort(
+        key=lambda item: (
+            item.get("summary", {}).get("last_submission_at") or "",
+            item.get("summary", {}).get("total_profiles_submitted") or 0,
+        ),
+        reverse=True,
+    )
+    return history
+
+
+def get_user_submission_summary(candidates: List[dict], submitter_user_id: Optional[str], submitted_at: str) -> dict:
+    """Derive per-user submission counts around the current submission event."""
+    submission_date = submitted_at[:10] if len(submitted_at) >= 10 else ""
+    if submitter_user_id:
+        user_candidates = [candidate for candidate in candidates if candidate.get("submitted_by_user_id") == submitter_user_id]
+    else:
+        user_candidates = candidates
+
+    same_date_candidates = [
+        candidate for candidate in user_candidates
+        if submission_date and str(candidate.get("submitted_date") or "").startswith(submission_date)
+    ]
+
+    ordered = sorted(user_candidates, key=lambda row: row.get("submitted_date", ""))
+    return {
+        "total_profiles_submitted": len(user_candidates),
+        "profiles_submitted_on_date": len(same_date_candidates),
+        "submission_date": submission_date,
+        "first_submission_at": ordered[0].get("submitted_date") if ordered else submitted_at,
+        "last_submission_at": ordered[-1].get("submitted_date") if ordered else submitted_at,
+    }
+
+
 def first_present(*values) -> str:
     for value in values:
         if value is None:
@@ -3961,6 +4105,12 @@ async def submit_candidate(
         except Exception as e:
             print(f"[SubmissionAudit] Failed to write audit log for {candidate_id}: {e}")
         
+        user_submission_summary = get_user_submission_summary(
+            load_candidate_submissions(current_user.id),
+            current_user.id,
+            submitted_at,
+        )
+
         # Send email notification to admin
         vendor_info = {
             "full_name": current_user.full_name,
@@ -3971,7 +4121,12 @@ async def submit_candidate(
         # Run the synchronous SendGrid call off the event loop so it doesn't stall other requests
         # if SendGrid is slow. Failure to email is non-fatal — the candidate is already stored.
         try:
-            email_sent = await asyncio.to_thread(send_submission_notification_email, candidate_doc, vendor_info)
+            email_sent = await asyncio.to_thread(
+                send_submission_notification_email,
+                candidate_doc,
+                vendor_info,
+                user_submission_summary,
+            )
         except Exception as e:
             print(f"[Submissions] Exception during notification email dispatch: {e}")
             email_sent = False
@@ -3984,7 +4139,8 @@ async def submit_candidate(
             "message": "Candidate submitted successfully",
             "candidate_id": candidate_id,
             "status": "submitted",
-            "submitted_by": current_user.full_name
+            "submitted_by": current_user.full_name,
+            "submission_summary": user_submission_summary,
         }
         
     except Exception as e:
@@ -4025,49 +4181,37 @@ async def get_all_candidates(
 ):
     """Get submitted candidates with submitter info. Vendors see only their own submissions, admin sees all. - MongoDB persistent storage"""
     try:
-        candidates = []
         is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
-        
-        if mongodb_enabled and candidates_collection is not None:
-            # Query MongoDB
-            if is_admin:
-                cursor = candidates_collection.find()
-            else:
-                cursor = candidates_collection.find({"submitted_by_user_id": current_user.id})
-            
-            for doc in cursor:
-                doc["_id"] = str(doc["_id"])
-                sanitize_candidate_bill_rate(doc)
-                # Build submitted_by info from stored data
-                doc["submitted_by"] = {
-                    "id": doc.get("submitted_by_user_id"),
-                    "full_name": doc.get("submitted_by_name"),
-                    "email": doc.get("submitted_by_email")
-                } if doc.get("submitted_by_user_id") else None
-                candidates.append(doc)
-        else:
-            # Fallback to JSON file
-            candidates_file = os.path.join(DATA_DIR, "candidates.json")
-            if os.path.exists(candidates_file):
-                with open(candidates_file, 'r') as f:
-                    all_candidates = json.load(f)
-                    if is_admin:
-                        candidates = all_candidates
-                    else:
-                        candidates = [c for c in all_candidates if c.get("submitted_by_user_id") == current_user.id]
-                    
-                    for c in candidates:
-                        sanitize_candidate_bill_rate(c)
-                        c["submitted_by"] = {
-                            "id": c.get("submitted_by_user_id"),
-                            "full_name": c.get("submitted_by_name"),
-                            "email": c.get("submitted_by_email")
-                        }
-        
+        candidates = load_candidate_submissions(None if is_admin else current_user.id)
+        for candidate in candidates:
+            candidate["submitted_by"] = {
+                "id": candidate.get("submitted_by_user_id"),
+                "full_name": candidate.get("submitted_by_name"),
+                "email": candidate.get("submitted_by_email")
+            } if candidate.get("submitted_by_user_id") else None
+
         return {"candidates": candidates, "total": len(candidates)}
     except Exception as e:
         print(f"[Submissions] Error fetching candidates: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch candidates: {str(e)}")
+
+
+@app.get("/api/submission-history")
+async def get_submission_history(current_user: UserDB = Depends(get_current_user)):
+    """Return submission history grouped by user and submission date."""
+    try:
+        is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
+        candidates = load_candidate_submissions(None if is_admin else current_user.id)
+        history = build_submission_history(candidates)
+        return {
+            "history": history,
+            "total_profiles": len(candidates),
+            "total_users": len(history),
+            "generated_at": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        print(f"[SubmissionHistory] Error fetching history: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch submission history: {str(e)}")
 
 
 @app.get("/api/submission-logs")

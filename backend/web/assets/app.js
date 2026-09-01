@@ -1024,7 +1024,7 @@ function setView(view) {
   }
   if (view === 'submissions') {
     els.pageTitle.textContent = 'Submissions';
-    els.pageSubtitle.textContent = 'Recent candidate submissions.';
+    els.pageSubtitle.textContent = 'Submission history grouped by user and date.';
     loadSubmissions();
   }
   if (view === 'offers') {
@@ -1601,6 +1601,235 @@ async function loadSubmissions() {
   }
 }
 
+function formatSubmissionDateTime(value) {
+  if (!value) return 'N/A';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+function formatSubmissionDay(value) {
+  if (!value || value === 'unknown') return 'Unknown date';
+  const date = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleDateString([], { dateStyle: 'full' });
+}
+
+function serializeDataAttr(value) {
+  return JSON.stringify(value || {}).replace(/'/g, "\\'");
+}
+
+loadSubmissions = async function loadSubmissionsHistory() {
+  els.submissionsTable.innerHTML = '<div class="loading-jobs">Loading submission history...</div>';
+
+  try {
+    const data = await apiGetAuth('/api/submission-history');
+    const history = data.history || [];
+    if (!history.length) {
+      els.submissionsTable.innerHTML = '<div class="empty">No submissions yet.</div>';
+      return;
+    }
+
+    const isUserAdmin = isAdmin();
+    const totalProfiles = Number(data.total_profiles || 0);
+    const totalUsers = Number(data.total_users || history.length);
+    const totalDays = history.reduce((sum, group) => sum + Number(group.summary?.total_submission_days || 0), 0);
+
+    const summaryCards = `
+      <div class="submission-summary-grid">
+        <div class="submission-summary-card">
+          <span>Total Profiles</span>
+          <strong>${totalProfiles}</strong>
+        </div>
+        <div class="submission-summary-card">
+          <span>${isUserAdmin ? 'Users Tracked' : 'Submission Days'}</span>
+          <strong>${isUserAdmin ? totalUsers : totalDays}</strong>
+        </div>
+        <div class="submission-summary-card">
+          <span>${isUserAdmin ? 'Date Groups' : 'Profiles Tracked'}</span>
+          <strong>${isUserAdmin ? totalDays : totalProfiles}</strong>
+        </div>
+      </div>
+    `;
+
+    const groupsHtml = history.map(group => {
+      const user = group.user || {};
+      const summary = group.summary || {};
+      const vendorPayload = { ...user, summary };
+      const userName = escapeHtml(user.full_name || user.email || 'Unknown User');
+      const userMeta = [
+        user.email ? escapeHtml(user.email) : null,
+        user.id ? `ID: ${escapeHtml(user.id)}` : null,
+        user.is_active ? `Status: ${escapeHtml(user.is_active)}` : null,
+        user.created_at ? `Joined: ${escapeHtml(formatSubmissionDateTime(user.created_at))}` : null,
+      ].filter(Boolean).join(' | ');
+
+      const dateGroups = (group.dates || []).map(dateGroup => {
+        const profiles = dateGroup.profiles || [];
+        const rows = profiles.map(candidate => `
+          <tr data-candidate='${serializeDataAttr(candidate)}'>
+            <td>
+              <a href="#" class="candidate-name-link submission-link">${escapeHtml(candidate.name || '')}</a>
+              <div class="submission-cell-sub">${escapeHtml(candidate.id || '')}</div>
+            </td>
+            <td>
+              <div>${escapeHtml(candidate.email || 'N/A')}</div>
+              <div class="submission-cell-sub">${escapeHtml(candidate.phone || 'N/A')}</div>
+            </td>
+            <td>
+              <div>${escapeHtml(candidate.job_title || candidate.job_id || 'N/A')}</div>
+              <div class="submission-cell-sub">${escapeHtml(candidate.job_id || '')}</div>
+            </td>
+            <td>${escapeHtml(formatSubmissionDateTime(candidate.submitted_date || ''))}</td>
+            <td>
+              ${isUserAdmin ? `
+                <select class="status-dropdown" data-candidate-id="${escapeHtml(candidate.id || '')}" data-current-status="${escapeHtml(candidate.status || 'submitted')}" style="padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:white;cursor:pointer;">
+                  <option value="submitted" ${candidate.status === 'submitted' ? 'selected' : ''}>Submitted</option>
+                  <option value="offer" ${candidate.status === 'offer' ? 'selected' : ''}>Offer</option>
+                  <option value="decline" ${candidate.status === 'decline' ? 'selected' : ''}>Decline</option>
+                  <option value="start" ${candidate.status === 'start' ? 'selected' : ''}>Start</option>
+                </select>
+              ` : `<span class="status-badge status-${candidate.status || 'submitted'}">${escapeHtml((candidate.status || 'submitted').toUpperCase())}</span>`}
+            </td>
+            <td><button class="btn btn--secondary view-resume-btn" data-candidate-id="${escapeHtml(candidate.id || '')}">View Resume</button></td>
+            ${isUserAdmin ? `<td><button class="btn btn--secondary email-vendor-btn" data-candidate-id="${escapeHtml(candidate.id || '')}">Email Vendor</button></td>` : ''}
+          </tr>
+        `).join('');
+
+        return `
+          <div class="submission-date-group">
+            <div class="submission-date-header">
+              <div>
+                <div class="submission-date-title">${escapeHtml(formatSubmissionDay(dateGroup.date))}</div>
+                <div class="submission-date-meta">
+                  ${Number(dateGroup.total_profiles_submitted || 0)} profile(s) |
+                  First: ${escapeHtml(formatSubmissionDateTime(dateGroup.first_submission_at || ''))} |
+                  Last: ${escapeHtml(formatSubmissionDateTime(dateGroup.last_submission_at || ''))}
+                </div>
+              </div>
+            </div>
+            <div class="table-container submission-table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Candidate</th>
+                    <th>Contact</th>
+                    <th>Job</th>
+                    <th>Submitted</th>
+                    <th>Status</th>
+                    <th>Resume</th>
+                    ${isUserAdmin ? '<th>Action</th>' : ''}
+                  </tr>
+                </thead>
+                <tbody>
+                  ${rows}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        `;
+      }).join('');
+
+      return `
+        <div class="submission-history-card">
+          <div class="submission-history-header">
+            <div>
+              <div class="submission-history-user">
+                ${isUserAdmin ? `<a href="#" class="vendor-name-link submission-link" data-vendor='${serializeDataAttr(vendorPayload)}'>${userName}</a>` : userName}
+              </div>
+              <div class="submission-history-meta">${userMeta || 'No user details available.'}</div>
+            </div>
+            <div class="submission-history-stats">
+              <div class="submission-history-stat">
+                <span>Total Profiles</span>
+                <strong>${Number(summary.total_profiles_submitted || 0)}</strong>
+              </div>
+              <div class="submission-history-stat">
+                <span>Submission Days</span>
+                <strong>${Number(summary.total_submission_days || 0)}</strong>
+              </div>
+              <div class="submission-history-stat">
+                <span>Latest Activity</span>
+                <strong>${escapeHtml(formatSubmissionDateTime(summary.last_submission_at || ''))}</strong>
+              </div>
+            </div>
+          </div>
+          <div class="submission-history-section">
+            ${dateGroups}
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    els.submissionsTable.innerHTML = `
+      <div class="panel submission-history-panel">
+        <div class="panel__title">Submission History</div>
+        <div class="panel__desc">${isUserAdmin ? 'Grouped by user and date across the portal.' : 'Your profile submissions grouped by date.'}</div>
+        ${summaryCards}
+        <div class="submission-history-list">
+          ${groupsHtml}
+        </div>
+      </div>
+    `;
+
+    els.submissionsTable.querySelectorAll('.view-resume-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const candidateId = btn.dataset.candidateId;
+        if (candidateId) {
+          window.open(`${API_BASE}/api/resumes/${candidateId}`, '_blank');
+        }
+      });
+    });
+
+    els.submissionsTable.querySelectorAll('.candidate-name-link').forEach(link => {
+      link.addEventListener('click', (e) => {
+        e.preventDefault();
+        const row = e.target.closest('tr');
+        if (!row) return;
+        const candidateData = JSON.parse(row.dataset.candidate);
+        showCandidateDetailsModal(candidateData);
+      });
+    });
+
+    if (isUserAdmin) {
+      els.submissionsTable.querySelectorAll('.status-dropdown').forEach(dropdown => {
+        dropdown.addEventListener('change', async (e) => {
+          const candidateId = e.target.dataset.candidateId;
+          const newStatus = e.target.value;
+          const previousStatus = e.target.dataset.currentStatus || 'submitted';
+          try {
+            await apiPatchAuth(`/api/candidates/${candidateId}/status?status=${newStatus}`);
+            e.target.dataset.currentStatus = newStatus;
+            showAlert('ok', `Status updated to ${newStatus}`);
+          } catch (err) {
+            e.target.value = previousStatus;
+            showAlert('error', 'Failed to update status');
+          }
+        });
+      });
+
+      els.submissionsTable.querySelectorAll('.email-vendor-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          const row = e.target.closest('tr');
+          if (!row) return;
+          const candidate = JSON.parse(row.dataset.candidate);
+          showEmailVendorModal(candidate);
+        });
+      });
+
+      els.submissionsTable.querySelectorAll('.vendor-name-link').forEach(link => {
+        link.addEventListener('click', (e) => {
+          e.preventDefault();
+          const vendorData = JSON.parse(e.currentTarget.dataset.vendor);
+          showVendorDetailsModal(vendorData);
+        });
+      });
+    }
+  } catch (e) {
+    els.submissionsTable.innerHTML = '<div class="empty">Failed to load submission history.</div>';
+  }
+}
+
 async function loadOffers() {
   await loadCandidatesByStatus('offer', els.offersTable, 'Offers', 'Candidates with offer status.');
 }
@@ -1756,11 +1985,16 @@ function closeCandidateDetailModal() {
 function showVendorDetailsModal(vendor) {
   // Remove any existing modal first
   closeVendorDetailModal();
+  const summary = vendor.summary || {};
   
   const details = `
     <div style="margin-bottom: 16px;"><strong>Name:</strong> ${vendor.full_name || vendor.name || 'N/A'}</div>
     <div style="margin-bottom: 16px;"><strong>Email:</strong> ${vendor.email || 'N/A'}</div>
     <div style="margin-bottom: 16px;"><strong>ID:</strong> ${vendor.id || 'N/A'}</div>
+    <div style="margin-bottom: 16px;"><strong>Total Profiles Submitted:</strong> ${summary.total_profiles_submitted ?? 'N/A'}</div>
+    <div style="margin-bottom: 16px;"><strong>Submission Days:</strong> ${summary.total_submission_days ?? 'N/A'}</div>
+    <div style="margin-bottom: 16px;"><strong>First Submission:</strong> ${formatSubmissionDateTime(summary.first_submission_at)}</div>
+    <div style="margin-bottom: 16px;"><strong>Latest Submission:</strong> ${formatSubmissionDateTime(summary.last_submission_at)}</div>
   `;
   
   const modal = document.createElement('div');
