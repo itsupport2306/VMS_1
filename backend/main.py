@@ -45,6 +45,7 @@ job_status_tracker_collection = None
 closure_audit_collection = None
 manual_jobs_collection = None
 submission_logs_collection = None
+auth_tokens_collection = None
 fs = None
 
 
@@ -57,6 +58,8 @@ def ensure_mongodb_indexes() -> None:
         ("manual_jobs.created_at", manual_jobs_collection, [("created_at", -1)], {"name": "manual_jobs_created_at_desc_idx"}),
         ("manual_jobs.id", manual_jobs_collection, "id", {"name": "manual_jobs_id_idx", "unique": True}),
         ("manual_jobs.job_id", manual_jobs_collection, "job_id", {"name": "manual_jobs_job_id_idx"}),
+        ("auth_tokens.key", auth_tokens_collection, [("kind", 1), ("key", 1)], {"name": "auth_tokens_kind_key_idx", "unique": True}),
+        ("auth_tokens.expires_at_ttl", auth_tokens_collection, "expires_at", {"name": "auth_tokens_ttl_idx", "expireAfterSeconds": 0}),
     ]
     for label, collection, keys, kwargs in index_specs:
         if collection is None:
@@ -69,7 +72,7 @@ def ensure_mongodb_indexes() -> None:
 
 def init_mongodb():
     """Initialize MongoDB connection"""
-    global mongo_client, db, users_collection, whitelist_collection, candidates_collection, notifications_collection, jobs_collection, job_status_tracker_collection, closure_audit_collection, manual_jobs_collection, submission_logs_collection, fs
+    global mongo_client, db, users_collection, whitelist_collection, candidates_collection, notifications_collection, jobs_collection, job_status_tracker_collection, closure_audit_collection, manual_jobs_collection, submission_logs_collection, auth_tokens_collection, fs
     
     print(f"[MongoDB] Checking configuration...")
     print(f"[MongoDB] MONGODB_URI present: {bool(MONGODB_URI)}")
@@ -93,6 +96,7 @@ def init_mongodb():
         closure_audit_collection = db.closure_audit  # Audit log for detected closures (dry-run + live)
         manual_jobs_collection = db.manual_jobs  # Direct API-ingested jobs
         submission_logs_collection = db.submission_logs  # Immutable audit log for candidate submissions
+        auth_tokens_collection = db.auth_tokens  # Password-reset tokens and login/registration OTPs shared across workers
         
         # Initialize GridFS for file storage
         import gridfs
@@ -226,6 +230,105 @@ _email_otp_tokens = {}
 
 OTP_EXPIRE_MINUTES = int(os.getenv("OTP_EXPIRE_MINUTES", "10"))
 OTP_MAX_ATTEMPTS = int(os.getenv("OTP_MAX_ATTEMPTS", "5"))
+
+_auth_token_lock = Lock()
+
+
+# ---------------------------------------------------------------------------
+# Shared auth-token store.
+#
+# The API runs with multiple uvicorn workers, so a reset token or OTP created by
+# one worker used to be invisible to every other worker (and to any worker
+# started after a redeploy). That is what produced "Invalid Token" / "Link
+# Expired" on perfectly good reset links. Tokens now live in MongoDB when it is
+# available, with the previous in-process dicts kept as a single-worker fallback.
+# ---------------------------------------------------------------------------
+
+def _auth_tokens_available() -> bool:
+    return bool(mongodb_enabled) and auth_tokens_collection is not None
+
+
+def _memory_store(kind: str) -> dict:
+    return _password_reset_tokens if kind == "reset" else _email_otp_tokens
+
+
+def store_auth_token(kind: str, key: str, payload: dict) -> None:
+    """Persist a reset token / OTP so every worker can validate it."""
+    expires = payload.get("expires")
+    if _auth_tokens_available():
+        try:
+            doc = dict(payload)
+            # `expires` is naive local time and stays authoritative for validation.
+            # `expires_at` is the same instant expressed in UTC purely so the TTL
+            # index sweeps the document only once it is genuinely dead.
+            doc.update({
+                "kind": kind,
+                "key": key,
+                "expires_at": datetime.utcnow() + (expires - datetime.now()),
+            })
+            auth_tokens_collection.replace_one({"kind": kind, "key": key}, doc, upsert=True)
+            return
+        except Exception as e:
+            print(f"[Auth] Could not persist {kind} token, using in-memory store: {e}")
+    with _auth_token_lock:
+        _memory_store(kind)[key] = payload
+
+
+def get_auth_token(kind: str, key: str) -> Optional[dict]:
+    """Fetch a token payload, or None when it is missing or already expired."""
+    if _auth_tokens_available():
+        try:
+            doc = auth_tokens_collection.find_one({"kind": kind, "key": key})
+            if not doc:
+                return None
+            doc.pop("_id", None)
+            doc.pop("kind", None)
+            doc.pop("key", None)
+            doc.pop("expires_at", None)
+            return doc
+        except Exception as e:
+            print(f"[Auth] Could not read {kind} token from MongoDB: {e}")
+    with _auth_token_lock:
+        return _memory_store(kind).get(key)
+
+
+def update_auth_token(kind: str, key: str, updates: dict) -> None:
+    """Apply field updates (attempt counters, used flag) to a stored token."""
+    if _auth_tokens_available():
+        try:
+            auth_tokens_collection.update_one({"kind": kind, "key": key}, {"$set": updates})
+            return
+        except Exception as e:
+            print(f"[Auth] Could not update {kind} token: {e}")
+    with _auth_token_lock:
+        existing = _memory_store(kind).get(key)
+        if existing is not None:
+            existing.update(updates)
+
+
+def delete_auth_token(kind: str, key: str) -> None:
+    if _auth_tokens_available():
+        try:
+            auth_tokens_collection.delete_one({"kind": kind, "key": key})
+            return
+        except Exception as e:
+            print(f"[Auth] Could not delete {kind} token: {e}")
+    with _auth_token_lock:
+        _memory_store(kind).pop(key, None)
+
+
+def bump_auth_token_attempts(kind: str, key: str, current_attempts: int) -> None:
+    """Record one more failed verification attempt."""
+    if _auth_tokens_available():
+        try:
+            auth_tokens_collection.update_one({"kind": kind, "key": key}, {"$inc": {"attempts": 1}})
+            return
+        except Exception as e:
+            print(f"[Auth] Could not increment attempts for {kind} token: {e}")
+    with _auth_token_lock:
+        existing = _memory_store(kind).get(key)
+        if existing is not None:
+            existing["attempts"] = current_attempts + 1
 
 
 def _hash_otp(otp: str) -> str:
@@ -363,10 +466,12 @@ def send_registration_otp_email(email: str, otp: str) -> bool:
 
 
 def cleanup_expired_otps():
+    """Drop expired OTPs. MongoDB expires them via a TTL index; this covers the fallback store."""
     now = datetime.now()
-    expired = [email for email, data in _email_otp_tokens.items() if data["expires"] < now]
-    for email in expired:
-        del _email_otp_tokens[email]
+    with _auth_token_lock:
+        expired = [email for email, data in _email_otp_tokens.items() if data["expires"] < now]
+        for email in expired:
+            del _email_otp_tokens[email]
     if expired:
         print(f"[Auth] Cleaned up {len(expired)} expired OTPs")
 
@@ -395,11 +500,12 @@ def send_password_reset_email(email: str, reset_token: str) -> bool:
     return sent
 
 def cleanup_expired_tokens():
-    """Remove expired password reset tokens"""
+    """Remove expired password reset tokens from the in-process fallback store."""
     now = datetime.now()
-    expired = [token for token, data in _password_reset_tokens.items() if data['expires'] < now]
-    for token in expired:
-        del _password_reset_tokens[token]
+    with _auth_token_lock:
+        expired = [token for token, data in _password_reset_tokens.items() if data['expires'] < now]
+        for token in expired:
+            del _password_reset_tokens[token]
     if expired:
         print(f"[Auth] Cleaned up {len(expired)} expired reset tokens")
 
@@ -696,9 +802,15 @@ def notify_users_about_job_posted(job, source: str = "direct_api") -> int:
     if not JOB_POSTING_NOTIFICATIONS_ENABLED:
         print(f"[JobPosted] Posting notifications disabled - skipping {job.id}")
         return 0
-    if not WHITELISTED_USERS:
-        load_whitelisted_users()
-    recipients = [u.lower() for u in WHITELISTED_USERS if u.lower() != ADMIN_EMAIL.lower()]
+    # Always re-read the shared whitelist. This worker's copy is per-process, so
+    # users who registered against another worker were silently left out of every
+    # new-job notification until the next restart.
+    recipients = sorted(
+        {u.lower() for u in get_whitelisted_emails(force_refresh=True) if u.lower() != ADMIN_EMAIL.lower()}
+    )
+    if not recipients:
+        print(f"[JobPosted] No notification recipients for job {job.id}")
+        return 0
     sent_count = 0
     for user_email in recipients:
         existing = notifications_collection.find_one({
@@ -899,9 +1011,9 @@ def detect_and_notify_closures(current_status_map: dict, fetch_complete: bool):
                 })
             return
 
-        if not WHITELISTED_USERS:
-            load_whitelisted_users()
-        recipients = [u.lower() for u in WHITELISTED_USERS if u.lower() != ADMIN_EMAIL.lower()]
+        recipients = sorted(
+            {u.lower() for u in get_whitelisted_emails(force_refresh=True) if u.lower() != ADMIN_EMAIL.lower()}
+        )
 
         for t in new_postings:
             job_id = t["job_id"]
@@ -1053,15 +1165,47 @@ def load_whitelisted_users():
     except Exception as e:
         print(f"[Auth] Error loading Users file: {e}")
 
+WHITELIST_CACHE_SECONDS = int(os.getenv("WHITELIST_CACHE_SECONDS", "60"))
+_whitelist_loaded_at: Optional[datetime] = None
+
+
+def get_whitelisted_emails(force_refresh: bool = False) -> set:
+    """Return the whitelist, re-reading MongoDB when the in-process copy is stale.
+
+    Each worker keeps its own copy, so an email whitelisted by another worker
+    (registration, admin add) was invisible here until restart - which blocked
+    logins and suppressed job notification emails for brand-new accounts.
+    """
+    global _whitelist_loaded_at
+    if force_refresh or _whitelist_loaded_at is None or (
+        datetime.now() - _whitelist_loaded_at
+    ) >= timedelta(seconds=WHITELIST_CACHE_SECONDS):
+        load_whitelisted_users()
+        _whitelist_loaded_at = datetime.now()
+    return WHITELISTED_USERS
+
+
+def is_whitelisted(email: str) -> bool:
+    email_lower = (email or "").strip().lower()
+    if email_lower in WHITELISTED_USERS:
+        return True
+    # Miss on the local copy: confirm against the shared store before rejecting.
+    return email_lower in get_whitelisted_emails(force_refresh=True)
+
+
 def save_whitelisted_users():
     """Save whitelisted users to MongoDB or fallback to Users file"""
     # Try MongoDB first
     if mongodb_enabled and whitelist_collection is not None:
         try:
-            # Clear and re-insert all emails
-            whitelist_collection.delete_many({})
+            # Upsert instead of clear-and-reinsert. With several workers, a worker
+            # holding a stale set used to delete every whitelist entry it had not
+            # seen, silently cutting newly registered users off from portal access
+            # and from job notification emails.
             for email in WHITELISTED_USERS:
-                whitelist_collection.insert_one({"email": email.lower()})
+                whitelist_collection.update_one(
+                    {"email": email.lower()}, {"$set": {"email": email.lower()}}, upsert=True
+                )
             print(f"[Auth] Saved {len(WHITELISTED_USERS)} whitelisted users to MongoDB")
             return True
         except Exception as e:
@@ -1194,7 +1338,8 @@ def load_users_from_json(force_refresh: bool = False):
     if not force_refresh and _users_cache and _cache_is_fresh(_users_cache_time, USERS_CACHE_SECONDS):
         age = int((datetime.now() - _users_cache_time).total_seconds())
         print(f"[Auth] Using cached users ({len(_users_cache)} users, cached {age}s ago)")
-        return _users_cache
+        with _users_cache_lock:
+            return dict(_users_cache)
 
     # Try MongoDB first
     if mongodb_enabled and users_collection is not None:
@@ -1207,7 +1352,7 @@ def load_users_from_json(force_refresh: bool = False):
             with _users_cache_lock:
                 _users_cache = users
                 _users_cache_time = datetime.now()
-            return users
+            return dict(users)
         except Exception as e:
             print(f"[Auth] Error loading users from MongoDB: {e}, falling back to JSON")
     
@@ -1227,7 +1372,7 @@ def load_users_from_json(force_refresh: bool = False):
             with _users_cache_lock:
                 _users_cache = users
                 _users_cache_time = datetime.now()
-            return users
+            return dict(users)
         except json.JSONDecodeError:
             try:
                 with open(USERS_JSON_FILE, "r") as f:
@@ -1252,7 +1397,12 @@ def load_user_by_email(email: str, prefer_cache: bool = True) -> Optional[dict]:
         return None
 
     if prefer_cache and _users_cache and _cache_is_fresh(_users_cache_time, USERS_CACHE_SECONDS):
-        return _users_cache.get(email_lower)
+        cached = _users_cache.get(email_lower)
+        if cached is not None:
+            return cached
+        # A cache miss is not proof the account is absent - it may have been
+        # created by another worker after this cache was built. Fall through to
+        # the shared store rather than reporting the user as unknown.
 
     if mongodb_enabled and users_collection is not None:
         try:
@@ -1269,10 +1419,12 @@ def load_user_by_email(email: str, prefer_cache: bool = True) -> Optional[dict]:
                 return users.get(email_lower)
             user = _normalize_user_doc(doc)
             with _users_cache_lock:
-                if not _cache_is_fresh(_users_cache_time, USERS_CACHE_SECONDS):
-                    _users_cache = {}
-                    _users_cache_time = datetime.now()
-                _users_cache[email_lower] = user
+                # Only ever add to a cache that is already fresh and complete.
+                # Seeding a brand-new cache from a single lookup used to mark a
+                # one-user dict as "fresh", after which every other user looked
+                # unknown and valid logins failed with 401.
+                if _cache_is_fresh(_users_cache_time, USERS_CACHE_SECONDS):
+                    _users_cache[email_lower] = user
             return user
         except Exception as e:
             print(f"[Auth] Error loading user {email_lower} from MongoDB: {e}, falling back to cache/JSON")
@@ -1322,6 +1474,89 @@ def save_users_to_json(users):
         print(f"[Auth] Error saving users JSON: {e}")
         return False
 
+def save_user_record(user_data: dict) -> bool:
+    """Persist exactly one user.
+
+    Writing a single account through save_users_to_json() meant rewriting the
+    whole user set from whatever the caller happened to be holding, which could
+    drop accounts created by another worker. This touches only one record.
+    """
+    user = _normalize_user_record(user_data.get("email", ""), user_data)
+    email_lower = user["email"]
+    if not email_lower:
+        return False
+
+    if mongodb_enabled and users_collection is not None:
+        try:
+            users_collection.update_one(
+                {"email": email_lower},
+                {"$set": {
+                    "id": user["id"],
+                    "email": user["email"],
+                    "full_name": user["full_name"],
+                    "hashed_password": user["hashed_password"],
+                    "is_active": user["is_active"],
+                    "created_at": user["created_at"],
+                }},
+                upsert=True,
+            )
+            clear_users_cache()
+            return True
+        except Exception as e:
+            print(f"[Auth] Error saving user {email_lower} to MongoDB: {e}, falling back to JSON")
+
+    # JSON fallback: merge into whatever is on disk instead of overwriting it.
+    try:
+        existing = {}
+        if os.path.exists(USERS_JSON_FILE):
+            with open(USERS_JSON_FILE, "r") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                existing = loaded
+        existing[email_lower] = user
+        os.makedirs(os.path.dirname(USERS_JSON_FILE), exist_ok=True)
+        with open(USERS_JSON_FILE, "w") as f:
+            json.dump(existing, f, indent=2)
+        clear_users_cache()
+        return True
+    except Exception as e:
+        print(f"[Auth] Error saving user {email_lower} to JSON: {e}")
+        return False
+
+
+def add_whitelisted_email(email: str) -> bool:
+    """Whitelist one email without rewriting the whole whitelist collection."""
+    global WHITELISTED_USERS
+    email_lower = (email or "").strip().lower()
+    if not email_lower:
+        return False
+
+    WHITELISTED_USERS.add(email_lower)
+    if mongodb_enabled and whitelist_collection is not None:
+        try:
+            whitelist_collection.update_one(
+                {"email": email_lower}, {"$set": {"email": email_lower}}, upsert=True
+            )
+            return True
+        except Exception as e:
+            print(f"[Auth] Error whitelisting {email_lower} in MongoDB: {e}, falling back to file")
+    return save_whitelisted_users()
+
+
+def remove_whitelisted_email(email: str) -> bool:
+    """Remove one email from the whitelist without rewriting the collection."""
+    global WHITELISTED_USERS
+    email_lower = (email or "").strip().lower()
+    WHITELISTED_USERS.discard(email_lower)
+    if mongodb_enabled and whitelist_collection is not None:
+        try:
+            whitelist_collection.delete_many({"email": email_lower})
+            return True
+        except Exception as e:
+            print(f"[Auth] Error removing {email_lower} from MongoDB whitelist: {e}, falling back to file")
+    return save_whitelisted_users()
+
+
 # Initialize users cache
 _users = load_users_from_json()
 
@@ -1338,7 +1573,7 @@ def seed_admin_user():
         if existing_user.get("is_active") == True:
             print(f"[Seed] Fixing is_active field for admin user...")
             existing_user["is_active"] = "true"
-            save_users_to_json(_users)
+            save_user_record(existing_user)
         print(f"[Seed] Admin user {admin_email} already exists")
         return
     
@@ -1356,12 +1591,10 @@ def seed_admin_user():
     }
     
     _users[admin_email.lower()] = admin_user
-    save_users_to_json(_users)
-    
+    save_user_record(admin_user)
+
     # Also add to whitelist
-    global WHITELISTED_USERS
-    WHITELISTED_USERS.add(admin_email.lower())
-    save_whitelisted_users()
+    add_whitelisted_email(admin_email.lower())
     
     print(f"[Seed] Created admin user: {admin_email} with password: {default_password}")
     print(f"[Seed] IMPORTANT: Please change this password after first login!")
@@ -1680,7 +1913,7 @@ async def register(user_data: UserCreate, request: Request):
 
     otp = f"{secrets.randbelow(1000000):06d}"
     full_name = (user_data.full_name or email.split("@")[0]).strip() or email_lower
-    _email_otp_tokens[email_lower] = {
+    store_auth_token("otp", email_lower, {
         "otp_hash": _hash_otp(otp),
         "expires": datetime.now() + timedelta(minutes=OTP_EXPIRE_MINUTES),
         "attempts": 0,
@@ -1695,11 +1928,11 @@ async def register(user_data: UserCreate, request: Request):
         },
         "user_agent": request.headers.get("user-agent", ""),
         "ip_address": get_client_ip(request),
-    }
+    })
 
     email_sent = await asyncio.to_thread(send_registration_otp_email, email_lower, otp)
     if not email_sent:
-        _email_otp_tokens.pop(email_lower, None)
+        delete_auth_token("otp", email_lower)
         raise HTTPException(
             status_code=503,
             detail="We could not send the verification code. Please contact support.",
@@ -1715,41 +1948,37 @@ async def verify_registration_otp(request_data: OtpVerify):
 
     email_lower = request_data.email.lower().strip()
     otp = (request_data.otp or "").strip()
-    token_data = _email_otp_tokens.get(email_lower)
+    token_data = get_auth_token("otp", email_lower)
 
     if not token_data or token_data.get("purpose") != "registration":
         raise HTTPException(status_code=400, detail="Invalid or expired verification code")
     if token_data["expires"] < datetime.now():
-        del _email_otp_tokens[email_lower]
+        delete_auth_token("otp", email_lower)
         raise HTTPException(status_code=400, detail="Verification code has expired")
-    if token_data["attempts"] >= OTP_MAX_ATTEMPTS:
-        del _email_otp_tokens[email_lower]
+    if token_data.get("attempts", 0) >= OTP_MAX_ATTEMPTS:
+        delete_auth_token("otp", email_lower)
         raise HTTPException(status_code=429, detail="Too many failed attempts. Please sign up again.")
 
-    token_data["attempts"] += 1
     if _hash_otp(otp) != token_data["otp_hash"]:
+        bump_auth_token_attempts("otp", email_lower, token_data.get("attempts", 0))
         raise HTTPException(status_code=400, detail="Invalid verification code")
 
     pending_user = token_data.get("pending_user")
     if not pending_user:
-        del _email_otp_tokens[email_lower]
+        delete_auth_token("otp", email_lower)
         raise HTTPException(status_code=400, detail="Registration session has expired")
 
-    users = load_users_from_json()
-    existing = users.get(email_lower)
+    existing = await asyncio.to_thread(load_user_by_email, email_lower, False)
     if existing and is_user_active(existing):
-        del _email_otp_tokens[email_lower]
+        delete_auth_token("otp", email_lower)
         raise HTTPException(status_code=400, detail="Account already exists. Please log in.")
 
-    users[email_lower] = pending_user
-    if not save_users_to_json(users):
+    if not save_user_record(pending_user):
         raise HTTPException(status_code=500, detail="Could not complete registration")
 
-    global WHITELISTED_USERS, _users_cache
-    WHITELISTED_USERS.add(email_lower)
-    save_whitelisted_users()
-    _users_cache = load_users_from_json(force_refresh=True)
-    del _email_otp_tokens[email_lower]
+    add_whitelisted_email(email_lower)
+    clear_users_cache()
+    delete_auth_token("otp", email_lower)
 
     return {"message": "Account verified. You can now log in."}
 
@@ -1759,25 +1988,23 @@ def get_or_create_otp_user(email: str) -> dict:
 
     email = (email or "").strip()
     email_lower = email.lower()
-    _users_cache = load_users_from_json(force_refresh=True)
-    user = _users_cache.get(email_lower)
+    user = load_user_by_email(email_lower, prefer_cache=False)
 
     if not user:
-        if email_lower not in WHITELISTED_USERS:
+        if not is_whitelisted(email_lower):
             raise HTTPException(status_code=401, detail="Email is not authorized for portal access")
 
         print(f"[Auth] Auto-creating OTP user: {email}")
         user_id = str(uuid4())
         user = {
             "id": user_id,
-            "email": email,
+            "email": email_lower,
             "full_name": email.split('@')[0],
             "hashed_password": get_password_hash(secrets.token_urlsafe(32)),
             "is_active": "true",
             "created_at": datetime.now().isoformat()
         }
-        _users_cache[email_lower] = user
-        save_users_to_json(_users_cache)
+        save_user_record(user)
 
     if not is_user_active(user):
         raise HTTPException(status_code=400, detail="Inactive user")
@@ -1795,21 +2022,22 @@ async def request_login_otp(request_data: OtpRequest, request: Request):
         raise HTTPException(status_code=400, detail="Valid email is required")
 
     # Do not create a user until the OTP is verified, but require whitelist before sending.
-    if email_lower not in WHITELISTED_USERS:
+    if not is_whitelisted(email_lower):
         raise HTTPException(status_code=401, detail="Email is not authorized for portal access")
 
     otp = f"{secrets.randbelow(1000000):06d}"
-    _email_otp_tokens[email_lower] = {
+    store_auth_token("otp", email_lower, {
         "otp_hash": _hash_otp(otp),
         "expires": datetime.now() + timedelta(minutes=OTP_EXPIRE_MINUTES),
         "attempts": 0,
+        "purpose": "login",
         "user_agent": request.headers.get("user-agent", ""),
         "ip_address": get_client_ip(request),
-    }
+    })
 
     email_sent = await asyncio.to_thread(send_login_otp_email, email_lower, otp)
     if not email_sent:
-        _email_otp_tokens.pop(email_lower, None)
+        delete_auth_token("otp", email_lower)
         raise HTTPException(
             status_code=503,
             detail="We could not send the verification code. Please contact support.",
@@ -1825,23 +2053,23 @@ async def verify_login_otp(request_data: OtpVerify):
 
     email_lower = request_data.email.lower().strip()
     otp = (request_data.otp or "").strip()
-    token_data = _email_otp_tokens.get(email_lower)
+    token_data = get_auth_token("otp", email_lower)
 
-    if not token_data:
+    if not token_data or token_data.get("purpose") == "registration":
         raise HTTPException(status_code=400, detail="Invalid or expired verification code")
     if token_data["expires"] < datetime.now():
-        del _email_otp_tokens[email_lower]
+        delete_auth_token("otp", email_lower)
         raise HTTPException(status_code=400, detail="Verification code has expired")
-    if token_data["attempts"] >= OTP_MAX_ATTEMPTS:
-        del _email_otp_tokens[email_lower]
+    if token_data.get("attempts", 0) >= OTP_MAX_ATTEMPTS:
+        delete_auth_token("otp", email_lower)
         raise HTTPException(status_code=429, detail="Too many failed attempts. Request a new code.")
 
-    token_data["attempts"] += 1
     if _hash_otp(otp) != token_data["otp_hash"]:
+        bump_auth_token_attempts("otp", email_lower, token_data.get("attempts", 0))
         raise HTTPException(status_code=400, detail="Invalid verification code")
 
     user = get_or_create_otp_user(email_lower)
-    del _email_otp_tokens[email_lower]
+    delete_auth_token("otp", email_lower)
 
     access_token = create_access_token(
         data={"sub": user["email"]},
@@ -1870,13 +2098,17 @@ async def login(user_data: UserLogin):
     user = await asyncio.to_thread(load_user_by_email, email_lower)
 
     if not user:
-        if email_lower not in WHITELISTED_USERS:
+        if not is_whitelisted(email_lower):
             raise HTTPException(status_code=401, detail="Incorrect email or password")
 
+        # Re-check the shared store, bypassing this worker's cache entirely,
+        # before concluding the account does not exist.
+        user = await asyncio.to_thread(load_user_by_email, email_lower, False)
+
+    if not user:
         # Restore legacy behavior: whitelisted users without a stored password
         # can be provisioned again on first password login.
         print(f"[Auth] Recreating missing password user for whitelisted email: {email_lower}")
-        users = load_users_from_json(force_refresh=True)
         user = {
             "id": str(uuid4()),
             "email": email_lower,
@@ -1885,10 +2117,8 @@ async def login(user_data: UserLogin):
             "is_active": "true",
             "created_at": datetime.now().isoformat(),
         }
-        users[email_lower] = user
-        if not save_users_to_json(users):
+        if not await asyncio.to_thread(save_user_record, user):
             raise HTTPException(status_code=500, detail="Could not restore account access")
-        _users_cache = load_users_from_json(force_refresh=True)
 
     if not is_user_active(user):
         raise HTTPException(status_code=400, detail="Inactive user")
@@ -1936,27 +2166,26 @@ async def forgot_password(request: ForgotPasswordRequest):
     if not email_lower or "@" not in email_lower:
         raise HTTPException(status_code=400, detail="Valid email is required")
     
-    # Check if email is whitelisted
-    if email_lower not in WHITELISTED_USERS:
-        # Don't reveal if email exists for security
-        return {"message": "If the email is registered, a password reset link has been sent."}
-    
-    users = load_users_from_json()
-    user = users.get(email_lower)
+    # Read the shared store directly: a stale per-worker cache must never make a
+    # real account look unregistered.
+    user = await asyncio.to_thread(load_user_by_email, email_lower, False)
 
-    # Check if user exists (has logged in before)
-    if not user or user.get("is_active") != "true":
+    # A registered, active account may reset its password. Anything else gets the
+    # same non-revealing response.
+    if not user or not is_user_active(user):
+        if not is_whitelisted(email_lower):
+            print(f"[Auth] Password reset requested for unknown email {email_lower}")
         return {"message": "If the email is registered, a password reset link has been sent."}
-    
+
     # Generate reset token
     reset_token = str(uuid4())
-    
-    # Store token with expiration (1 hour)
-    _password_reset_tokens[reset_token] = {
+
+    # Store token with expiration (1 hour), shared across workers
+    store_auth_token("reset", reset_token, {
         "email": email_lower,
         "expires": datetime.now() + timedelta(hours=1),
-        "used": False
-    }
+        "used": False,
+    })
     
     # Send email
     email_sent = await asyncio.to_thread(send_password_reset_email, email_lower, reset_token)
@@ -1965,7 +2194,7 @@ async def forgot_password(request: ForgotPasswordRequest):
         print(f"[Auth] Password reset email sent to {email_lower}")
         return {"message": "Password reset email sent. Please check your inbox."}
     else:
-        _password_reset_tokens.pop(reset_token, None)
+        delete_auth_token("reset", reset_token)
         print(f"[Auth] Password reset email failed for {email_lower}")
         raise HTTPException(
             status_code=503,
@@ -1980,41 +2209,38 @@ async def reset_password_with_token(data: ResetPasswordWithToken):
     # Clean up expired tokens
     cleanup_expired_tokens()
     
-    token = data.token
-    
-    # Validate token
-    if token not in _password_reset_tokens:
+    token = (data.token or "").strip()
+
+    # Validate token against the shared store so it resolves on any worker.
+    token_data = get_auth_token("reset", token) if token else None
+    if not token_data:
         raise HTTPException(status_code=400, detail="Invalid or expired reset token")
-    
-    token_data = _password_reset_tokens[token]
-    
-    if token_data["used"]:
+
+    if token_data.get("used"):
         raise HTTPException(status_code=400, detail="Reset token has already been used")
-    
+
     if token_data["expires"] < datetime.now():
+        delete_auth_token("reset", token)
         raise HTTPException(status_code=400, detail="Reset token has expired")
-    
+
     email_lower = token_data["email"]
-    
+
     # Validate password
     if len(data.password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
-    
-    users = load_users_from_json()
-    if email_lower not in users:
-        _password_reset_tokens.pop(token, None)
+
+    user = await asyncio.to_thread(load_user_by_email, email_lower, False)
+    if not user:
+        delete_auth_token("reset", token)
         raise HTTPException(status_code=400, detail="Invalid or expired reset token")
 
-    # Update password
-    hashed_password = get_password_hash(data.password)
-
-    users[email_lower]["hashed_password"] = hashed_password
-    if not save_users_to_json(users):
+    # Update password on that one record only
+    user["hashed_password"] = get_password_hash(data.password)
+    if not await asyncio.to_thread(save_user_record, user):
         raise HTTPException(status_code=500, detail="Could not update password")
-    _users_cache = load_users_from_json()
-    
-    # Mark token as used
-    token_data["used"] = True
+
+    # Mark token as used so the link cannot be replayed
+    update_auth_token("reset", token, {"used": True})
     
     print(f"[Auth] Password reset successful for {email_lower}")
     return {"message": "Password reset successfully. Please login with your new password."}
@@ -2026,9 +2252,10 @@ async def get_whitelisted_users(current_user: UserDB = Depends(get_current_user)
     if not is_admin:
         raise HTTPException(status_code=403, detail="Only admin can manage users")
     
+    emails = get_whitelisted_emails(force_refresh=True)
     return {
-        "users": sorted(list(WHITELISTED_USERS)),
-        "count": len(WHITELISTED_USERS)
+        "users": sorted(emails),
+        "count": len(emails)
     }
 
 @app.post("/api/admin/users")
@@ -2050,14 +2277,11 @@ async def add_whitelisted_user(
         raise HTTPException(status_code=400, detail="Invalid email format")
     
     # Check if already exists
-    if email_lower in WHITELISTED_USERS:
+    if email_lower in get_whitelisted_emails(force_refresh=True):
         raise HTTPException(status_code=400, detail="User already whitelisted")
     
     # Add to whitelist
-    WHITELISTED_USERS.add(email_lower)
-    
-    # Save to file
-    if save_whitelisted_users():
+    if add_whitelisted_email(email_lower):
         return {"message": f"User {email} added to whitelist", "email": email_lower}
     else:
         raise HTTPException(status_code=500, detail="Failed to save users file")
@@ -2081,14 +2305,11 @@ async def remove_whitelisted_user(
         raise HTTPException(status_code=400, detail="Cannot remove admin user")
     
     # Check if exists
-    if email_lower not in WHITELISTED_USERS:
+    if email_lower not in get_whitelisted_emails(force_refresh=True):
         raise HTTPException(status_code=404, detail="User not found in whitelist")
     
     # Remove from whitelist
-    WHITELISTED_USERS.remove(email_lower)
-    
-    # Save to file
-    if save_whitelisted_users():
+    if remove_whitelisted_email(email_lower):
         return {"message": f"User {email} removed from whitelist", "email": email_lower}
     else:
         raise HTTPException(status_code=500, detail="Failed to save users file")

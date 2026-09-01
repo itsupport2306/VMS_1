@@ -14,7 +14,7 @@ import pandas as pd
 
 BASE_URL = "https://api-nexus.laboredge.com/api/leap-service/v1/unsecured"
 ORGANIZATION_ID = 491
-OFFERING_ID = "ADVANCE_PRACTICE"
+OFFERING_ID = "NURSING"
 LIST_URL = f"{BASE_URL}/jobboard/organization/{ORGANIZATION_ID}?offeringId={OFFERING_ID}"
 DETAIL_URL_TEMPLATE = (
     f"{BASE_URL}/jobboard/organization/{ORGANIZATION_ID}/job/{{job_id}}"
