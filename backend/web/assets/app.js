@@ -298,7 +298,8 @@ function logout() {
   authMode = 'login';
   localStorage.removeItem('vms_token');
   localStorage.removeItem('vms_user');
-  
+  clearCachedJobs();
+
   // Clear search and filter state to prevent leaking to next user
   if (els.searchInput) els.searchInput.value = '';
   if (els.statusFilter) els.statusFilter.value = '';
@@ -768,8 +769,12 @@ async function apiGetAuthUncached(path) {
     headers['Authorization'] = `Bearer ${authToken}`;
   }
   
-  const res = await fetch(`${API_BASE}${path}`, { headers });
-  
+  // index.html starts /api/jobs before this script loads; use that response once.
+  const prefetched = path === '/api/jobs' ? window.__jobsPrefetch : null;
+  if (prefetched) window.__jobsPrefetch = null;
+  let res = prefetched ? await prefetched.catch(() => null) : null;
+  if (!res) res = await fetch(`${API_BASE}${path}`, { headers });
+
   if (res.status === 401) {
     logout();
     throw new Error('Session expired. Please login again.');
@@ -1426,27 +1431,77 @@ function getJobsPollDelay(pollCount) {
   return 12000;
 }
 
+// The last job list per user, so a reload or a new tab shows jobs at once while
+// /api/jobs (browser -> Cloudflare -> origin, several hundred ms in production)
+// revalidates it. Cleared on logout.
+const JOBS_CACHE_KEY_PREFIX = 'vms_jobs_cache:';
+const JOBS_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+function jobsCacheKey() {
+  return currentUser && currentUser.email ? JOBS_CACHE_KEY_PREFIX + currentUser.email.toLowerCase() : null;
+}
+
+function readCachedJobs() {
+  const key = jobsCacheKey();
+  if (!key) return null;
+  try {
+    const cached = JSON.parse(localStorage.getItem(key) || 'null');
+    if (cached && Array.isArray(cached.jobs) && Date.now() - cached.at < JOBS_CACHE_MAX_AGE_MS) return cached.jobs;
+  } catch { /* storage unavailable or corrupt: fall back to the network */ }
+  return null;
+}
+
+function writeCachedJobs(jobs) {
+  const key = jobsCacheKey();
+  if (!key) return;
+  try {
+    localStorage.setItem(key, JSON.stringify({ at: Date.now(), jobs }));
+  } catch { /* quota or private mode: caching is optional */ }
+}
+
+function clearCachedJobs() {
+  try {
+    Object.keys(localStorage)
+      .filter(key => key.startsWith(JOBS_CACHE_KEY_PREFIX))
+      .forEach(key => localStorage.removeItem(key));
+  } catch { /* ignore */ }
+}
+
 async function loadJobs() {
-  els.jobsGrid.innerHTML = '<div class="loading-jobs">Loading jobs...<br><small>Please wait...</small></div>';
-  els.jobsEmpty.hidden = true;
-  
+  // First load of this page: paint the cached list immediately, if there is one.
+  const cachedJobs = allJobs.length ? null : readCachedJobs();
+  if (cachedJobs && cachedJobs.length) {
+    allJobs = cachedJobs;
+    updateJobFilterOptions();
+    renderJobs();
+  } else {
+    els.jobsGrid.innerHTML = '<div class="loading-jobs">Loading jobs...<br><small>Please wait...</small></div>';
+    els.jobsEmpty.hidden = true;
+  }
+
   // Reset infinite scroll state
   isLoadingMore = false;
   nextStartPage = 26;
-  
+
   // Clear any existing poll
   clearJobsPolling();
-  
+
   try {
     // Fetch jobs (returns immediately with cached data, background fetch continues)
     const data = await apiGetAuth('/api/jobs');
-    allJobs = data.jobs || [];
+    const jobs = data.jobs || [];
+    // Re-render only if the cached list was stale, so the view doesn't jump.
+    const unchanged = cachedJobs && JSON.stringify(jobs) === JSON.stringify(cachedJobs);
+    allJobs = jobs;
+    writeCachedJobs(jobs);
     fullDescriptionCache.clear();
     hasMoreJobs = data.has_more || false;
     nextStartPage = data.next_start_page || nextStartPage;
     console.log(`[Jobs] Loaded ${allJobs.length} jobs. Has more: ${hasMoreJobs}`);
-    updateJobFilterOptions();
-    renderJobs();
+    if (!unchanged) {
+      updateJobFilterOptions();
+      renderJobs();
+    }
     
     // Poll only while the backend says a refresh is actively running.
     if (data.is_refreshing) {
@@ -2604,8 +2659,10 @@ document.addEventListener('DOMContentLoaded', () => {
     // Already logged in
     setView(initialViewFromUrl());
     setStatus('warn', 'CEIPAL disabled');
-    startNotificationPolling();
+    // Jobs first: notifications used to be requested ahead of them and compete
+    // for the same connection and server threads.
     await loadJobs();
+    startNotificationPolling();
   } else {
     // Not logged in - show auth view
     setView('auth');

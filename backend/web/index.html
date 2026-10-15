@@ -4,6 +4,17 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>VMS - Vendor Management System</title>
+  <script>
+    // Start the job list request now, in parallel with app.js, instead of after
+    // it has downloaded and run. Placed before the stylesheet: an inline script
+    // after it would wait for the CSS to load. app.js picks the response up in apiGetAuth.
+    (function () {
+      try {
+        var token = localStorage.getItem('vms_token');
+        if (token) window.__jobsPrefetch = fetch('/api/jobs', { headers: { Authorization: 'Bearer ' + token } });
+      } catch (e) { /* storage blocked: app.js fetches normally */ }
+    })();
+  </script>
   <link rel="stylesheet" href="/assets/app.css" />
 </head>
 <body>

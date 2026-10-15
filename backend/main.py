@@ -135,6 +135,10 @@ def init_mongodb():
             MONGODB_URI,
             server_api=ServerApi('1'),
             maxPoolSize=int(os.getenv("MONGODB_MAX_POOL_SIZE", "20")),
+            # Each new connection to a remote cluster costs several round trips
+            # (TCP, TLS, auth), and pymongo opens at most two at a time, so a
+            # burst of tabs waited on connection setup. Keep some open and ready.
+            minPoolSize=int(os.getenv("MONGODB_MIN_POOL_SIZE", "10")),
             serverSelectionTimeoutMS=int(os.getenv("MONGODB_SERVER_SELECTION_TIMEOUT_MS", "10000")),
             # Bound the damage from a slow or hung cluster: without these a stuck
             # socket pins one of the 40 worker threads indefinitely.
@@ -1857,6 +1861,19 @@ _manual_jobs_rebuild_lock = Lock()
 _jobs_response_cache: Dict[str, Dict[str, Any]] = {}
 _jobs_response_cache_lock = Lock()
 _jobs_response_generation = 0
+# Last payload built per role. Never cleared: while the background refresher
+# (jobs_refresh_loop) rebuilds after a change, requests keep getting this one
+# instead of waiting ~0.5-1 s for MongoDB round trips to the remote cluster.
+_jobs_response_last_good: Dict[str, Dict[str, Any]] = {}
+_jobs_refresh_loop_ref: Optional[asyncio.AbstractEventLoop] = None
+_jobs_refresh_wakeup: Optional[asyncio.Event] = None
+
+
+def wake_jobs_refresher() -> None:
+    """Ask the background refresher to rebuild now. Safe to call from any thread."""
+    loop, event = _jobs_refresh_loop_ref, _jobs_refresh_wakeup
+    if loop is not None and event is not None and not loop.is_closed():
+        loop.call_soon_threadsafe(event.set)
 
 
 def clear_jobs_response_cache() -> None:
@@ -1864,6 +1881,7 @@ def clear_jobs_response_cache() -> None:
     with _jobs_response_cache_lock:
         _jobs_response_cache.clear()
         _jobs_response_generation += 1
+    wake_jobs_refresher()
 
 
 def _cache_is_fresh(cache_time: Optional[datetime], ttl_seconds: int) -> bool:
@@ -2360,7 +2378,14 @@ async def startup_event():
         asyncio.create_task(scheduled_job_fetch())
     else:
         print("[Startup] Ceipal integration disabled; background fetch skipped")
+    # asyncio.to_thread (auth lookups, job payloads) defaults to cpu_count + 4
+    # threads: only 5 on the 1-vCPU production instance. That work is mostly
+    # waiting on MongoDB, so a burst of tabs queued behind five threads.
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=int(os.getenv("ASYNC_THREAD_POOL_SIZE", "32")), thread_name_prefix="vms-io")
+    )
     if mongodb_enabled:
+        asyncio.create_task(jobs_refresh_loop())
         print(f"[Startup] Job notification digest every {JOB_NOTIFICATION_DIGEST_SECONDS}s")
         asyncio.create_task(job_notification_digest_loop())
     if JOB_STATUS_REPORT_ENABLED and JOB_STATUS_REPORT_RECIPIENTS:
@@ -4002,12 +4027,25 @@ def get_jobs_response_payload(is_admin: bool) -> Dict[str, Any]:
     different worker still gets a correct 304 or a fresh body.
     """
     role = "admin" if is_admin else "vendor"
+    if _jobs_refresh_wakeup is not None:
+        # The background refresher polls the version stamp and reloads jobs, so
+        # requests never wait on MongoDB once this worker has built a payload.
+        with _jobs_response_cache_lock:
+            cached = _jobs_response_cache.get(role) or _jobs_response_last_good.get(role)
+        if cached is not None:
+            return cached
+        return build_jobs_response_payload(is_admin)
+
     refresh_jobs_if_version_changed()  # cheap: one tiny read per worker per few seconds
     with _jobs_response_cache_lock:
         cached = _jobs_response_cache.get(role)
     if cached is not None and _manual_jobs_cache_is_current():
         return cached
+    return build_jobs_response_payload(is_admin)
 
+
+def build_jobs_response_payload(is_admin: bool) -> Dict[str, Any]:
+    role = "admin" if is_admin else "vendor"
     all_jobs = get_all_jobs()  # refreshes the source caches (and clears ours) when stale
     with _jobs_response_cache_lock:
         cached = _jobs_response_cache.get(role)
@@ -4040,7 +4078,72 @@ def get_jobs_response_payload(is_admin: bool) -> Dict[str, Any]:
         # Skip storing if the job lists changed while this payload was built.
         if generation == _jobs_response_generation:
             _jobs_response_cache[role] = payload
+            _jobs_response_last_good[role] = payload
     return payload
+
+
+# The whole users collection is small (tens of vendors), so each worker keeps it
+# in memory and re-reads it on this interval. Authenticated requests then find
+# the user in memory instead of paying a ~200 ms MongoDB round trip roughly once
+# a minute per user. Deactivations still reach every worker within this interval.
+USERS_REFRESH_SECONDS = max(1, min(USER_LOOKUP_CACHE_SECONDS, USERS_CACHE_SECONDS // 2))
+_users_refreshed_at = 0.0
+
+
+def refresh_users_in_background() -> None:
+    global _users_refreshed_at, _users_cache, _users_cache_time
+    if not (mongodb_enabled and users_collection is not None):
+        return
+    if _monotonic() - _users_refreshed_at < USERS_REFRESH_SECONDS:
+        return
+    _users_refreshed_at = _monotonic()
+    # Not load_users_from_json: on a MongoDB error that falls back to the JSON
+    # file and would replace the good in-memory list. Here an error propagates
+    # and the current list is kept.
+    users = {doc["email"].lower(): _normalize_user_doc(doc) for doc in users_collection.find()}
+    with _users_cache_lock:
+        _users_cache = users
+        _users_cache_time = datetime.now()
+
+
+def refresh_jobs_in_background() -> None:
+    """One refresher pass: pick up foreign changes, honour the TTL, rebuild payloads."""
+    refresh_jobs_if_version_changed()
+    if not _manual_jobs_cache_is_current():
+        load_manual_jobs()  # clears the payloads only if the jobs actually changed
+    for is_admin in (False, True):
+        with _jobs_response_cache_lock:
+            current = ("admin" if is_admin else "vendor") in _jobs_response_cache
+        if not current:
+            build_jobs_response_payload(is_admin)
+
+
+async def jobs_refresh_loop() -> None:
+    """Keep this worker's job list current off the request path.
+
+    App and Atlas are ~200 ms apart, so each MongoDB call made inside a request
+    was visible to users: the version poll, a full reload every TTL, and a
+    rebuild after every change. Runs right away at startup (warming both role
+    payloads), then every JOBS_VERSION_POLL_SECONDS or when a local write wakes it.
+    Also keeps the in-memory users list current (refresh_users_in_background).
+    """
+    global _jobs_refresh_loop_ref, _jobs_refresh_wakeup
+    _jobs_refresh_loop_ref = asyncio.get_running_loop()
+    _jobs_refresh_wakeup = asyncio.Event()
+    while True:
+        _jobs_refresh_wakeup.clear()
+        try:
+            await asyncio.to_thread(refresh_jobs_in_background)
+        except Exception as e:
+            print(f"[JobsRefresh] Refresh failed, serving the last good list: {e}")
+        try:
+            await asyncio.to_thread(refresh_users_in_background)
+        except Exception as e:
+            print(f"[JobsRefresh] Users refresh failed: {e}")
+        try:
+            await asyncio.wait_for(_jobs_refresh_wakeup.wait(), timeout=min(JOBS_VERSION_POLL_SECONDS, USERS_REFRESH_SECONDS))
+        except asyncio.TimeoutError:
+            pass
 
 
 def upsert_manual_job(job: Job) -> None:
