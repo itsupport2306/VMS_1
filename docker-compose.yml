@@ -16,3 +16,16 @@ services:
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+    # /healthz does no I/O, so this cannot load the database.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    # Without rotation the json-file driver grows without limit.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

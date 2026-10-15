@@ -24,6 +24,8 @@ import secrets
 import hashlib
 import smtplib
 from threading import Lock
+from time import monotonic as _monotonic
+from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from email.message import EmailMessage
 from urllib.parse import quote, urlencode
@@ -52,6 +54,7 @@ auth_tokens_collection = None
 user_preferences_collection = None
 job_notification_outbox_collection = None
 locks_collection = None
+meta_collection = None
 fs = None
 
 
@@ -115,7 +118,7 @@ def measure_mongodb_ping_ms(samples: int = 5) -> Optional[float]:
 def init_mongodb():
     """Initialize MongoDB connection"""
     global mongodb_startup_ping_ms
-    global mongo_client, db, users_collection, whitelist_collection, candidates_collection, notifications_collection, jobs_collection, job_status_tracker_collection, closure_audit_collection, manual_jobs_collection, submission_logs_collection, auth_tokens_collection, user_preferences_collection, job_notification_outbox_collection, locks_collection, fs
+    global mongo_client, db, users_collection, whitelist_collection, candidates_collection, notifications_collection, jobs_collection, job_status_tracker_collection, closure_audit_collection, manual_jobs_collection, submission_logs_collection, auth_tokens_collection, user_preferences_collection, job_notification_outbox_collection, locks_collection, meta_collection, fs
     
     print(f"[MongoDB] Checking configuration...")
     print(f"[MongoDB] MONGODB_URI present: {bool(MONGODB_URI)}")
@@ -131,8 +134,13 @@ def init_mongodb():
         mongo_client = MongoClient(
             MONGODB_URI,
             server_api=ServerApi('1'),
-            maxPoolSize=int(os.getenv("MONGODB_MAX_POOL_SIZE", "50")),
+            maxPoolSize=int(os.getenv("MONGODB_MAX_POOL_SIZE", "20")),
             serverSelectionTimeoutMS=int(os.getenv("MONGODB_SERVER_SELECTION_TIMEOUT_MS", "10000")),
+            # Bound the damage from a slow or hung cluster: without these a stuck
+            # socket pins one of the 40 worker threads indefinitely.
+            connectTimeoutMS=int(os.getenv("MONGODB_CONNECT_TIMEOUT_MS", "5000")),
+            socketTimeoutMS=int(os.getenv("MONGODB_SOCKET_TIMEOUT_MS", "20000")),
+            waitQueueTimeoutMS=int(os.getenv("MONGODB_WAIT_QUEUE_TIMEOUT_MS", "5000")),
         )
         db = mongo_client.vms
         users_collection = db.users
@@ -148,6 +156,7 @@ def init_mongodb():
         user_preferences_collection = db.user_preferences  # Per-user job notification preferences
         job_notification_outbox_collection = db.job_notification_outbox  # Durable queue of posted jobs awaiting digest emails
         locks_collection = db.locks  # Cross-worker leases (only one worker sends digests at a time)
+        meta_collection = db.meta  # Small shared state: jobs version stamp, status-report snapshot
         
         # Initialize GridFS for file storage
         import gridfs
@@ -195,6 +204,15 @@ SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() in {"1", "true", "yes",
 JOB_CLOSURE_NOTIFICATIONS_ENABLED = os.getenv("JOB_CLOSURE_NOTIFICATIONS_ENABLED", "false").lower() == "true"
 JOB_CLOSURE_PER_RUN_CAP = int(os.getenv("JOB_CLOSURE_PER_RUN_CAP", "25"))
 JOB_POSTING_NOTIFICATIONS_ENABLED = os.getenv("JOB_POSTING_NOTIFICATIONS_ENABLED", "true").lower() == "true"
+
+# Periodic "how many jobs are open / closed" e-mail to the listed recipients.
+JOB_STATUS_REPORT_ENABLED = os.getenv("JOB_STATUS_REPORT_ENABLED", "true").lower() == "true"
+JOB_STATUS_REPORT_SECONDS = int(os.getenv("JOB_STATUS_REPORT_SECONDS", str(2 * 60 * 60)))
+JOB_STATUS_REPORT_RECIPIENTS = [
+    addr.strip().lower()
+    for addr in os.getenv("JOB_STATUS_REPORT_RECIPIENTS", "het@radixsol.com").split(",")
+    if addr.strip()
+]
 JOB_POSTING_PER_RUN_CAP = int(os.getenv("JOB_POSTING_PER_RUN_CAP", "25"))
 
 # Recipients for new-submission notification emails. Comma-separated env var.
@@ -272,14 +290,20 @@ def hide_compensation_details(text: str) -> str:
     return "\n".join(kept_lines).strip()
 
 
+@lru_cache(maxsize=8192)
+def _sanitize_description_cached(description: str, is_admin: bool) -> str:
+    """Regex work is the dominant cost of a job-list rebuild; unchanged
+    descriptions are served from this cache instead of being re-processed."""
+    return sanitize_job_description(hide_compensation_details(description), is_admin)
+
+
 def sanitize_job_for_display(job, is_admin: bool = False) -> dict:
     job_dict = job.dict() if hasattr(job, "dict") else dict(job)
     if job_dict.get("salary_range") and not job_dict.get("bill_rate_discount_applied"):
         job_dict["salary_range"] = display_bill_rate(job_dict.get("salary_range")) or None
     job_dict["bill_rate_discount_applied"] = True
     if "description" in job_dict:
-        description = hide_compensation_details(job_dict.get("description") or "")
-        job_dict["description"] = sanitize_job_description(description, is_admin)
+        job_dict["description"] = _sanitize_description_cached(job_dict.get("description") or "", is_admin)
     job_dict.pop("bill_rate_discount_applied", None)
     return job_dict
 
@@ -1275,6 +1299,161 @@ async def job_notification_digest_loop() -> None:
         await asyncio.sleep(JOB_NOTIFICATION_DIGEST_SECONDS)
 
 
+def summarize_job_statuses(force_refresh: bool = True) -> Dict[str, int]:
+    """Count jobs by status. Reads the store directly so the numbers are current."""
+    if force_refresh:
+        load_manual_jobs(force_refresh=True)
+    counts = {"open": 0, "closed": 0, "other": 0}
+    jobs = get_all_jobs()
+    for job in jobs:
+        status = normalize_job_status(job.status).strip().lower()
+        if status in OPEN_STATUSES:
+            counts["open"] += 1
+        elif status in CLOSED_STATUSES:
+            counts["closed"] += 1
+        else:
+            counts["other"] += 1
+    counts["total"] = len(jobs)
+    return counts
+
+
+def _format_age(delta: timedelta) -> str:
+    minutes = int(delta.total_seconds() // 60)
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, rem = divmod(minutes, 60)
+    return f"{hours} h {rem} min" if rem else f"{hours} h"
+
+
+def _signed(value: int) -> str:
+    return f"+{value}" if value > 0 else str(value)
+
+
+def build_job_status_report(counts: Dict[str, int], previous: Optional[dict]) -> Dict[str, str]:
+    generated = datetime.now()
+    if JOB_STATUS_REPORT_SECONDS % 3600 == 0:
+        interval_label = f"{JOB_STATUS_REPORT_SECONDS // 3600} hours"
+    else:
+        interval_label = f"{JOB_STATUS_REPORT_SECONDS // 60} minutes"
+    change_html = change_text = ""
+    if previous and previous.get("sent_at"):
+        age = generated - previous["sent_at"]
+        d_open = counts["open"] - int(previous.get("open", 0))
+        d_closed = counts["closed"] - int(previous.get("closed", 0))
+        change_html = (
+            f'<p style="color:#555;">Since the last report ({_format_age(age)} ago): '
+            f'open {_signed(d_open)}, closed {_signed(d_closed)}.</p>'
+        )
+        change_text = f"Since the last report ({_format_age(age)} ago): open {_signed(d_open)}, closed {_signed(d_closed)}."
+    other_row = (
+        f'<tr><td style="padding:8px;border:1px solid #ddd;">Other statuses</td>'
+        f'<td style="padding:8px;border:1px solid #ddd;text-align:right;">{counts["other"]}</td></tr>'
+        if counts["other"] else ""
+    )
+    html_content = f'''
+        <h2>Job status report</h2>
+        <p>Current job counts on the Vendor Management System.</p>
+        <table style="border-collapse:collapse;width:100%;max-width:360px;">
+            <tr><td style="padding:8px;border:1px solid #ddd;"><strong>Open jobs</strong></td>
+                <td style="padding:8px;border:1px solid #ddd;text-align:right;"><strong>{counts["open"]}</strong></td></tr>
+            <tr><td style="padding:8px;border:1px solid #ddd;"><strong>Closed jobs</strong></td>
+                <td style="padding:8px;border:1px solid #ddd;text-align:right;"><strong>{counts["closed"]}</strong></td></tr>
+            {other_row}
+            <tr><td style="padding:8px;border:1px solid #ddd;">Total</td>
+                <td style="padding:8px;border:1px solid #ddd;text-align:right;">{counts["total"]}</td></tr>
+        </table>
+        {change_html}
+        <p><a href="{html.escape(APP_URL)}">Open the portal</a></p>
+        <p style="color:#666;font-size:12px;margin-top:24px;">
+            Automated report, sent every {interval_label}.
+            Generated {generated.strftime("%Y-%m-%d %H:%M")} (server time).
+        </p>
+    '''
+    text_lines = [
+        "Job status report",
+        f"Open jobs: {counts['open']}",
+        f"Closed jobs: {counts['closed']}",
+    ]
+    if counts["other"]:
+        text_lines.append(f"Other statuses: {counts['other']}")
+    text_lines.append(f"Total: {counts['total']}")
+    if change_text:
+        text_lines.append(change_text)
+    text_lines.append(APP_URL)
+    return {
+        "subject": f"Job status: {counts['open']} open, {counts['closed']} closed",
+        "html": html_content,
+        "text": "\n".join(text_lines),
+    }
+
+
+def send_job_status_report(ignore_schedule: bool = False) -> Dict[str, Any]:
+    """Send the open/closed report. Scheduled calls take a MongoDB lease so only
+    one worker sends per interval, and a restart does not send a duplicate."""
+    if not JOB_STATUS_REPORT_RECIPIENTS:
+        return {"sent": False, "reason": "no recipients configured"}
+
+    leased = False
+    use_lease = mongodb_enabled and locks_collection is not None and not ignore_schedule
+    if use_lease:
+        if not _acquire_lease("job_status_report", JOB_STATUS_REPORT_SECONDS):
+            return {"sent": False, "reason": "not due"}
+        leased = True
+    elif not ignore_schedule:
+        global _status_report_last_sent
+        if _status_report_last_sent and _monotonic() - _status_report_last_sent < JOB_STATUS_REPORT_SECONDS:
+            return {"sent": False, "reason": "not due"}
+
+    try:
+        counts = summarize_job_statuses()
+        previous = None
+        if mongodb_enabled and meta_collection is not None:
+            previous = meta_collection.find_one({"_id": "job_status_report"})
+        report = build_job_status_report(counts, previous)
+        sent = send_app_email(
+            JOB_STATUS_REPORT_RECIPIENTS,
+            subject=report["subject"],
+            html_content=report["html"],
+            text_content=report["text"],
+        )
+        if not sent:
+            raise RuntimeError("email provider did not accept the message")
+        if mongodb_enabled and meta_collection is not None:
+            meta_collection.update_one(
+                {"_id": "job_status_report"},
+                {"$set": {"open": counts["open"], "closed": counts["closed"], "sent_at": datetime.now()}},
+                upsert=True,
+            )
+        if not ignore_schedule:
+            _status_report_last_sent = _monotonic()  # a manual test send must not delay the schedule
+        print(f"[JobStatusReport] Sent to {', '.join(JOB_STATUS_REPORT_RECIPIENTS)}: {counts}")
+        return {"sent": True, "counts": counts, "recipients": JOB_STATUS_REPORT_RECIPIENTS}
+    except Exception as e:
+        if leased:
+            _release_lease("job_status_report")  # let the next check retry
+        print(f"[JobStatusReport] Failed: {e}")
+        return {"sent": False, "reason": str(e)}
+
+
+_status_report_last_sent: Optional[float] = None
+JOB_STATUS_REPORT_RETRY_SECONDS = 300
+
+
+async def job_status_report_loop() -> None:
+    """Check once a minute; the lease decides whether a report is actually due."""
+    await asyncio.sleep(20 + secrets.randbelow(40))
+    while True:
+        delay = 60
+        try:
+            result = await asyncio.to_thread(send_job_status_report)
+            if not result.get("sent") and result.get("reason") not in ("not due", None):
+                delay = JOB_STATUS_REPORT_RETRY_SECONDS  # do not hammer the mail provider
+        except Exception as e:
+            print(f"[JobStatusReport] Loop error: {e}")
+            delay = JOB_STATUS_REPORT_RETRY_SECONDS
+        await asyncio.sleep(delay)
+
+
 def extract_ceipal_status_entries(reports_data) -> list:
     """Extract (job_id, status, title) from a raw Ceipal reports page WITHOUT filtering by status.
 
@@ -1691,16 +1870,78 @@ def _cache_is_fresh(cache_time: Optional[datetime], ttl_seconds: int) -> bool:
     return bool(cache_time and (datetime.now() - cache_time) < timedelta(seconds=ttl_seconds))
 
 
+# Per-user lookups for authenticated requests. get_current_user used to reach
+# MongoDB on most requests once the all-users cache aged out (and that cache is
+# never refilled per user). Kept short so deactivations still take effect quickly.
+USER_LOOKUP_CACHE_SECONDS = int(os.getenv("USER_LOOKUP_CACHE_SECONDS", "60"))
+USER_LOOKUP_CACHE_MAX = 2000
+_user_lookup_cache: Dict[str, Any] = {}
+
+
 def clear_users_cache() -> None:
     global _users_cache, _users_cache_time
     with _users_cache_lock:
         _users_cache = {}
         _users_cache_time = None
+        _user_lookup_cache.clear()
     print("[Auth] User cache cleared")
 
 
-def clear_manual_jobs_cache() -> None:
+# Cross-worker coherence without Redis: every job write bumps one tiny shared
+# document, and each worker polls it (at most every JOBS_VERSION_POLL_SECONDS)
+# instead of waiting out a 5 minute TTL.
+JOBS_VERSION_POLL_SECONDS = float(os.getenv("JOBS_VERSION_POLL_SECONDS", "5"))
+_jobs_version_seen: Optional[int] = None
+_jobs_version_checked_at = 0.0
+_jobs_version_lock = Lock()
+
+
+def bump_jobs_version() -> None:
+    """Tell every worker the job set changed. Call after a successful job write."""
+    global _jobs_version_seen
+    if not (mongodb_enabled and meta_collection is not None):
+        return
+    try:
+        doc = meta_collection.find_one_and_update(
+            {"_id": "jobs"},
+            {"$inc": {"version": 1}, "$set": {"updated_at": datetime.utcnow()}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        with _jobs_version_lock:
+            # This worker clears its own cache right after, so don't treat our
+            # own bump as a foreign change on the next poll.
+            _jobs_version_seen = (doc or {}).get("version")
+    except Exception as e:
+        print(f"[JobsVersion] Could not bump jobs version: {e}")
+
+
+def refresh_jobs_if_version_changed() -> None:
+    """Drop this worker's job caches when another worker or the sync changed jobs."""
+    global _jobs_version_seen, _jobs_version_checked_at
+    if not (mongodb_enabled and meta_collection is not None):
+        return
+    now = _monotonic()
+    with _jobs_version_lock:
+        if now - _jobs_version_checked_at < JOBS_VERSION_POLL_SECONDS:
+            return
+        _jobs_version_checked_at = now
+    try:
+        doc = meta_collection.find_one({"_id": "jobs"}, {"version": 1})
+    except Exception as e:
+        print(f"[JobsVersion] Could not read jobs version: {e}")
+        return
+    version = (doc or {}).get("version", 0)
+    with _jobs_version_lock:
+        previous, _jobs_version_seen = _jobs_version_seen, version
+    if previous is not None and previous != version:
+        clear_manual_jobs_cache(bump=False)
+
+
+def clear_manual_jobs_cache(bump: bool = True) -> None:
     global _manual_jobs_cache, _manual_jobs_cache_time
+    if bump:
+        bump_jobs_version()
     with _manual_jobs_cache_lock:
         _manual_jobs_cache = None
         _manual_jobs_cache_time = None
@@ -1840,6 +2081,11 @@ def load_user_by_email(email: str, prefer_cache: bool = True) -> Optional[dict]:
     if not email_lower:
         return None
 
+    if prefer_cache:
+        hit = _user_lookup_cache.get(email_lower)
+        if hit is not None and _monotonic() - hit[0] < USER_LOOKUP_CACHE_SECONDS:
+            return hit[1]
+
     if prefer_cache and _users_cache and _cache_is_fresh(_users_cache_time, USERS_CACHE_SECONDS):
         cached = _users_cache.get(email_lower)
         if cached is not None:
@@ -1859,9 +2105,15 @@ def load_user_by_email(email: str, prefer_cache: bool = True) -> Optional[dict]:
                     }
                 })
             if doc is None:
-                users = load_users_from_json(force_refresh=True)
-                return users.get(email_lower)
+                # Unknown account. This used to reload the whole users collection
+                # (a full scan) for every unknown or mistyped e-mail.
+                return None
             user = _normalize_user_doc(doc)
+            if prefer_cache:
+                with _users_cache_lock:
+                    if len(_user_lookup_cache) >= USER_LOOKUP_CACHE_MAX:
+                        _user_lookup_cache.clear()
+                    _user_lookup_cache[email_lower] = (_monotonic(), user)
             with _users_cache_lock:
                 # Only ever add to a cache that is already fresh and complete.
                 # Seeding a brand-new cache from a single lookup used to mark a
@@ -2111,6 +2363,9 @@ async def startup_event():
     if mongodb_enabled:
         print(f"[Startup] Job notification digest every {JOB_NOTIFICATION_DIGEST_SECONDS}s")
         asyncio.create_task(job_notification_digest_loop())
+    if JOB_STATUS_REPORT_ENABLED and JOB_STATUS_REPORT_RECIPIENTS:
+        print(f"[Startup] Job status report to {', '.join(JOB_STATUS_REPORT_RECIPIENTS)} every {JOB_STATUS_REPORT_SECONDS}s")
+        asyncio.create_task(job_status_report_loop())
 
 # Web UI (HTML/CSS/JS)
 WEB_DIR = os.path.join(os.path.dirname(__file__), "web")
@@ -2121,6 +2376,26 @@ if os.path.isdir(ASSETS_DIR):
 # Compress JSON responses. /api/jobs carries every job with its full description,
 # and was previously shipped uncompressed to every tab on every load.
 app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+SLOW_REQUEST_MS = float(os.getenv("SLOW_REQUEST_MS", "500"))
+
+
+@app.middleware("http")
+async def timing_and_cache_headers(request: Request, call_next):
+    """Time every request (X-Process-Time-Ms) and log the slow ones, so lag can be
+    traced to a route instead of guessed at. Also lets browsers reuse static assets."""
+    started = _monotonic()
+    response = await call_next(request)
+    elapsed_ms = (_monotonic() - started) * 1000
+    response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.0f}"
+    path = request.url.path
+    if elapsed_ms >= SLOW_REQUEST_MS and path not in ("/healthz", "/readyz"):
+        print(f"[Slow] {request.method} {path} -> {response.status_code} in {elapsed_ms:.0f} ms")
+    if path.startswith("/assets/") and "cache-control" not in response.headers:
+        # Revalidated by ETag/Last-Modified after a day, so a deploy is picked up.
+        response.headers["Cache-Control"] = "public, max-age=3600, stale-while-revalidate=86400"
+    return response
+
 
 # CORS Middleware
 app.add_middleware(
@@ -2545,7 +2820,7 @@ async def login(user_data: UserLogin):
     global _users_cache
 
     email_lower = user_data.email.lower().strip()
-    user = await asyncio.to_thread(load_user_by_email, email_lower)
+    user = await asyncio.to_thread(load_user_by_email, email_lower, False)
 
     if not user:
         if not is_whitelisted(email_lower):
@@ -2917,7 +3192,23 @@ def delete_job_from_payload(
         raise HTTPException(status_code=500, detail=f"Failed to delete job: {str(e)}")
 
 
-@app.post("/api/nexus/jobs")
+NEXUS_INGEST_TOKEN = os.getenv("NEXUS_INGEST_TOKEN", "")
+
+
+def require_ingest_access(request: Request) -> None:
+    """Protect the unauthenticated Nexus ingest routes with a shared token.
+
+    Opt-in so the existing sync keeps working: set NEXUS_INGEST_TOKEN on both the
+    API and the sync process (X-Ingest-Token header) to close these routes.
+    """
+    if not NEXUS_INGEST_TOKEN:
+        return
+    supplied = request.headers.get("x-ingest-token", "")
+    if not secrets.compare_digest(supplied.encode(), NEXUS_INGEST_TOKEN.encode()):
+        raise HTTPException(status_code=401, detail="Invalid or missing ingest token")
+
+
+@app.post("/api/nexus/jobs", dependencies=[Depends(require_ingest_access)])
 def create_nexus_job(payload: DirectJobCreateRequest, background_tasks: BackgroundTasks):
     """Create or update a job from Nexus-style request parameters."""
     try:
@@ -2936,7 +3227,7 @@ def create_nexus_job(payload: DirectJobCreateRequest, background_tasks: Backgrou
         raise HTTPException(status_code=500, detail=f"Failed to store job: {str(e)}")
 
 
-@app.post("/api/nexus/jobs/bulk")
+@app.post("/api/nexus/jobs/bulk", dependencies=[Depends(require_ingest_access)])
 def create_nexus_jobs_bulk(
     payload: BulkDirectJobCreateRequest,
     background_tasks: BackgroundTasks,
@@ -3220,8 +3511,11 @@ def load_excel_jobs() -> List[Job]:
 
 
 def _excel_jobs_cache_is_fresh() -> bool:
+    # `is not None`, not truthiness: with no Excel file the cached result is an
+    # empty list, which used to count as "not cached" and re-ran the loader (and
+    # printed two log lines) on every /api/jobs request.
     return bool(
-        _excel_jobs_cache
+        _excel_jobs_cache is not None
         and _excel_jobs_cache_time
         and datetime.now() - _excel_jobs_cache_time < timedelta(minutes=EXCEL_CACHE_MINUTES)
     )
@@ -3635,10 +3929,14 @@ def _read_manual_jobs_from_store() -> List[Job]:
                 doc["bill_rate_discount_applied"] = True
                 jobs.append(Job(**doc))
             with _manual_jobs_cache_lock:
+                unchanged = _manual_jobs_cache is not None and _manual_jobs_cache == jobs
                 _manual_jobs_cache = jobs
                 _manual_jobs_cache_time = datetime.now()
-            clear_jobs_response_cache()
-            print(f"[Manual Jobs] Reloaded {len(jobs)} jobs from MongoDB")
+            # Keep the sanitised/serialised payloads when nothing changed, so a
+            # periodic reload no longer forces every request to rebuild them.
+            if not unchanged:
+                clear_jobs_response_cache()
+                print(f"[Manual Jobs] Reloaded {len(jobs)} jobs from MongoDB (changed)")
             return jobs
 
         if not os.path.exists(MANUAL_JOBS_FILE):
@@ -3653,13 +3951,42 @@ def _read_manual_jobs_from_store() -> List[Job]:
             job_data["bill_rate_discount_applied"] = True
             jobs.append(Job(**job_data))
         with _manual_jobs_cache_lock:
+            unchanged = _manual_jobs_cache is not None and _manual_jobs_cache == jobs
             _manual_jobs_cache = jobs
             _manual_jobs_cache_time = datetime.now()
-        clear_jobs_response_cache()
+        if not unchanged:
+            clear_jobs_response_cache()
     except Exception as e:
         print(f"[Manual Jobs] Failed to load direct-input jobs: {e}")
 
     return jobs
+
+
+JOB_LIST_PREVIEW_CHARS = 260
+
+
+def _manual_jobs_cache_is_current() -> bool:
+    """True while the manual-job cache is within its TTL, so no reload is due."""
+    return _manual_jobs_cache is not None and _cache_is_fresh(_manual_jobs_cache_time, MANUAL_JOBS_CACHE_SECONDS)
+
+
+def to_list_item(job: dict) -> dict:
+    """Slim a sanitised job for /api/jobs: a short preview instead of the full text.
+
+    The full description is fetched from /api/jobs/{id} when a job is opened.
+    The specialty filter used to fall back to parsing the description, so that is
+    resolved here, server-side, before the text is cut.
+    """
+    item = dict(job)
+    description = item.get("description") or ""
+    if not item.get("specialty"):
+        match = re.search(r"Special(?:ty|ity):\s*([^|\n]+)", description, flags=re.IGNORECASE)
+        if match:
+            item["specialty"] = match.group(1).strip()
+    truncated = len(description) > JOB_LIST_PREVIEW_CHARS
+    item["description"] = description[:JOB_LIST_PREVIEW_CHARS] if truncated else description
+    item["description_truncated"] = truncated
+    return item
 
 
 def get_all_jobs() -> List[Job]:
@@ -3675,6 +4002,12 @@ def get_jobs_response_payload(is_admin: bool) -> Dict[str, Any]:
     different worker still gets a correct 304 or a fresh body.
     """
     role = "admin" if is_admin else "vendor"
+    refresh_jobs_if_version_changed()  # cheap: one tiny read per worker per few seconds
+    with _jobs_response_cache_lock:
+        cached = _jobs_response_cache.get(role)
+    if cached is not None and _manual_jobs_cache_is_current():
+        return cached
+
     all_jobs = get_all_jobs()  # refreshes the source caches (and clears ours) when stale
     with _jobs_response_cache_lock:
         cached = _jobs_response_cache.get(role)
@@ -3683,15 +4016,21 @@ def get_jobs_response_payload(is_admin: bool) -> Dict[str, Any]:
         return cached
 
     sanitized_jobs = [sanitize_job_for_display(job, is_admin) for job in all_jobs]
-    body = JobListResponse(
-        jobs=sanitized_jobs,
-        total=len(sanitized_jobs),
-        total_pages=1,
-        next_start_page=2,
-        has_more=False,
-        is_refreshing=False,
-        cache_age_seconds=None,
-    ).json().encode("utf-8")
+    slim_jobs = [to_list_item(job) for job in sanitized_jobs]
+    body = json.dumps(
+        {
+            "jobs": slim_jobs,
+            "total": len(slim_jobs),
+            "total_pages": 1,
+            "next_start_page": 2,
+            "has_more": False,
+            "is_refreshing": False,
+            "cache_age_seconds": None,
+        },
+        default=str,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
     payload = {
         "body": body,
         "etag": f'"jobs-{role}-{hashlib.sha1(body).hexdigest()[:20]}"',
@@ -4687,6 +5026,14 @@ async def get_jobs(request: Request, current_user: UserDB = Depends(get_current_
         raise HTTPException(status_code=500, detail=f"Failed to fetch jobs: {str(e)}")
 
 
+@app.post("/api/admin/job-status-report/send")
+async def send_job_status_report_now(current_user: UserDB = Depends(get_current_user)):
+    """Admin: send the open/closed report immediately (ignores the 2-hour schedule)."""
+    if current_user.email.lower() != ADMIN_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Only admin can send the job status report")
+    return await asyncio.to_thread(send_job_status_report, True)
+
+
 @app.get("/api/ceipal/status")
 async def get_ceipal_status():
     return {
@@ -4702,10 +5049,11 @@ async def get_ceipal_status():
     }
 
 @app.get("/api/jobs/{job_id}", response_model=Job)
-async def get_job(job_id: str):
-    """Get specific job details"""
+async def get_job(job_id: str, current_user: UserDB = Depends(get_current_user)):
+    """Get one job with its full description (the list endpoint only sends a preview)."""
     try:
-        payload = await asyncio.to_thread(get_jobs_response_payload, False)
+        is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
+        payload = await asyncio.to_thread(get_jobs_response_payload, is_admin)
         job = payload["jobs_by_id"].get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
@@ -4743,14 +5091,41 @@ async def get_ceipal_cache_status():
         "reports_cached": None,
     }
 
+@app.get("/healthz")
+async def liveness():
+    """Liveness: no I/O, safe to poll every few seconds."""
+    return {"status": "ok"}
+
+
+_readyz_cache: Dict[str, Any] = {"at": 0.0, "ok": True}
+
+
+@app.get("/readyz")
+def readiness():
+    """Readiness: one MongoDB ping, cached for 5 s so a monitor cannot load the database."""
+    if not mongodb_enabled:
+        return {"status": "ok", "mongodb": "disabled"}
+    if _monotonic() - _readyz_cache["at"] > 5:
+        try:
+            mongo_client.admin.command("ping")
+            _readyz_cache["ok"] = True
+        except Exception as e:
+            print(f"[Health] readyz ping failed: {e}")
+            _readyz_cache["ok"] = False
+        _readyz_cache["at"] = _monotonic()
+    if not _readyz_cache["ok"]:
+        raise HTTPException(status_code=503, detail="MongoDB unavailable")
+    return {"status": "ok", "mongodb": "ok"}
+
+
 @app.get("/api/health")
 def health_check():
-    """Health check endpoint for MongoDB/JSON-backed runtime state."""
-    users = load_users_from_json()
+    """Diagnostics for MongoDB/JSON-backed runtime state. Prefer /healthz or /readyz for monitors."""
+    users = _users_cache if _users_cache else load_users_from_json()
     mongodb_ping_ms = None
     if mongodb_enabled:
         try:
-            mongodb_ping_ms = measure_mongodb_ping_ms(samples=3)
+            mongodb_ping_ms = measure_mongodb_ping_ms(samples=1)
         except Exception as e:
             print(f"[Health] MongoDB ping failed: {e}")
     return {
@@ -4952,14 +5327,18 @@ async def submit_candidate(
         raise HTTPException(status_code=500, detail=f"Failed to submit candidate: {str(e)}")
 
 @app.get("/api/candidates/job/{job_id}")
-def get_candidates_for_job(job_id: str):
-    """Get all candidates submitted for a specific job - MongoDB persistent storage"""
+def get_candidates_for_job(job_id: str, current_user: UserDB = Depends(get_current_user)):
+    """Get candidates submitted for a specific job. Admin sees all; vendors only their own."""
     try:
         job_candidates = []
+        is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
         
         if mongodb_enabled and candidates_collection is not None:
             # Query MongoDB
-            cursor = candidates_collection.find({"job_id": job_id})
+            query = {"job_id": job_id}
+            if not is_admin:
+                query["submitted_by_user_id"] = current_user.id
+            cursor = candidates_collection.find(query)
             for doc in cursor:
                 doc["_id"] = str(doc["_id"])  # Convert ObjectId to string
                 sanitize_candidate_bill_rate(doc)
@@ -4970,7 +5349,11 @@ def get_candidates_for_job(job_id: str):
             if os.path.exists(candidates_file):
                 with open(candidates_file, 'r') as f:
                     all_candidates = json.load(f)
-                    job_candidates = [c for c in all_candidates if c.get("job_id") == job_id]
+                    job_candidates = [
+                        c for c in all_candidates
+                        if c.get("job_id") == job_id
+                        and (is_admin or c.get("submitted_by_user_id") == current_user.id)
+                    ]
                     for c in job_candidates:
                         sanitize_candidate_bill_rate(c)
         

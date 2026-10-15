@@ -3,6 +3,7 @@ import asyncio
 from datetime import datetime, timezone
 import html
 import json
+import os
 from pathlib import Path
 import random
 import re
@@ -59,9 +60,12 @@ STATUS_FAILED = "failed"
 # DEFAULT_VMS_BASE_URL = os.getenv("VMS_BASE_URL", "https://radixsolvms.com/")
 # DEFAULT_ADMIN_EMAIL = os.getenv("VMS_ADMIN_EMAIL", "Admin@radixsol.com")
 # DEFAULT_ADMIN_PASSWORD = os.getenv("VMS_ADMIN_PASSWORD", "Admin123")
-DEFAULT_VMS_BASE_URL = "https://radixsolvms.com/"
-DEFAULT_ADMIN_EMAIL = "Admin@radixsol.com"
-DEFAULT_ADMIN_PASSWORD = "Admin@123"
+# Environment variables win; the previous literal values remain the fallback so
+# existing deployments behave the same. Set these in the worker's environment
+# and rotate the admin password instead of relying on the default.
+DEFAULT_VMS_BASE_URL = os.getenv("VMS_BASE_URL", "https://radixsolvms.com/")
+DEFAULT_ADMIN_EMAIL = os.getenv("VMS_ADMIN_EMAIL", "Admin@radixsol.com")
+DEFAULT_ADMIN_PASSWORD = os.getenv("VMS_ADMIN_PASSWORD", "Admin@123")
 
 def build_payload(start: int) -> Dict[str, Any]:
     return {
@@ -414,10 +418,49 @@ def build_vms_payload(summary_job: Dict[str, Any], detail_job: Dict[str, Any]) -
     return {key: coerce_text(value) for key, value in payload.items()}
 
 
+# A row left in "posting" (the request outcome was unknown, or the process died)
+# is retried after this long. Server-side upserts are idempotent, so it is safe.
+POSTING_LEASE_SECONDS = 15 * 60
+# Failed rows back off exponentially instead of being replayed every 10 s forever.
+FAILED_RETRY_BASE_SECONDS = 30
+FAILED_RETRY_MAX_SECONDS = 30 * 60
+_RETRY_STATE: Dict[str, Tuple[int, float]] = {}
+
+
+def is_stale_posting(started_at: Any) -> bool:
+    try:
+        started = datetime.fromisoformat(str(started_at).strip())
+    except ValueError:
+        return True
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - started).total_seconds() > POSTING_LEASE_SECONDS
+
+
 class CsvJobStore:
     def __init__(self, output_csv: str) -> None:
         self.path = Path(output_csv)
         self.lock = asyncio.Lock()
+        self._dirty = False
+
+    def _write_if_dirty(self, df: pd.DataFrame) -> None:
+        """Only rewrite the CSV when something actually changed (it used to be
+        rewritten in full on every 10 s poll)."""
+        if self._dirty:
+            self._write_df(df)
+            self._dirty = False
+
+    async def known_job_ids(self) -> set:
+        """All job ids already stored, from a single read of the file."""
+        async with self.lock:
+            df = self._read_df()
+            if df.empty:
+                return set()
+            if CSV_JOB_ID_COLUMN in df.columns:
+                ids = df[CSV_JOB_ID_COLUMN].map(normalize_csv_value)
+            else:
+                ids = df.apply(lambda item: get_row_job_id(item.to_dict()), axis=1)
+            return {job_id for job_id in ids if job_id}
 
     def _read_df(self) -> pd.DataFrame:
         if not self.path.exists() or self.path.stat().st_size == 0:
@@ -438,6 +481,7 @@ class CsvJobStore:
         ]:
             if column not in df.columns:
                 df[column] = ""
+                self._dirty = True
 
         if not df.empty:
             missing_job_id = df[CSV_JOB_ID_COLUMN].map(normalize_csv_value) == ""
@@ -446,8 +490,11 @@ class CsvJobStore:
                     lambda item: get_row_job_id(item.to_dict()),
                     axis=1,
                 )
+                self._dirty = True
             missing_status = df[CSV_STATUS_COLUMN].map(normalize_csv_value) == ""
-            df.loc[missing_status, CSV_STATUS_COLUMN] = STATUS_PENDING
+            if missing_status.any():
+                df.loc[missing_status, CSV_STATUS_COLUMN] = STATUS_PENDING
+                self._dirty = True
 
         return df
 
@@ -504,38 +551,37 @@ class CsvJobStore:
 
     async def ready_rows(self) -> List[Dict[str, Any]]:
         async with self.lock:
+            self._dirty = False
             df = self._prepare_df(self._read_df())
             if df.empty:
-                self._write_df(df)
                 return []
+            self._write_if_dirty(df)
 
-            ready = df[
-                ~df[CSV_STATUS_COLUMN]
-                .map(normalize_csv_value)
-                .isin([STATUS_POSTED, STATUS_POSTING])
-            ]
-            if len(ready) != len(df):
-                self._write_df(df)
+            status = df[CSV_STATUS_COLUMN].map(normalize_csv_value)
+            stale_posting = (status == STATUS_POSTING) & df[CSV_STARTED_AT_COLUMN].map(is_stale_posting)
+            ready = df[(status != STATUS_POSTED) & ((status != STATUS_POSTING) | stale_posting)]
             return [item.to_dict() for _, item in ready.iterrows()]
 
     async def claim_for_posting(self, job_id: str) -> bool:
         async with self.lock:
+            self._dirty = False
             df = self._prepare_df(self._read_df())
             if df.empty:
-                self._write_df(df)
                 return False
 
             matches = df.index[
                 df[CSV_JOB_ID_COLUMN].map(normalize_csv_value) == job_id
             ].tolist()
             if not matches:
-                self._write_df(df)
+                self._write_if_dirty(df)
                 return False
 
             index = matches[0]
             status = normalize_csv_value(df.at[index, CSV_STATUS_COLUMN])
-            if status in [STATUS_POSTED, STATUS_POSTING]:
-                self._write_df(df)
+            if status == STATUS_POSTED or (
+                status == STATUS_POSTING and not is_stale_posting(df.at[index, CSV_STARTED_AT_COLUMN])
+            ):
+                self._write_if_dirty(df)
                 return False
 
             df.at[index, CSV_STATUS_COLUMN] = STATUS_POSTING
@@ -568,6 +614,7 @@ class CsvJobStore:
                 df.at[index, CSV_STATUS_COLUMN] = STATUS_POSTED
                 df.at[index, CSV_POSTED_AT_COLUMN] = utc_now_iso()
                 df.at[index, CSV_ERROR_COLUMN] = ""
+            _RETRY_STATE.pop(job_id, None)
             self._write_df(df)
 
     async def mark_failed(self, job_id: str, error: str) -> None:
@@ -583,12 +630,26 @@ class CsvJobStore:
             self._write_df(df)
 
 
+# Remembered so an expired 7-day JWT can be replaced without restarting the sync.
+_VMS_AUTH: Dict[str, str] = {}
+
+
+def ingest_headers(token: Optional[str]) -> Dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    elif os.getenv("NEXUS_INGEST_TOKEN"):
+        headers["X-Ingest-Token"] = os.environ["NEXUS_INGEST_TOKEN"]
+    return headers
+
+
 async def login_to_vms(
     client: httpx.AsyncClient,
     base_url: str,
     email: str,
     password: str,
 ) -> str:
+    _VMS_AUTH.update({"base_url": base_url, "email": email, "password": password})
     response = await client.post(
         f"{base_url.rstrip('/')}/api/auth/login",
         json={"email": email, "password": password},
@@ -609,9 +670,7 @@ async def post_job_to_vms(
     token: Optional[str] = None,
 ) -> Dict[str, Any]:
     endpoint = "/api/admin/jobs" if token else "/api/nexus/jobs"
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    headers = ingest_headers(token)
 
     response = await client.post(
         f"{base_url.rstrip('/')}{endpoint}",
@@ -642,9 +701,7 @@ async def post_jobs_to_vms_bulk(
     send_notifications: bool = False,
 ) -> Dict[str, Any]:
     endpoint = "/api/admin/jobs/bulk" if token else "/api/nexus/jobs/bulk"
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    headers = ingest_headers(token)
 
     response = await client.post(
         f"{base_url.rstrip('/')}{endpoint}",
@@ -667,6 +724,7 @@ async def post_jobs_to_vms_bulk_with_retries(
     max_retries: int = DEFAULT_POST_MAX_RETRIES,
 ) -> Dict[str, Any]:
     attempt = 0
+    relogged_in = False
     while True:
         attempt += 1
         try:
@@ -679,6 +737,15 @@ async def post_jobs_to_vms_bulk_with_retries(
             )
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code
+            if status_code == 401 and token and _VMS_AUTH and not relogged_in:
+                # The 7-day session token expired. Log in again and retry once
+                # instead of failing every queued job.
+                relogged_in = True
+                print("VMS token rejected (401); logging in again.")
+                token = await login_to_vms(
+                    client, _VMS_AUTH["base_url"], _VMS_AUTH["email"], _VMS_AUTH["password"]
+                )
+                continue
             retryable = status_code == 429 or 500 <= status_code < 600
             if not retryable or attempt >= max_retries:
                 raise
@@ -983,13 +1050,20 @@ async def enqueue_ready_csv_jobs(
     post_queue: "asyncio.Queue[Optional[Dict[str, Any]]]",
 ) -> int:
     enqueued = 0
+    now = asyncio.get_running_loop().time()
     for flat_row in await csv_store.ready_rows():
         row = row_from_flat_csv(flat_row)
         job_id = get_row_job_id(row)
         if not job_id:
             print("Skipping CSV row without a job_id")
             continue
+        attempts, not_before = _RETRY_STATE.get(job_id, (0, 0.0))
+        if now < not_before:
+            continue  # still backing off after a failure
         if await csv_store.claim_for_posting(job_id):
+            if normalize_csv_value(flat_row.get(CSV_STATUS_COLUMN)) in (STATUS_FAILED, STATUS_POSTING):
+                delay = min(FAILED_RETRY_MAX_SECONDS, FAILED_RETRY_BASE_SECONDS * (2 ** attempts))
+                _RETRY_STATE[job_id] = (attempts + 1, now + delay + random.uniform(0, 5))
             await post_queue.put(row)
             enqueued += 1
     return enqueued
@@ -1004,6 +1078,7 @@ async def scan_nexus_once(
     total_seen = 0
     queued = 0
     total_count: Optional[int] = None
+    known_ids = await csv_store.known_job_ids()  # one read, not one per job
 
     while True:
         records, reported_count = await fetch_summary_page(client, start)
@@ -1023,8 +1098,9 @@ async def scan_nexus_once(
             if not job_id:
                 print(f"Skipping summary row {total_seen}: missing jobId")
                 continue
-            if await csv_store.has_job(job_id):
+            if job_id in known_ids:
                 continue
+            known_ids.add(job_id)
 
             await summary_queue.put((total_seen, summary_job))
             queued += 1

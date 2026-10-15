@@ -978,9 +978,40 @@ function jobMatches(job) {
   return true;
 }
 
+// Render in chunks so a long list does not build hundreds of cards on every
+// keystroke; "Show more" appends the next chunk without rebuilding the rest.
+const JOBS_PAGE_SIZE = 60;
+let jobsRenderLimit = JOBS_PAGE_SIZE;
+let jobsFiltered = [];
+let jobsMoreBtn = null;
+
+function ensureJobsMoreButton() {
+  if (jobsMoreBtn) return jobsMoreBtn;
+  jobsMoreBtn = document.createElement('button');
+  jobsMoreBtn.className = 'btn btn--secondary';
+  jobsMoreBtn.style.cssText = 'display:block;margin:16px auto;';
+  jobsMoreBtn.addEventListener('click', () => {
+    const from = jobsRenderLimit;
+    jobsRenderLimit += JOBS_PAGE_SIZE;
+    appendJobCards(jobsFiltered.slice(from, jobsRenderLimit));
+    updateJobsMoreButton();
+  });
+  els.jobsGrid.insertAdjacentElement('afterend', jobsMoreBtn);
+  return jobsMoreBtn;
+}
+
+function updateJobsMoreButton() {
+  const btn = ensureJobsMoreButton();
+  const remaining = jobsFiltered.length - jobsRenderLimit;
+  btn.hidden = remaining <= 0;
+  if (remaining > 0) btn.textContent = `Show more (${remaining} remaining)`;
+}
+
 function renderJobs() {
   els.jobsGrid.innerHTML = '';
+  jobsRenderLimit = JOBS_PAGE_SIZE;
   const filtered = allJobs.filter(jobMatches);
+  jobsFiltered = filtered;
 
   // Update job count display
   if (els.jobsCount) {
@@ -1007,7 +1038,12 @@ function renderJobs() {
     els.jobsEmpty.hidden = true;
   }
 
-  for (const job of filtered) {
+  appendJobCards(filtered.slice(0, jobsRenderLimit));
+  updateJobsMoreButton();
+}
+
+function appendJobCards(jobs) {
+  for (const job of jobs) {
     const card = document.createElement('div');
     card.className = 'card';
 
@@ -1018,11 +1054,11 @@ function renderJobs() {
     const meta = document.createElement('div');
     meta.className = 'card__meta';
     meta.innerHTML = `
-      <span class="tag">${job.department || 'Department: N/A'}</span>
-      <span class="tag">${job.location || 'Location: N/A'}</span>
-      <span class="tag">${job.employment_type || 'Type: N/A'}</span>
-      <span class="tag">Status: ${job.status || 'N/A'}</span>
-      ${job.end_client ? `<span class="tag">End Client: ${job.end_client}</span>` : ''}
+      <span class="tag">${escapeHtml(job.department || 'Department: N/A')}</span>
+      <span class="tag">${escapeHtml(job.location || 'Location: N/A')}</span>
+      <span class="tag">${escapeHtml(job.employment_type || 'Type: N/A')}</span>
+      <span class="tag">Status: ${escapeHtml(job.status || 'N/A')}</span>
+      ${job.end_client ? `<span class="tag">End Client: ${escapeHtml(job.end_client)}</span>` : ''}
     `;
 
     const desc = document.createElement('div');
@@ -1143,6 +1179,16 @@ function openJobDetailModal(job) {
   els.jobDetailMeta.textContent = parts.join(' • ') || '—';
   
   els.jobDetailFullDesc.textContent = job.description || 'No description available.';
+  // The job list only carries a short preview; fetch the full text when opened.
+  if (job.description_truncated) {
+    const openedFor = job.id;
+    els.jobDetailFullDesc.textContent = `${job.description}\n\nLoading full description...`;
+    loadFullJobDescription(job).then(full => {
+      if (activeJobId === openedFor && !els.jobDetailModal.hidden) {
+        els.jobDetailFullDesc.textContent = full || job.description || 'No description available.';
+      }
+    });
+  }
   
   // Show/hide candidates panel based on admin status (only admin sees submitted candidates)
   const candidatesPanel = document.getElementById('jobDetailCandidatesPanel');
@@ -1155,6 +1201,21 @@ function openJobDetailModal(job) {
   // Only load candidates for admin
   if (isAdmin()) {
     loadJobDetailCandidates(activeJobId);
+  }
+}
+
+const fullDescriptionCache = new Map();
+
+async function loadFullJobDescription(job) {
+  if (fullDescriptionCache.has(job.id)) return fullDescriptionCache.get(job.id);
+  try {
+    const full = await apiGetAuth(`/api/jobs/${encodeURIComponent(job.id)}`, { fresh: true });
+    const text = (full && full.description) || job.description || '';
+    fullDescriptionCache.set(job.id, text);
+    return text;
+  } catch (e) {
+    console.error('Failed to load full job description:', e);
+    return `${job.description || ''}\n\n(Could not load the full description. Please try again.)`;
   }
 }
 
@@ -1243,7 +1304,7 @@ document.addEventListener('keydown', (e) => {
 async function loadJobDetailCandidates(jobId) {
   if (!els.jobDetailCandidates) return;
   try {
-    const data = await apiGet(`/api/candidates/job/${encodeURIComponent(jobId)}`);
+    const data = await apiGetAuth(`/api/candidates/job/${encodeURIComponent(jobId)}`, { fresh: true });
     const candidates = data.candidates || [];
     els.jobDetailCandidates.textContent = candidates.length 
       ? JSON.stringify(candidates, null, 2) 
@@ -1380,6 +1441,7 @@ async function loadJobs() {
     // Fetch jobs (returns immediately with cached data, background fetch continues)
     const data = await apiGetAuth('/api/jobs');
     allJobs = data.jobs || [];
+    fullDescriptionCache.clear();
     hasMoreJobs = data.has_more || false;
     nextStartPage = data.next_start_page || nextStartPage;
     console.log(`[Jobs] Loaded ${allJobs.length} jobs. Has more: ${hasMoreJobs}`);
@@ -1439,9 +1501,14 @@ async function loadJobs() {
       jobsPollTimeout = setTimeout(pollJobs, getJobsPollDelay(pollCount));
     }
   } catch (e) {
-    allJobs = [];
-    hasMoreJobs = false;
-    renderJobs();
+    console.error('[Jobs] Failed to load jobs:', e);
+    // Keep the last good list when a refresh fails; only show the error if there is none.
+    if (!allJobs.length) {
+      hasMoreJobs = false;
+      renderJobs();
+      els.jobsEmpty.hidden = false;
+      els.jobsEmpty.textContent = 'Could not load jobs. Check your connection and press Refresh.';
+    }
   }
 }
 
