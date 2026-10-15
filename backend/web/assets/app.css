@@ -1030,3 +1030,14 @@ tbody tr:hover { background: var(--panel-2); }
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }
+
+
+/* Job alert preferences */
+.pref-toggle { display: inline-flex; align-items: center; gap: 10px; margin-top: 16px; font-weight: 600; font-size: 14px; cursor: pointer; }
+.pref-groups { display: flex; flex-direction: column; gap: 14px; margin-top: 16px; }
+.pref-group { border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; margin: 0; min-width: 0; }
+.pref-group__title { font-weight: 600; font-size: 13px; padding: 0 6px; }
+.pref-group__chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; max-height: 220px; overflow-y: auto; }
+.pref-chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--panel-2); font-size: 13px; cursor: pointer; }
+.pref-chip:has(input:checked) { border-color: var(--brand); background: var(--brand-soft); }
+.pref-summary { margin-top: 14px; font-size: 13px; color: var(--muted); }

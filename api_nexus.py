@@ -39,6 +39,10 @@ OUTPUT_CSV = "jobs.csv"
 DEFAULT_DETAIL_CONCURRENCY = 10
 DEFAULT_POST_CONCURRENCY = 2
 DEFAULT_POST_BATCH_SIZE = 25
+
+# Whether bulk posts ask the backend to email whitelisted users about new jobs.
+# Flipped by --no-send-notifications for backfills.
+SEND_JOB_NOTIFICATIONS = True
 DEFAULT_POST_MAX_RETRIES = 5
 DEFAULT_POST_MAX_RETRY_AFTER_SECONDS = 60
 DEFAULT_NEXUS_POLL_SECONDS = 300
@@ -846,7 +850,7 @@ async def post_worker(
                     vms_base_url,
                     [payload for _, _, payload in valid_entries],
                     token=token,
-                    send_notifications=False,
+                    send_notifications=SEND_JOB_NOTIFICATIONS,
                 )
                 stored_job_ids = set(response.get("stored_job_ids", []))
                 failed_by_job_id = {
@@ -1219,11 +1223,27 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_CSV_POLL_SECONDS,
         help="Seconds to wait between jobs.csv checks in continuous mode.",
     )
+    parser.add_argument(
+        "--no-send-notifications",
+        dest="send_notifications",
+        action="store_false",
+        help=(
+            "Post jobs without emailing whitelisted users. Use this for backfills, "
+            "where notifying on every historical job would flood inboxes."
+        ),
+    )
+    parser.set_defaults(send_notifications=True)
     return parser.parse_args()
 
 
 async def async_main() -> None:
+    global SEND_JOB_NOTIFICATIONS
     args = parse_args()
+    SEND_JOB_NOTIFICATIONS = args.send_notifications
+    print(
+        "Job-posted notification emails: "
+        + ("ENABLED" if SEND_JOB_NOTIFICATIONS else "DISABLED (--no-send-notifications)")
+    )
     if args.skip_csv:
         raise SystemExit(
             "--skip-csv cannot be used because jobs.csv now stores posting status "

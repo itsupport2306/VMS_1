@@ -103,7 +103,15 @@ const els = {
   candResume: document.getElementById('candResume'),
   submitAnotherBtn: document.getElementById('submitAnotherBtn'),
   submitCloseBtn: document.getElementById('submitCloseBtn'),
-  formAlert: document.getElementById('formAlert')
+  formAlert: document.getElementById('formAlert'),
+  // Job alert preferences
+  viewPreferences: document.getElementById('viewPreferences'),
+  prefEmailEnabled: document.getElementById('prefEmailEnabled'),
+  prefGroups: document.getElementById('prefGroups'),
+  prefSummary: document.getElementById('prefSummary'),
+  prefSaveBtn: document.getElementById('prefSaveBtn'),
+  prefClearBtn: document.getElementById('prefClearBtn'),
+  prefAlert: document.getElementById('prefAlert')
 };
 
 els.apiBase.textContent = `API: ${API_BASE}`;
@@ -276,6 +284,7 @@ function updateAuthUI() {
     els.viewJobs.hidden = true;
     els.viewSubmissions.hidden = true;
     els.viewSettings.hidden = true;
+    if (els.viewPreferences) els.viewPreferences.hidden = true;
     // Hide any previous auth alerts
     els.authAlert.hidden = true;
     els.authAlert.textContent = '';
@@ -308,7 +317,9 @@ function logout() {
     clearInterval(jobsPollInterval);
     jobsPollInterval = null;
   }
-  
+  stopNotificationPolling();
+  clearGetCache();
+
   updateAuthUI();
 }
 
@@ -563,9 +574,16 @@ async function completeLogin(data) {
   resetPasswordVisibility();
   setAuthMode('login', { keepValues: true });
   updateAuthUI();
-  setView('jobs');
-  await loadCeipalStatus();
+  setView(initialViewFromUrl());
+  setStatus('warn', 'CEIPAL disabled');
   await loadJobs();
+  startNotificationPolling();
+}
+
+// Email links deep-link to a view, e.g. ?view=preferences from job alert emails.
+function initialViewFromUrl() {
+  const requestedView = new URLSearchParams(window.location.search).get('view');
+  return requestedView === 'preferences' ? 'preferences' : 'jobs';
 }
 
 async function handleLogin(email, password) {
@@ -658,6 +676,7 @@ function resetOtpFlow() {
 
 // Modified API function that includes auth token
 async function apiPostFormAuth(path, formData) {
+  clearGetCache();
   const headers = {};
   if (authToken) {
     headers['Authorization'] = `Bearer ${authToken}`;
@@ -709,7 +728,41 @@ async function apiGet(path) {
   return json;
 }
 
-async function apiGetAuth(path) {
+// Identical GETs that are already in flight share one request, and selected
+// endpoints are reused for a few seconds. The Offers, Declines and Starts tabs
+// all read /api/candidates; switching between them used to download the full
+// candidate list every time.
+const inflightGets = new Map();
+const getCache = new Map();
+const GET_CACHE_TTL_MS = {
+  '/api/candidates': 30000,
+  '/api/submission-history': 30000,
+};
+
+function clearGetCache() {
+  getCache.clear();
+}
+
+function apiGetAuth(path, { fresh = false } = {}) {
+  const ttl = GET_CACHE_TTL_MS[path] || 0;
+  const cached = getCache.get(path);
+  if (!fresh && ttl && cached && Date.now() - cached.at < ttl) {
+    return Promise.resolve(cached.data);
+  }
+  if (!fresh && inflightGets.has(path)) {
+    return inflightGets.get(path);
+  }
+  const request = apiGetAuthUncached(path)
+    .then(data => {
+      if (ttl) getCache.set(path, { at: Date.now(), data });
+      return data;
+    })
+    .finally(() => inflightGets.delete(path));
+  inflightGets.set(path, request);
+  return request;
+}
+
+async function apiGetAuthUncached(path) {
   const headers = {};
   if (authToken) {
     headers['Authorization'] = `Bearer ${authToken}`;
@@ -734,6 +787,7 @@ async function apiGetAuth(path) {
 }
 
 async function apiPatchAuth(path) {
+  clearGetCache();
   const headers = {};
   if (authToken) {
     headers['Authorization'] = `Bearer ${authToken}`;
@@ -1013,6 +1067,7 @@ function setView(view) {
   els.viewDeclines.hidden = view !== 'declines';
   els.viewStarts.hidden = view !== 'starts';
   els.viewSettings.hidden = view !== 'settings';
+  if (els.viewPreferences) els.viewPreferences.hidden = view !== 'preferences';
 
   if (view === 'auth') {
     els.pageTitle.textContent = 'Authentication';
@@ -1041,6 +1096,11 @@ function setView(view) {
     els.pageTitle.textContent = 'Starts';
     els.pageSubtitle.textContent = 'Track candidates who have started working.';
     loadStarts();
+  }
+  if (view === 'preferences') {
+    els.pageTitle.textContent = 'Job Alerts';
+    els.pageSubtitle.textContent = 'Choose which new jobs you get emailed about.';
+    loadPreferences();
   }
   if (view === 'settings') {
     els.pageTitle.textContent = 'System';
@@ -1435,6 +1495,8 @@ function hideLoadingSpinner() {
   if (spinner) spinner.style.display = 'none';
 }
 
+// Kept for the System view. The Ceipal integration is disabled on the server, so
+// the page no longer calls this on every load and refresh.
 async function loadCeipalStatus() {
   try {
     const data = await apiGet('/api/ceipal/status');
@@ -2119,14 +2181,15 @@ function closeEmailVendorModal() {
 }
 
 // UI events
-els.searchInput.addEventListener('input', renderJobs);
+let searchDebounce = null;
+els.searchInput.addEventListener('input', () => {
+  clearTimeout(searchDebounce);
+  searchDebounce = setTimeout(renderJobs, 200);
+});
 els.statusFilter.addEventListener('change', renderJobs);
 if (els.stateFilter) els.stateFilter.addEventListener('change', renderJobs);
 if (els.specialtyFilter) els.specialtyFilter.addEventListener('change', renderJobs);
-els.refreshBtn.addEventListener('click', async () => {
-  await loadJobs();
-  await loadCeipalStatus();
-});
+els.refreshBtn.addEventListener('click', loadJobs);
 els.ceipalCacheBtn.addEventListener('click', async () => {
   try {
     const cache = await apiGet('/api/ceipal/cache');
@@ -2276,9 +2339,40 @@ function showToast(message, type = 'info', duration = 3000) {
 
 // Notifications handling
 let notificationsData = { notifications: [], unread_count: 0 };
+const NOTIFICATION_POLL_MS = 60000;
+let notificationPollTimer = null;
+let notificationsLoadedAt = 0;
+
+// Poll only while this tab is visible. Every open tab used to poll once a
+// minute forever, so a user with several tabs multiplied the load, and a
+// background tab kept hitting the API all day.
+function startNotificationPolling() {
+  stopNotificationPolling();
+  if (!authToken || !currentUser) return;
+  if (document.visibilityState === 'visible') loadNotifications();
+  notificationPollTimer = setInterval(() => {
+    if (document.visibilityState === 'visible') loadNotifications();
+  }, NOTIFICATION_POLL_MS);
+}
+
+function stopNotificationPolling() {
+  if (notificationPollTimer) {
+    clearInterval(notificationPollTimer);
+    notificationPollTimer = null;
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  // Catch up when a tab comes back, but only if the last check is stale.
+  if (document.visibilityState === 'visible' && notificationPollTimer &&
+      Date.now() - notificationsLoadedAt > NOTIFICATION_POLL_MS) {
+    loadNotifications();
+  }
+});
 
 async function loadNotifications() {
   if (!authToken || !currentUser) return;
+  notificationsLoadedAt = Date.now();
   
   try {
     const response = await fetch(`${API_BASE}/api/notifications`, {
@@ -2441,14 +2535,134 @@ document.addEventListener('DOMContentLoaded', () => {
   
   if (authToken && currentUser) {
     // Already logged in
-    setView('jobs');
-    await loadCeipalStatus();
+    setView(initialViewFromUrl());
+    setStatus('warn', 'CEIPAL disabled');
+    startNotificationPolling();
     await loadJobs();
-    await loadNotifications();
-    // Poll for notifications every minute
-    setInterval(loadNotifications, 60000);
   } else {
     // Not logged in - show auth view
     setView('auth');
   }
 })();
+
+// ---------------------------------------------------------------------------
+// Job alert preferences
+// ---------------------------------------------------------------------------
+const PREFERENCE_GROUPS = [
+  { field: 'professions', label: 'Profession' },
+  { field: 'specialties', label: 'Specialty' },
+  { field: 'job_types', label: 'Job type' },
+  { field: 'states', label: 'State' },
+];
+const STATE_CODE_TO_NAME = Object.entries(STATE_NAME_TO_CODE).reduce((map, [name, code]) => {
+  map[code] = name;
+  return map;
+}, {});
+
+let preferencesState = null;
+
+function showPrefAlert(kind, msg) {
+  if (!els.prefAlert) return;
+  els.prefAlert.hidden = !msg;
+  els.prefAlert.className = `alert ${kind === 'ok' ? 'alert--ok' : 'alert--error'}`;
+  els.prefAlert.textContent = msg || '';
+}
+
+function preferenceLabel(field, value) {
+  if (field === 'states' && STATE_CODE_TO_NAME[value]) return `${STATE_CODE_TO_NAME[value]} (${value})`;
+  return value;
+}
+
+function selectedPreferenceValues(field) {
+  return [...els.prefGroups.querySelectorAll(`input[data-pref-field="${field}"]:checked`)].map(input => input.value);
+}
+
+function updatePreferenceSummary() {
+  if (!els.prefSummary) return;
+  if (!els.prefEmailEnabled.checked) {
+    els.prefSummary.textContent = 'Job emails are off. New jobs still appear in the bell, filtered by the choices below.';
+    return;
+  }
+  const parts = PREFERENCE_GROUPS
+    .map(({ field, label }) => {
+      const values = selectedPreferenceValues(field);
+      return values.length ? `${label}: ${values.map(v => preferenceLabel(field, v)).join(', ')}` : null;
+    })
+    .filter(Boolean);
+  els.prefSummary.textContent = parts.length
+    ? `You will be emailed about new jobs matching ${parts.join(' and ')}.`
+    : 'No filters selected: you will be emailed about every new job.';
+}
+
+function renderPreferences() {
+  const { preferences, options } = preferencesState;
+  els.prefEmailEnabled.checked = preferences.email_notifications !== false;
+  els.prefGroups.innerHTML = PREFERENCE_GROUPS.map(({ field, label }) => {
+    const selected = new Set(preferences[field] || []);
+    const values = options[field] || [];
+    const chips = values.length
+      ? values.map(value => `
+          <label class="pref-chip">
+            <input type="checkbox" data-pref-field="${field}" value="${escapeHtml(value)}" ${selected.has(value) ? 'checked' : ''} />
+            <span>${escapeHtml(preferenceLabel(field, value))}</span>
+          </label>`).join('')
+      : '<div class="meta">No values available yet.</div>';
+    return `
+      <fieldset class="pref-group">
+        <legend class="pref-group__title">${label} <span class="meta">(none selected = any)</span></legend>
+        <div class="pref-group__chips">${chips}</div>
+      </fieldset>`;
+  }).join('');
+  updatePreferenceSummary();
+}
+
+async function loadPreferences() {
+  if (!els.prefGroups) return;
+  showPrefAlert('ok', '');
+  els.prefGroups.innerHTML = '<div class="loading-jobs">Loading preferences...</div>';
+  try {
+    preferencesState = await apiGetAuth('/api/preferences', { fresh: true });
+    renderPreferences();
+  } catch (err) {
+    els.prefGroups.innerHTML = '';
+    showPrefAlert('error', 'Could not load your preferences. Please try again.');
+  }
+}
+
+async function savePreferences() {
+  const body = { email_notifications: els.prefEmailEnabled.checked };
+  PREFERENCE_GROUPS.forEach(({ field }) => { body[field] = selectedPreferenceValues(field); });
+
+  els.prefSaveBtn.disabled = true;
+  els.prefSaveBtn.textContent = 'Saving...';
+  try {
+    const res = await fetch(`${API_BASE}/api/preferences`, {
+      method: 'PUT',
+      headers: { 'Authorization': `Bearer ${authToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (res.status === 401) {
+      logout();
+      return;
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    preferencesState.preferences = data.preferences;
+    showPrefAlert('ok', 'Preferences saved.');
+  } catch (err) {
+    showPrefAlert('error', 'Could not save your preferences. Please try again.');
+  } finally {
+    els.prefSaveBtn.disabled = false;
+    els.prefSaveBtn.textContent = 'Save preferences';
+  }
+}
+
+if (els.prefGroups) {
+  els.prefGroups.addEventListener('change', updatePreferenceSummary);
+  els.prefEmailEnabled.addEventListener('change', updatePreferenceSummary);
+  els.prefSaveBtn.addEventListener('click', savePreferences);
+  els.prefClearBtn.addEventListener('click', () => {
+    els.prefGroups.querySelectorAll('input[type="checkbox"]').forEach(input => { input.checked = false; });
+    updatePreferenceSummary();
+  });
+}

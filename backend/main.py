@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, status, Form, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, Response
 from fastapi.security import HTTPBearer, HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, root_validator
@@ -23,9 +24,11 @@ import secrets
 import hashlib
 import smtplib
 from threading import Lock
+from concurrent.futures import ThreadPoolExecutor
 from email.message import EmailMessage
-from urllib.parse import urlencode
-from pymongo import MongoClient
+from urllib.parse import quote, urlencode
+from pymongo import MongoClient, ReturnDocument, UpdateOne
+from pymongo.errors import DuplicateKeyError
 from pymongo.server_api import ServerApi
 from bson.objectid import ObjectId
 
@@ -46,6 +49,9 @@ closure_audit_collection = None
 manual_jobs_collection = None
 submission_logs_collection = None
 auth_tokens_collection = None
+user_preferences_collection = None
+job_notification_outbox_collection = None
+locks_collection = None
 fs = None
 
 
@@ -60,6 +66,19 @@ def ensure_mongodb_indexes() -> None:
         ("manual_jobs.job_id", manual_jobs_collection, "job_id", {"name": "manual_jobs_job_id_idx"}),
         ("auth_tokens.key", auth_tokens_collection, [("kind", 1), ("key", 1)], {"name": "auth_tokens_kind_key_idx", "unique": True}),
         ("auth_tokens.expires_at_ttl", auth_tokens_collection, "expires_at", {"name": "auth_tokens_ttl_idx", "expireAfterSeconds": 0}),
+        # Hot read paths that previously ran as full collection scans.
+        ("candidates.id", candidates_collection, "id", {"name": "candidates_id_idx"}),
+        ("candidates.job_id", candidates_collection, "job_id", {"name": "candidates_job_id_idx"}),
+        ("candidates.submitter_date", candidates_collection, [("submitted_by_user_id", 1), ("submitted_date", 1)], {"name": "candidates_submitter_date_idx"}),
+        ("notifications.user_created", notifications_collection, [("user_email", 1), ("created_at", -1)], {"name": "notifications_user_created_idx"}),
+        ("notifications.user_read", notifications_collection, [("user_email", 1), ("read", 1)], {"name": "notifications_user_read_idx"}),
+        ("notifications.type_job_user", notifications_collection, [("type", 1), ("job_id", 1), ("user_email", 1)], {"name": "notifications_type_job_user_idx"}),
+        ("submission_logs.submitted_at", submission_logs_collection, [("submitted_at", -1)], {"name": "submission_logs_submitted_at_idx"}),
+        ("whitelist.email", whitelist_collection, "email", {"name": "whitelist_email_idx"}),
+        ("job_status_tracker.job_id", job_status_tracker_collection, "job_id", {"name": "job_status_tracker_job_id_idx"}),
+        ("user_preferences.email", user_preferences_collection, "email", {"name": "user_preferences_email_idx", "unique": True}),
+        ("job_notification_outbox.job_id", job_notification_outbox_collection, "job_id", {"name": "job_outbox_job_id_idx", "unique": True}),
+        ("job_notification_outbox.status", job_notification_outbox_collection, [("status", 1), ("queued_at", 1)], {"name": "job_outbox_status_idx"}),
     ]
     for label, collection, keys, kwargs in index_specs:
         if collection is None:
@@ -70,9 +89,33 @@ def ensure_mongodb_indexes() -> None:
         except Exception as e:
             print(f"[MongoDB] Failed to ensure index {label}: {e}")
 
+MONGODB_SLOW_PING_MS = float(os.getenv("MONGODB_SLOW_PING_MS", "15"))
+mongodb_startup_ping_ms: Optional[float] = None
+
+
+def measure_mongodb_ping_ms(samples: int = 5) -> Optional[float]:
+    """Median round trip to MongoDB in milliseconds.
+
+    Every database call pays this delay, often several times per request. When
+    Atlas runs in the same cloud region as the app it is typically 1-5 ms; a few
+    tens of ms or more means the cluster and the droplets are in different regions.
+    """
+    if mongo_client is None:
+        return None
+    import time
+    timings = []
+    for _ in range(samples):
+        t0 = time.perf_counter()
+        mongo_client.admin.command("ping")
+        timings.append((time.perf_counter() - t0) * 1000)
+    timings.sort()
+    return round(timings[len(timings) // 2], 1)
+
+
 def init_mongodb():
     """Initialize MongoDB connection"""
-    global mongo_client, db, users_collection, whitelist_collection, candidates_collection, notifications_collection, jobs_collection, job_status_tracker_collection, closure_audit_collection, manual_jobs_collection, submission_logs_collection, auth_tokens_collection, fs
+    global mongodb_startup_ping_ms
+    global mongo_client, db, users_collection, whitelist_collection, candidates_collection, notifications_collection, jobs_collection, job_status_tracker_collection, closure_audit_collection, manual_jobs_collection, submission_logs_collection, auth_tokens_collection, user_preferences_collection, job_notification_outbox_collection, locks_collection, fs
     
     print(f"[MongoDB] Checking configuration...")
     print(f"[MongoDB] MONGODB_URI present: {bool(MONGODB_URI)}")
@@ -85,7 +128,12 @@ def init_mongodb():
     
     try:
         print(f"[MongoDB] Attempting to connect...")
-        mongo_client = MongoClient(MONGODB_URI, server_api=ServerApi('1'))
+        mongo_client = MongoClient(
+            MONGODB_URI,
+            server_api=ServerApi('1'),
+            maxPoolSize=int(os.getenv("MONGODB_MAX_POOL_SIZE", "50")),
+            serverSelectionTimeoutMS=int(os.getenv("MONGODB_SERVER_SELECTION_TIMEOUT_MS", "10000")),
+        )
         db = mongo_client.vms
         users_collection = db.users
         whitelist_collection = db.whitelist
@@ -97,6 +145,9 @@ def init_mongodb():
         manual_jobs_collection = db.manual_jobs  # Direct API-ingested jobs
         submission_logs_collection = db.submission_logs  # Immutable audit log for candidate submissions
         auth_tokens_collection = db.auth_tokens  # Password-reset tokens and login/registration OTPs shared across workers
+        user_preferences_collection = db.user_preferences  # Per-user job notification preferences
+        job_notification_outbox_collection = db.job_notification_outbox  # Durable queue of posted jobs awaiting digest emails
+        locks_collection = db.locks  # Cross-worker leases (only one worker sends digests at a time)
         
         # Initialize GridFS for file storage
         import gridfs
@@ -106,6 +157,18 @@ def init_mongodb():
         mongo_client.admin.command('ping')
         ensure_mongodb_indexes()
         print("[MongoDB] Connected successfully (with GridFS)")
+        try:
+            mongodb_startup_ping_ms = measure_mongodb_ping_ms()
+            if mongodb_startup_ping_ms is not None and mongodb_startup_ping_ms > MONGODB_SLOW_PING_MS:
+                print(
+                    f"[MongoDB] WARNING: median round trip is {mongodb_startup_ping_ms} ms "
+                    f"(threshold {MONGODB_SLOW_PING_MS} ms). The Atlas cluster is probably in a "
+                    f"different region from this server; every request pays this delay per query."
+                )
+            else:
+                print(f"[MongoDB] Median round trip: {mongodb_startup_ping_ms} ms")
+        except Exception as e:
+            print(f"[MongoDB] Could not measure round-trip time: {e}")
         return True
     except Exception as e:
         print(f"[MongoDB] Connection failed: {e}")
@@ -761,6 +824,7 @@ def send_job_posted_notification_email(
                 <a href="{html.escape(APP_URL)}" style="padding: 12px 24px; background: #7c3aed; color: white; text-decoration: none; border-radius: 6px;">View Job</a>
             </p>
             <p style="color: #666; font-size: 12px; margin-top: 30px;">
+                Getting jobs you are not interested in? <a href="{html.escape(preferences_url())}">Update your job alert preferences</a>.<br>
                 This is an automated notification from the Vendor Management System.<br>
                 For questions, please contact admin@radixsol.com
             </p>
@@ -794,56 +858,421 @@ def build_job_posted_meta_tags(
     return tags
 
 
-def notify_users_about_job_posted(job, source: str = "direct_api") -> int:
-    """Notify whitelisted users about a newly posted direct/manual job."""
-    if not mongodb_enabled or notifications_collection is None:
-        print("[JobPosted] Skipping direct posted-job notifications - MongoDB notifications unavailable.")
-        return 0
+# ---------------------------------------------------------------------------
+# Job alert preferences.
+#
+# Each user can narrow which posted jobs they hear about by profession,
+# specialty, job type and state. An empty list on a dimension means "any", so a
+# user who never sets preferences keeps receiving every job, exactly as before.
+# ---------------------------------------------------------------------------
+
+PREFERENCE_LIST_FIELDS = ("professions", "specialties", "job_types", "states")
+PREFERENCE_MAX_VALUES = 200
+PREFERENCE_MAX_VALUE_LENGTH = 120
+_preferences_file_lock = Lock()
+
+US_STATE_CODES = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR", "california": "CA",
+    "colorado": "CO", "connecticut": "CT", "delaware": "DE", "district of columbia": "DC",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID", "illinois": "IL",
+    "indiana": "IN", "iowa": "IA", "kansas": "KS", "kentucky": "KY", "louisiana": "LA",
+    "maine": "ME", "maryland": "MD", "massachusetts": "MA", "michigan": "MI", "minnesota": "MN",
+    "mississippi": "MS", "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+    "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK", "oregon": "OR",
+    "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC", "south dakota": "SD",
+    "tennessee": "TN", "texas": "TX", "utah": "UT", "vermont": "VT", "virginia": "VA",
+    "washington": "WA", "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+}
+
+
+def _clean_text(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _match_key(value: Any) -> str:
+    return _clean_text(value).lower()
+
+
+def normalize_state(value: Any) -> str:
+    """Map 'Michigan' / 'mi' / 'MI' to 'MI' so Excel and Nexus jobs compare equal."""
+    text = _clean_text(value)
+    if not text:
+        return ""
+    return US_STATE_CODES.get(text.lower(), text.upper() if len(text) == 2 else text)
+
+
+def default_job_preferences(email: str) -> dict:
+    return {
+        "email": (email or "").strip().lower(),
+        "email_notifications": True,
+        **{field: [] for field in PREFERENCE_LIST_FIELDS},
+        "updated_at": None,
+    }
+
+
+def clean_job_preferences(email: str, raw: dict) -> dict:
+    prefs = default_job_preferences(email)
+    prefs["email_notifications"] = bool(raw.get("email_notifications", True))
+    for field in PREFERENCE_LIST_FIELDS:
+        seen = set()
+        values = []
+        for value in raw.get(field) or []:
+            text = _clean_text(value)[:PREFERENCE_MAX_VALUE_LENGTH]
+            if field == "states":
+                text = normalize_state(text)
+            if text and _match_key(text) not in seen:
+                seen.add(_match_key(text))
+                values.append(text)
+        prefs[field] = values[:PREFERENCE_MAX_VALUES]
+    return prefs
+
+
+def _preferences_file() -> str:
+    return os.path.join(DATA_DIR, "user_preferences.json")
+
+
+def _read_preferences_file() -> dict:
+    path = _preferences_file()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"[Preferences] Could not read {path}: {e}")
+        return {}
+
+
+def get_preferences_for_users(emails: List[str]) -> Dict[str, dict]:
+    """Preferences for many users in one query; users without a record get defaults."""
+    emails = [(e or "").strip().lower() for e in emails if e]
+    stored: Dict[str, dict] = {}
+    if mongodb_enabled and user_preferences_collection is not None:
+        for doc in user_preferences_collection.find({"email": {"$in": emails}}, {"_id": 0}):
+            stored[doc["email"]] = doc
+    else:
+        with _preferences_file_lock:
+            file_data = _read_preferences_file()
+        stored = {email: file_data[email] for email in emails if email in file_data}
+    return {
+        email: clean_job_preferences(email, stored[email]) if email in stored else default_job_preferences(email)
+        for email in emails
+    }
+
+
+def get_user_preferences(email: str) -> dict:
+    email_lower = (email or "").strip().lower()
+    prefs = get_preferences_for_users([email_lower]).get(email_lower) or default_job_preferences(email_lower)
+    if mongodb_enabled and user_preferences_collection is not None:
+        doc = user_preferences_collection.find_one({"email": email_lower}, {"_id": 0, "updated_at": 1})
+        prefs["updated_at"] = (doc or {}).get("updated_at")
+    return prefs
+
+
+def save_user_preferences(email: str, raw: dict) -> dict:
+    prefs = clean_job_preferences(email, raw)
+    prefs["updated_at"] = datetime.now().isoformat()
+    if mongodb_enabled and user_preferences_collection is not None:
+        user_preferences_collection.update_one({"email": prefs["email"]}, {"$set": prefs}, upsert=True)
+        return prefs
+    with _preferences_file_lock:
+        data = _read_preferences_file()
+        data[prefs["email"]] = prefs
+        os.makedirs(os.path.dirname(_preferences_file()), exist_ok=True)
+        with open(_preferences_file(), "w") as f:
+            json.dump(data, f, indent=2)
+    return prefs
+
+
+def job_preference_attributes(job: dict) -> dict:
+    """The fields of a job that preferences filter on, normalized for matching."""
+    specialty = job.get("specialty") or ""
+    department = job.get("department") or ""
+    if not specialty and department and not department.lower().startswith("job code:"):
+        specialty = department
+    state = job.get("state") or ""
+    if not state:
+        parts = [p.strip() for p in str(job.get("location") or "").split(",") if p.strip()]
+        state = parts[-1] if len(parts) > 1 else ""
+    return {
+        "professions": _match_key(job.get("profession")),
+        "specialties": _match_key(specialty),
+        "job_types": _match_key(job.get("title")),
+        "states": _match_key(normalize_state(state)),
+    }
+
+
+def job_matches_preferences(job_attrs: dict, prefs: dict) -> bool:
+    for field in PREFERENCE_LIST_FIELDS:
+        wanted = {_match_key(v) for v in prefs.get(field) or []}
+        if wanted and job_attrs.get(field) not in wanted:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Posted-job notification outbox.
+#
+# Posting a job used to email every whitelisted user immediately, one email per
+# job, from a BackgroundTask inside the request's worker: a bulk post of 25 jobs
+# meant 25 emails to each user, sent serially, and the queue was lost on any
+# restart or redeploy. Jobs now go into a MongoDB outbox. A periodic flush,
+# guarded by a cross-worker lease so only one of the API workers sends, groups
+# everything queued since the last flush into one digest per user, filtered by
+# that user's preferences.
+# ---------------------------------------------------------------------------
+
+JOB_NOTIFICATION_DIGEST_SECONDS = int(os.getenv("JOB_NOTIFICATION_DIGEST_SECONDS", "300"))
+JOB_NOTIFICATION_DIGEST_MAX_LISTED = int(os.getenv("JOB_NOTIFICATION_DIGEST_MAX_LISTED", "25"))
+JOB_NOTIFICATION_FLUSH_BATCH = int(os.getenv("JOB_NOTIFICATION_FLUSH_BATCH", "500"))
+JOB_NOTIFICATION_SEND_CONCURRENCY = int(os.getenv("JOB_NOTIFICATION_SEND_CONCURRENCY", "4"))
+JOB_NOTIFICATION_LEASE_SECONDS = 15 * 60
+WORKER_ID = f"{os.getpid()}-{uuid4().hex[:8]}"
+
+
+def preferences_url() -> str:
+    return f"{APP_URL.rstrip('/')}/?{urlencode({'view': 'preferences'})}"
+
+
+def job_notification_snapshot(job) -> dict:
+    return {
+        "id": job.id,
+        "title": job.title,
+        "location": job.location,
+        "department": job.department,
+        "profession": job.profession or "",
+        "specialty": job.specialty or "",
+        "state": job.state or "",
+        "employment_type": job.employment_type,
+        "status": job.status,
+        "end_client": job.end_client or "",
+    }
+
+
+def enqueue_job_post_notifications(jobs: List["Job"], source: str) -> int:
+    """Queue posted jobs for the next digest. Re-posting a queued job is a no-op."""
     if not JOB_POSTING_NOTIFICATIONS_ENABLED:
-        print(f"[JobPosted] Posting notifications disabled - skipping {job.id}")
+        print(f"[JobPosted] Posting notifications disabled - not queueing {len(jobs)} job(s) from {source}")
         return 0
-    # Always re-read the shared whitelist. This worker's copy is per-process, so
-    # users who registered against another worker were silently left out of every
-    # new-job notification until the next restart.
-    recipients = sorted(
-        {u.lower() for u in get_whitelisted_emails(force_refresh=True) if u.lower() != ADMIN_EMAIL.lower()}
+    if not mongodb_enabled or job_notification_outbox_collection is None:
+        print("[JobPosted] Skipping posted-job notifications - MongoDB unavailable.")
+        return 0
+
+    open_jobs = [job for job in jobs if normalize_job_status(job.status) == "Open"]
+    if not open_jobs:
+        return 0
+    now = datetime.now()
+    result = job_notification_outbox_collection.bulk_write(
+        [
+            UpdateOne(
+                {"job_id": job.id},
+                {"$setOnInsert": {
+                    "job_id": job.id,
+                    "job": job_notification_snapshot(job),
+                    "source": source,
+                    "status": "pending",
+                    "queued_at": now,
+                }},
+                upsert=True,
+            )
+            for job in open_jobs
+        ],
+        ordered=False,
     )
-    if not recipients:
-        print(f"[JobPosted] No notification recipients for job {job.id}")
-        return 0
-    sent_count = 0
-    for user_email in recipients:
-        existing = notifications_collection.find_one({
-            "type": "job_posted",
-            "job_id": job.id,
-            "user_email": user_email,
-        })
-        if existing:
-            continue
-        meta_tags = build_job_posted_meta_tags(
-            specialty=job.specialty or job.department,
-            state=job.state or "",
-            employment_type=job.employment_type,
-            status=job.status,
-            end_client=job.end_client or "",
+    queued = result.upserted_count
+    print(f"[JobPosted] Queued {queued} new job(s) from {source} for the next digest ({len(open_jobs) - queued} already queued/sent)")
+    return queued
+
+
+def _acquire_lease(name: str, seconds: int) -> bool:
+    now = datetime.utcnow()
+    try:
+        locks_collection.find_one_and_update(
+            {"_id": name, "$or": [{"locked_until": {"$lt": now}}, {"locked_until": {"$exists": False}}]},
+            {"$set": {"locked_until": now + timedelta(seconds=seconds), "owner": WORKER_ID}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
         )
-        email_sent = send_job_posted_notification_email(user_email, job.title, job.id, job.location, meta_tags)
-        notifications_collection.insert_one({
-            "id": str(uuid4()),
-            "type": "job_posted",
-            "job_id": job.id,
-            "job_title": job.title,
-            "user_email": user_email,
-            "email_sent": email_sent,
-            "source": source,
-            "meta_tags": meta_tags,
-            "created_at": datetime.now().isoformat(),
-            "read": False,
-        })
-        if email_sent:
-            sent_count += 1
-    print(f"[JobPosted] Notified {sent_count}/{len(recipients)} users about posted job {job.id}")
-    return sent_count
+        return True
+    except DuplicateKeyError:
+        return False  # another worker holds an unexpired lease
+
+
+def _release_lease(name: str) -> None:
+    try:
+        locks_collection.update_one(
+            {"_id": name, "owner": WORKER_ID},
+            # In the past, not "now": Mongo keeps millisecond precision, so a lease
+            # released and re-acquired within the same millisecond would look held.
+            {"$set": {"locked_until": datetime.utcnow() - timedelta(seconds=1)}},
+        )
+    except Exception as e:
+        print(f"[JobDigest] Could not release lease {name}: {e}")
+
+
+def send_job_digest_email(user_email: str, jobs: List[dict]) -> bool:
+    """One email listing every new job that matched this user's preferences."""
+    if len(jobs) == 1:
+        job = jobs[0]
+        return send_job_posted_notification_email(
+            user_email,
+            job["title"],
+            job["id"],
+            job.get("location") or "",
+            build_job_posted_meta_tags(
+                specialty=job.get("specialty") or job.get("department") or "",
+                state=job.get("state") or "",
+                employment_type=job.get("employment_type") or "",
+                status=job.get("status") or "",
+                end_client=job.get("end_client") or "",
+            ),
+        )
+
+    listed = jobs[:JOB_NOTIFICATION_DIGEST_MAX_LISTED]
+    remaining = len(jobs) - len(listed)
+    rows = "".join(
+        f'''<tr>
+                <td style="padding: 8px; border: 1px solid #ddd;">{html.escape(job["title"])}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">{html.escape(job.get("specialty") or job.get("profession") or "")}</td>
+                <td style="padding: 8px; border: 1px solid #ddd;">{html.escape(job.get("location") or "")}</td>
+            </tr>'''
+        for job in listed
+    )
+    more_html = f"<p>…and {remaining} more. Open the portal to see them all.</p>" if remaining else ""
+    html_content = f'''
+        <h2>{len(jobs)} New Jobs Posted</h2>
+        <p>These newly posted jobs match your job alert preferences and are accepting submissions.</p>
+        <table style="border-collapse: collapse; width: 100%; max-width: 640px;">
+            <tr>
+                <th style="padding: 8px; border: 1px solid #ddd; text-align: left;">Job</th>
+                <th style="padding: 8px; border: 1px solid #ddd; text-align: left;">Specialty</th>
+                <th style="padding: 8px; border: 1px solid #ddd; text-align: left;">Location</th>
+            </tr>
+            {rows}
+        </table>
+        {more_html}
+        <p style="margin-top: 20px;">
+            <a href="{html.escape(APP_URL)}" style="padding: 12px 24px; background: #7c3aed; color: white; text-decoration: none; border-radius: 6px;">View Jobs</a>
+        </p>
+        <p style="color: #666; font-size: 12px; margin-top: 30px;">
+            Getting jobs you are not interested in? <a href="{html.escape(preferences_url())}">Update your job alert preferences</a>.<br>
+            This is an automated notification from the Vendor Management System.
+        </p>
+    '''
+    text_lines = [f"{len(jobs)} new jobs matching your preferences:"]
+    text_lines += [f"- {job['title']} ({job.get('location') or 'location n/a'})" for job in listed]
+    if remaining:
+        text_lines.append(f"...and {remaining} more.")
+    text_lines.append(f"Manage your job alert preferences: {preferences_url()}")
+    return send_app_email(
+        user_email,
+        subject=f"{len(jobs)} new jobs matching your preferences",
+        html_content=html_content,
+        text_content="\n".join(text_lines),
+    )
+
+
+def flush_job_notification_outbox() -> None:
+    """Send one digest per user for everything queued since the last flush."""
+    if not mongodb_enabled or job_notification_outbox_collection is None or locks_collection is None:
+        return
+    if not _acquire_lease("job_notification_digest", JOB_NOTIFICATION_LEASE_SECONDS):
+        return
+    try:
+        pending = list(
+            job_notification_outbox_collection.find({"status": "pending"})
+            .sort("queued_at", 1)
+            .limit(JOB_NOTIFICATION_FLUSH_BATCH)
+        )
+        if not pending:
+            return
+
+        jobs = [doc["job"] for doc in pending]
+        job_ids = [job["id"] for job in jobs]
+        job_attrs = {job["id"]: job_preference_attributes(job) for job in jobs}
+        recipients = sorted(
+            {u.lower() for u in get_whitelisted_emails(force_refresh=True) if u.lower() != ADMIN_EMAIL.lower()}
+        )
+        prefs_by_user = get_preferences_for_users(recipients)
+
+        # Who already heard about which job (earlier runs, or the pre-outbox sender).
+        already_notified = {
+            (doc["user_email"], doc["job_id"])
+            for doc in notifications_collection.find(
+                {"type": "job_posted", "job_id": {"$in": job_ids}},
+                {"_id": 0, "user_email": 1, "job_id": 1},
+            )
+        } if notifications_collection is not None else set()
+
+        deliveries = []
+        for user_email in recipients:
+            prefs = prefs_by_user[user_email]
+            matched = [
+                job for job in jobs
+                if (user_email, job["id"]) not in already_notified
+                and job_matches_preferences(job_attrs[job["id"]], prefs)
+            ]
+            if matched:
+                deliveries.append((user_email, prefs, matched))
+
+        def deliver(user_email: str, prefs: dict, matched: List[dict]) -> bool:
+            email_sent = False
+            if prefs.get("email_notifications", True):
+                try:
+                    email_sent = send_job_digest_email(user_email, matched)
+                except Exception as e:
+                    print(f"[JobDigest] Email to {user_email} failed: {e}")
+            if notifications_collection is not None:
+                created_at = datetime.now().isoformat()
+                notifications_collection.insert_many([
+                    {
+                        "id": str(uuid4()),
+                        "type": "job_posted",
+                        "job_id": job["id"],
+                        "job_title": job["title"],
+                        "user_email": user_email,
+                        "email_sent": email_sent,
+                        "digest_size": len(matched),
+                        "source": "digest",
+                        "created_at": created_at,
+                        "read": False,
+                    }
+                    for job in matched
+                ])
+            return email_sent
+
+        emails_sent = 0
+        if deliveries:
+            # Bounded parallelism: fast enough for many users without tripping
+            # SendGrid rate limits or starving the API's own threadpool.
+            with ThreadPoolExecutor(max_workers=JOB_NOTIFICATION_SEND_CONCURRENCY) as pool:
+                for sent in pool.map(lambda d: deliver(*d), deliveries):
+                    emails_sent += int(bool(sent))
+
+        job_notification_outbox_collection.update_many(
+            {"_id": {"$in": [doc["_id"] for doc in pending]}},
+            {"$set": {"status": "sent", "processed_at": datetime.now()}},
+        )
+        print(
+            f"[JobDigest] Processed {len(jobs)} job(s): {len(deliveries)} user(s) matched, "
+            f"{emails_sent} digest email(s) sent, {len(recipients) - len(deliveries)} user(s) had no matches"
+        )
+    finally:
+        _release_lease("job_notification_digest")
+
+
+async def job_notification_digest_loop() -> None:
+    # Stagger workers so they do not all race for the lease at the same instant.
+    await asyncio.sleep(5 + secrets.randbelow(25))
+    while True:
+        try:
+            await asyncio.to_thread(flush_job_notification_outbox)
+        except Exception as e:
+            import traceback
+            print(f"[JobDigest] Flush failed: {e}\n{traceback.format_exc()}")
+        await asyncio.sleep(JOB_NOTIFICATION_DIGEST_SECONDS)
 
 
 def extract_ceipal_status_entries(reports_data) -> list:
@@ -1239,6 +1668,23 @@ _users_cache_lock = Lock()
 _manual_jobs_cache: Optional[List["Job"]] = None
 _manual_jobs_cache_time: Optional[datetime] = None
 _manual_jobs_cache_lock = Lock()
+# Held while the manual jobs collection is being re-read, so that when the cache
+# expires only one request pays for the scan and the rest reuse its result.
+_manual_jobs_rebuild_lock = Lock()
+
+# Fully sanitized + serialized /api/jobs payloads, keyed by role ("admin"/"vendor").
+# Rebuilt only when the underlying job lists change, instead of re-running the
+# compensation/client-name regexes over every job on every request.
+_jobs_response_cache: Dict[str, Dict[str, Any]] = {}
+_jobs_response_cache_lock = Lock()
+_jobs_response_generation = 0
+
+
+def clear_jobs_response_cache() -> None:
+    global _jobs_response_generation
+    with _jobs_response_cache_lock:
+        _jobs_response_cache.clear()
+        _jobs_response_generation += 1
 
 
 def _cache_is_fresh(cache_time: Optional[datetime], ttl_seconds: int) -> bool:
@@ -1258,7 +1704,7 @@ def clear_manual_jobs_cache() -> None:
     with _manual_jobs_cache_lock:
         _manual_jobs_cache = None
         _manual_jobs_cache_time = None
-    print("[Manual Jobs] Cache cleared")
+    clear_jobs_response_cache()
 
 
 def _normalize_is_active(value: Any) -> str:
@@ -1336,8 +1782,6 @@ def load_users_from_json(force_refresh: bool = False):
     global _users_cache, _users_cache_time
 
     if not force_refresh and _users_cache and _cache_is_fresh(_users_cache_time, USERS_CACHE_SECONDS):
-        age = int((datetime.now() - _users_cache_time).total_seconds())
-        print(f"[Auth] Using cached users ({len(_users_cache)} users, cached {age}s ago)")
         with _users_cache_lock:
             return dict(_users_cache)
 
@@ -1664,12 +2108,19 @@ async def startup_event():
         asyncio.create_task(scheduled_job_fetch())
     else:
         print("[Startup] Ceipal integration disabled; background fetch skipped")
+    if mongodb_enabled:
+        print(f"[Startup] Job notification digest every {JOB_NOTIFICATION_DIGEST_SECONDS}s")
+        asyncio.create_task(job_notification_digest_loop())
 
 # Web UI (HTML/CSS/JS)
 WEB_DIR = os.path.join(os.path.dirname(__file__), "web")
 ASSETS_DIR = os.path.join(WEB_DIR, "assets")
 if os.path.isdir(ASSETS_DIR):
     app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
+
+# Compress JSON responses. /api/jobs carries every job with its full description,
+# and was previously shipped uncompressed to every tab on every load.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # CORS Middleware
 app.add_middleware(
@@ -1865,7 +2316,6 @@ async def get_current_user(token: str = Depends(HTTPBearer())):
     if not is_user_active(user):
         print(f"[Auth] User {email_lower} is inactive: {user.get('is_active')}")
         raise HTTPException(status_code=400, detail="Inactive user")
-    print(f"[Auth] User {email_lower} authenticated successfully")
     
     # Return as dict-like object for compatibility
     return type('User', (), {
@@ -1922,7 +2372,7 @@ async def register(user_data: UserCreate, request: Request):
             "id": str(uuid4()),
             "email": email_lower,
             "full_name": full_name,
-            "hashed_password": get_password_hash(password),
+            "hashed_password": await asyncio.to_thread(get_password_hash, password),
             "is_active": "true",
             "created_at": datetime.now().isoformat(),
         },
@@ -2047,7 +2497,7 @@ async def request_login_otp(request_data: OtpRequest, request: Request):
 
 
 @app.post("/api/auth/verify-otp", response_model=Token)
-async def verify_login_otp(request_data: OtpVerify):
+def verify_login_otp(request_data: OtpVerify):
     """Verify email OTP and return a 7-day JWT session."""
     cleanup_expired_otps()
 
@@ -2122,7 +2572,8 @@ async def login(user_data: UserLogin):
 
     if not is_user_active(user):
         raise HTTPException(status_code=400, detail="Inactive user")
-    if not verify_password(user_data.password, user["hashed_password"]):
+    # bcrypt is deliberately slow (~100ms+); keep it off the event loop.
+    if not await asyncio.to_thread(verify_password, user_data.password, user["hashed_password"]):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
 
     access_token = create_access_token(
@@ -2235,7 +2686,7 @@ async def reset_password_with_token(data: ResetPasswordWithToken):
         raise HTTPException(status_code=400, detail="Invalid or expired reset token")
 
     # Update password on that one record only
-    user["hashed_password"] = get_password_hash(data.password)
+    user["hashed_password"] = await asyncio.to_thread(get_password_hash, data.password)
     if not await asyncio.to_thread(save_user_record, user):
         raise HTTPException(status_code=500, detail="Could not update password")
 
@@ -2246,7 +2697,7 @@ async def reset_password_with_token(data: ResetPasswordWithToken):
     return {"message": "Password reset successfully. Please login with your new password."}
 
 @app.get("/api/admin/users")
-async def get_whitelisted_users(current_user: UserDB = Depends(get_current_user)):
+def get_whitelisted_users(current_user: UserDB = Depends(get_current_user)):
     """Get list of whitelisted users (admin only)"""
     is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
     if not is_admin:
@@ -2259,7 +2710,7 @@ async def get_whitelisted_users(current_user: UserDB = Depends(get_current_user)
     }
 
 @app.post("/api/admin/users")
-async def add_whitelisted_user(
+def add_whitelisted_user(
     email: str = Form(...),
     current_user: UserDB = Depends(get_current_user)
 ):
@@ -2287,7 +2738,7 @@ async def add_whitelisted_user(
         raise HTTPException(status_code=500, detail="Failed to save users file")
 
 @app.delete("/api/admin/users/{email}")
-async def remove_whitelisted_user(
+def remove_whitelisted_user(
     email: str,
     current_user: UserDB = Depends(get_current_user)
 ):
@@ -2313,13 +2764,6 @@ async def remove_whitelisted_user(
         return {"message": f"User {email} removed from whitelist", "email": email_lower}
     else:
         raise HTTPException(status_code=500, detail="Failed to save users file")
-
-def clear_excel_jobs_cache():
-    """Clear the Excel jobs cache to force reload on next request"""
-    global _excel_jobs_cache, _excel_jobs_cache_time
-    _excel_jobs_cache = None
-    _excel_jobs_cache_time = None
-    print("[Excel] Cache cleared")
 
 @app.post("/api/admin/jobs/upload-excel")
 async def upload_excel_jobs(
@@ -2388,7 +2832,7 @@ async def upload_excel_jobs(
 
 
 @app.post("/api/admin/jobs")
-async def create_job_from_payload(
+def create_job_from_payload(
     background_tasks: BackgroundTasks,
     payload: DirectJobCreateRequest,
     current_user: UserDB = Depends(get_current_user)
@@ -2414,7 +2858,7 @@ async def create_job_from_payload(
 
 
 @app.post("/api/admin/jobs/bulk")
-async def create_jobs_from_payload_bulk(
+def create_jobs_from_payload_bulk(
     payload: BulkDirectJobCreateRequest,
     background_tasks: BackgroundTasks,
     current_user: UserDB = Depends(get_current_user)
@@ -2449,7 +2893,7 @@ async def create_jobs_from_payload_bulk(
 
 
 @app.delete("/api/admin/jobs/{job_id}")
-async def delete_job_from_payload(
+def delete_job_from_payload(
     job_id: str,
     credentials: AdminJobDeleteRequest
 ):
@@ -2474,7 +2918,7 @@ async def delete_job_from_payload(
 
 
 @app.post("/api/nexus/jobs")
-async def create_nexus_job(payload: DirectJobCreateRequest, background_tasks: BackgroundTasks):
+def create_nexus_job(payload: DirectJobCreateRequest, background_tasks: BackgroundTasks):
     """Create or update a job from Nexus-style request parameters."""
     try:
         job = build_job_from_direct_input(payload)
@@ -2493,7 +2937,7 @@ async def create_nexus_job(payload: DirectJobCreateRequest, background_tasks: Ba
 
 
 @app.post("/api/nexus/jobs/bulk")
-async def create_nexus_jobs_bulk(
+def create_nexus_jobs_bulk(
     payload: BulkDirectJobCreateRequest,
     background_tasks: BackgroundTasks,
 ):
@@ -2617,6 +3061,7 @@ CLIENT_NAME_PATTERNS = [
 # Excel jobs cache
 _excel_jobs_cache: Optional[List[Job]] = None
 _excel_jobs_cache_time: Optional[datetime] = None
+_excel_jobs_rebuild_lock = Lock()
 
 EXCEL_CACHE_MINUTES = 1440  # Cache Excel jobs for 24 hours (1 day) - Excel jobs are static
 
@@ -2764,15 +3209,27 @@ def load_excel_jobs() -> List[Job]:
     
     Returns combined list of all jobs from all files.
     """
-    global _excel_jobs_cache, _excel_jobs_cache_time
-    
-    # Return cached jobs if less than cache duration old
-    if _excel_jobs_cache and _excel_jobs_cache_time:
-        age = datetime.now() - _excel_jobs_cache_time
-        if age < timedelta(minutes=EXCEL_CACHE_MINUTES):
-            print(f"[Excel] Using cached jobs ({len(_excel_jobs_cache)} jobs, cached {age.seconds}s ago)")
+    if _excel_jobs_cache_is_fresh():
+        return _excel_jobs_cache
+    # Single-flight: a cold worker used to parse the spreadsheet with pandas once
+    # per concurrent request, spiking memory right after every deploy.
+    with _excel_jobs_rebuild_lock:
+        if _excel_jobs_cache_is_fresh():
             return _excel_jobs_cache
-    
+        return _read_all_excel_jobs()
+
+
+def _excel_jobs_cache_is_fresh() -> bool:
+    return bool(
+        _excel_jobs_cache
+        and _excel_jobs_cache_time
+        and datetime.now() - _excel_jobs_cache_time < timedelta(minutes=EXCEL_CACHE_MINUTES)
+    )
+
+
+def _read_all_excel_jobs() -> List[Job]:
+    global _excel_jobs_cache, _excel_jobs_cache_time
+
     all_jobs: List[Job] = []
     
     # Load from original file first
@@ -2808,6 +3265,7 @@ def clear_excel_jobs_cache():
     global _excel_jobs_cache, _excel_jobs_cache_time
     _excel_jobs_cache = None
     _excel_jobs_cache_time = None
+    clear_jobs_response_cache()
     print("[Excel] Cache cleared")
 
 
@@ -2938,6 +3396,74 @@ def build_submission_history(candidates: List[dict]) -> List[dict]:
         reverse=True,
     )
     return history
+
+
+def store_candidate_doc(candidate_doc: dict) -> None:
+    """Persist one candidate submission in MongoDB or the JSON fallback."""
+    candidate_id = candidate_doc.get("id")
+    if mongodb_enabled and candidates_collection is not None:
+        # insert_one adds _id to the dict it is given; keep the caller's copy JSON-safe.
+        candidates_collection.insert_one(dict(candidate_doc))
+        print(f"[Submissions] Candidate {candidate_id} stored in MongoDB")
+        return
+
+    candidates_file = os.path.join(DATA_DIR, "candidates.json")
+    existing = []
+    if os.path.exists(candidates_file):
+        with open(candidates_file, 'r') as f:
+            existing = json.load(f)
+    existing.append(candidate_doc)
+    with open(candidates_file, 'w') as f:
+        json.dump(existing, f, indent=2, default=str)
+    print(f"[Submissions] Candidate {candidate_id} stored in JSON (MongoDB not available)")
+
+
+def send_submission_notification_and_log(candidate_doc: dict, vendor_info: dict, summary: dict) -> None:
+    candidate_id = candidate_doc.get("id")
+    try:
+        email_sent = send_submission_notification_email(candidate_doc, vendor_info, summary)
+    except Exception as e:
+        print(f"[Submissions] Exception during notification email dispatch: {e}")
+        email_sent = False
+    if email_sent:
+        print(f"[Submissions] Notification email sent for candidate {candidate_id}")
+    else:
+        print(f"[Submissions] Failed to send notification email for candidate {candidate_id}")
+
+
+def compute_user_submission_summary(submitter_user_id: Optional[str], submitted_at: str) -> dict:
+    """Per-user submission counts, computed with indexed queries in MongoDB.
+
+    Previously every submission loaded the submitter's entire history into memory
+    just to count it.
+    """
+    if not (mongodb_enabled and candidates_collection is not None and submitter_user_id):
+        return get_user_submission_summary(
+            load_candidate_submissions(submitter_user_id),
+            submitter_user_id,
+            submitted_at,
+        )
+
+    submission_date = submitted_at[:10] if len(submitted_at) >= 10 else ""
+    base = {"submitted_by_user_id": submitter_user_id}
+    projection = {"_id": 0, "submitted_date": 1}
+    total = candidates_collection.count_documents(base)
+    on_date = 0
+    if submission_date:
+        # submitted_date is an ISO string, so one day is a contiguous string range.
+        on_date = candidates_collection.count_documents({
+            **base,
+            "submitted_date": {"$gte": submission_date, "$lt": submission_date + "\uffff"},
+        })
+    first = candidates_collection.find_one(base, projection, sort=[("submitted_date", 1)])
+    last = candidates_collection.find_one(base, projection, sort=[("submitted_date", -1)])
+    return {
+        "total_profiles_submitted": total,
+        "profiles_submitted_on_date": on_date,
+        "submission_date": submission_date,
+        "first_submission_at": (first or {}).get("submitted_date") or submitted_at,
+        "last_submission_at": (last or {}).get("submitted_date") or submitted_at,
+    }
 
 
 def get_user_submission_summary(candidates: List[dict], submitter_user_id: Optional[str], submitted_at: str) -> dict:
@@ -3085,19 +3611,24 @@ def build_job_from_direct_input(payload: DirectJobCreateRequest) -> Job:
 
 def load_manual_jobs(force_refresh: bool = False) -> List[Job]:
     """Load jobs created through the direct API endpoint."""
-    global _manual_jobs_cache, _manual_jobs_cache_time
-
     if not force_refresh and _manual_jobs_cache is not None and _cache_is_fresh(_manual_jobs_cache_time, MANUAL_JOBS_CACHE_SECONDS):
-        age = int((datetime.now() - _manual_jobs_cache_time).total_seconds())
-        print(f"[Manual Jobs] Using cached jobs ({len(_manual_jobs_cache)} jobs, cached {age}s ago)")
         return _manual_jobs_cache
+
+    with _manual_jobs_rebuild_lock:
+        # Another request may have rebuilt the cache while this one waited.
+        if not force_refresh and _manual_jobs_cache is not None and _cache_is_fresh(_manual_jobs_cache_time, MANUAL_JOBS_CACHE_SECONDS):
+            return _manual_jobs_cache
+        return _read_manual_jobs_from_store()
+
+
+def _read_manual_jobs_from_store() -> List[Job]:
+    global _manual_jobs_cache, _manual_jobs_cache_time
 
     jobs: List[Job] = []
 
     try:
         if mongodb_enabled and manual_jobs_collection is not None:
-            for doc in manual_jobs_collection.find().sort("created_at", -1):
-                doc.pop("_id", None)
+            for doc in manual_jobs_collection.find({}, {"_id": 0}).sort("created_at", -1):
                 doc.pop("created_at", None)
                 if not doc.get("bill_rate_discount_applied"):
                     doc["salary_range"] = display_bill_rate(doc.get("salary_range")) or None
@@ -3106,6 +3637,8 @@ def load_manual_jobs(force_refresh: bool = False) -> List[Job]:
             with _manual_jobs_cache_lock:
                 _manual_jobs_cache = jobs
                 _manual_jobs_cache_time = datetime.now()
+            clear_jobs_response_cache()
+            print(f"[Manual Jobs] Reloaded {len(jobs)} jobs from MongoDB")
             return jobs
 
         if not os.path.exists(MANUAL_JOBS_FILE):
@@ -3122,10 +3655,53 @@ def load_manual_jobs(force_refresh: bool = False) -> List[Job]:
         with _manual_jobs_cache_lock:
             _manual_jobs_cache = jobs
             _manual_jobs_cache_time = datetime.now()
+        clear_jobs_response_cache()
     except Exception as e:
         print(f"[Manual Jobs] Failed to load direct-input jobs: {e}")
 
     return jobs
+
+
+def get_all_jobs() -> List[Job]:
+    """Direct/Nexus jobs first, then Excel jobs, de-duplicated by ID."""
+    return combine_jobs_with_priority(load_manual_jobs(), load_excel_jobs(), [])
+
+
+def get_jobs_response_payload(is_admin: bool) -> Dict[str, Any]:
+    """Return the cached, serialized /api/jobs body and its ETag for one role.
+
+    The ETag is a hash of the body itself, so it is identical on every worker
+    and instance that holds the same jobs - a browser revalidating against a
+    different worker still gets a correct 304 or a fresh body.
+    """
+    role = "admin" if is_admin else "vendor"
+    all_jobs = get_all_jobs()  # refreshes the source caches (and clears ours) when stale
+    with _jobs_response_cache_lock:
+        cached = _jobs_response_cache.get(role)
+        generation = _jobs_response_generation
+    if cached is not None:
+        return cached
+
+    sanitized_jobs = [sanitize_job_for_display(job, is_admin) for job in all_jobs]
+    body = JobListResponse(
+        jobs=sanitized_jobs,
+        total=len(sanitized_jobs),
+        total_pages=1,
+        next_start_page=2,
+        has_more=False,
+        is_refreshing=False,
+        cache_age_seconds=None,
+    ).json().encode("utf-8")
+    payload = {
+        "body": body,
+        "etag": f'"jobs-{role}-{hashlib.sha1(body).hexdigest()[:20]}"',
+        "jobs_by_id": {job["id"]: job for job in sanitized_jobs},
+    }
+    with _jobs_response_cache_lock:
+        # Skip storing if the job lists changed while this payload was built.
+        if generation == _jobs_response_generation:
+            _jobs_response_cache[role] = payload
+    return payload
 
 
 def upsert_manual_job(job: Job) -> None:
@@ -3146,12 +3722,18 @@ def upsert_manual_jobs(jobs: List[Job]) -> None:
 
     if mongodb_enabled and manual_jobs_collection is not None:
         created_at = datetime.now()
-        for job_payload in job_payloads:
-            manual_jobs_collection.update_one(
-                {"id": job_payload["id"]},
-                {"$set": {**job_payload, "created_at": created_at}},
-                upsert=True,
-            )
+        # One round trip for the whole batch instead of one per job.
+        manual_jobs_collection.bulk_write(
+            [
+                UpdateOne(
+                    {"id": job_payload["id"]},
+                    {"$set": {**job_payload, "created_at": created_at}},
+                    upsert=True,
+                )
+                for job_payload in job_payloads
+            ],
+            ordered=False,
+        )
         clear_manual_jobs_cache()
         return
 
@@ -3197,9 +3779,18 @@ def queue_job_post_notifications(
     send_notifications: bool,
 ) -> None:
     if not send_notifications:
+        # Log the skip. This used to return silently, so a caller that left
+        # send_notifications off looked identical in the logs to one where the
+        # emails had genuinely been dispatched.
+        print(
+            f"[JobPosted] send_notifications=false for {len(jobs)} job(s) from {source} "
+            f"- no notification emails queued"
+        )
         return
-    for job in jobs:
-        background_tasks.add_task(notify_users_about_job_posted, job, source)
+    print(f"[JobPosted] Queueing notifications for {len(jobs)} job(s) from {source}")
+    # Delivery happens in the periodic digest (job_notification_digest_loop), so
+    # this only records the jobs. It runs after the response is sent.
+    background_tasks.add_task(enqueue_job_post_notifications, jobs, source)
 
 
 def delete_manual_job(job_id: str) -> bool:
@@ -4072,28 +4663,26 @@ async def root():
     return {"message": "VMS Backend API is running"}
 
 @app.get("/api/jobs", response_model=JobListResponse)
-async def get_jobs(background_tasks: BackgroundTasks, current_user: UserDB = Depends(get_current_user)):
-    """Get all active jobs from direct input and Excel files."""
-    try:
-        manual_jobs, excel_jobs = await asyncio.gather(
-            asyncio.to_thread(load_manual_jobs),
-            asyncio.to_thread(load_excel_jobs),
-        )
-        print(f"[API] Loaded {len(manual_jobs)} jobs from direct API input")
-        print(f"[API] Loaded {len(excel_jobs)} jobs from Excel")
-        all_jobs = combine_jobs_with_priority(manual_jobs, excel_jobs, [])
-        is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
-        sanitized_jobs = [sanitize_job_for_display(job, is_admin) for job in all_jobs]
+async def get_jobs(request: Request, current_user: UserDB = Depends(get_current_user)):
+    """Get all active jobs from direct input and Excel files.
 
-        return JobListResponse(
-            jobs=sanitized_jobs,
-            total=len(sanitized_jobs),
-            total_pages=1,
-            next_start_page=2,
-            has_more=False,
-            is_refreshing=False,
-            cache_age_seconds=None,
-        )
+    Returns a pre-serialized body with an ETag. Browsers revalidate with
+    If-None-Match automatically, so an unchanged job list costs a 304 instead
+    of re-downloading every job description on every tab load and refresh.
+    """
+    try:
+        is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
+        payload = await asyncio.to_thread(get_jobs_response_payload, is_admin)
+        headers = {
+            "ETag": payload["etag"],
+            # private: the body differs per role, so shared caches must not store it.
+            # no-cache: always revalidate, so new jobs show up immediately.
+            "Cache-Control": "private, no-cache",
+            "Vary": "Authorization",
+        }
+        if request.headers.get("if-none-match") == payload["etag"]:
+            return Response(status_code=304, headers=headers)
+        return Response(content=payload["body"], media_type="application/json", headers=headers)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch jobs: {str(e)}")
 
@@ -4116,20 +4705,13 @@ async def get_ceipal_status():
 async def get_job(job_id: str):
     """Get specific job details"""
     try:
-        manual_jobs, excel_jobs = await asyncio.gather(
-            asyncio.to_thread(load_manual_jobs),
-            asyncio.to_thread(load_excel_jobs),
-        )
-        all_jobs = combine_jobs_with_priority(
-            manual_jobs,
-            excel_jobs,
-            [],
-        )
-
-        job = next((job for job in all_jobs if job.id == job_id), None)
+        payload = await asyncio.to_thread(get_jobs_response_payload, False)
+        job = payload["jobs_by_id"].get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
-        return sanitize_job_for_display(job)
+        return job
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch job: {str(e)}")
 
@@ -4162,12 +4744,21 @@ async def get_ceipal_cache_status():
     }
 
 @app.get("/api/health")
-async def health_check():
+def health_check():
     """Health check endpoint for MongoDB/JSON-backed runtime state."""
     users = load_users_from_json()
+    mongodb_ping_ms = None
+    if mongodb_enabled:
+        try:
+            mongodb_ping_ms = measure_mongodb_ping_ms(samples=3)
+        except Exception as e:
+            print(f"[Health] MongoDB ping failed: {e}")
     return {
         "storage_mode": "mongodb_json",
         "mongodb_enabled": mongodb_enabled,
+        "mongodb_ping_ms": mongodb_ping_ms,
+        "mongodb_startup_ping_ms": mongodb_startup_ping_ms,
+        "mongodb_slow": bool(mongodb_ping_ms is not None and mongodb_ping_ms > MONGODB_SLOW_PING_MS),
         "user_count": len(users),
         "upload_dir": UPLOAD_DIR,
         "upload_dir_exists": os.path.exists(UPLOAD_DIR),
@@ -4197,6 +4788,7 @@ async def get_ceipal_reports():
 @app.post("/api/candidates/submit")
 async def submit_candidate(
     request: Request,
+    background_tasks: BackgroundTasks,
     candidate_name: str = Form(...),
     email: str = Form(...), 
     phone: str = Form(...),
@@ -4231,8 +4823,10 @@ async def submit_candidate(
         filename = f"{candidate_name.replace(' ', '_')}_{timestamp}.{file_extension}"
         
         if mongodb_enabled and fs is not None:
-            # Store in GridFS
-            resume_file_id = fs.put(
+            # Store in GridFS (off the event loop - a multi-MB upload to Atlas
+            # used to stall every other request on this worker).
+            resume_file_id = await asyncio.to_thread(
+                fs.put,
                 content,
                 filename=filename,
                 content_type=resume.content_type or 'application/octet-stream',
@@ -4290,20 +4884,7 @@ async def submit_candidate(
             "candidate_summary": candidate_summary
         }
         
-        if mongodb_enabled and candidates_collection is not None:
-            candidates_collection.insert_one(candidate_doc)
-            print(f"[Submissions] Candidate {candidate_id} stored in MongoDB")
-        else:
-            # Fallback: store in local JSON file
-            candidates_file = os.path.join(DATA_DIR, "candidates.json")
-            existing = []
-            if os.path.exists(candidates_file):
-                with open(candidates_file, 'r') as f:
-                    existing = json.load(f)
-            existing.append(candidate_doc)
-            with open(candidates_file, 'w') as f:
-                json.dump(existing, f, indent=2, default=str)
-            print(f"[Submissions] Candidate {candidate_id} stored in JSON (MongoDB not available)")
+        await asyncio.to_thread(store_candidate_doc, candidate_doc)
 
         audit_doc = {
             "id": f"submission_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid4())[:8]}",
@@ -4332,12 +4913,12 @@ async def submit_candidate(
             },
         }
         try:
-            record_submission_log(audit_doc)
+            await asyncio.to_thread(record_submission_log, audit_doc)
         except Exception as e:
             print(f"[SubmissionAudit] Failed to write audit log for {candidate_id}: {e}")
-        
-        user_submission_summary = get_user_submission_summary(
-            load_candidate_submissions(current_user.id),
+
+        user_submission_summary = await asyncio.to_thread(
+            compute_user_submission_summary,
             current_user.id,
             submitted_at,
         )
@@ -4348,23 +4929,15 @@ async def submit_candidate(
             "email": current_user.email,
             "id": current_user.id
         }
-        print(f"[Submissions] Attempting to send notification email to {SUBMISSION_NOTIFICATION_RECIPIENTS}")
-        # Run the synchronous SendGrid call off the event loop so it doesn't stall other requests
-        # if SendGrid is slow. Failure to email is non-fatal — the candidate is already stored.
-        try:
-            email_sent = await asyncio.to_thread(
-                send_submission_notification_email,
-                candidate_doc,
-                vendor_info,
-                user_submission_summary,
-            )
-        except Exception as e:
-            print(f"[Submissions] Exception during notification email dispatch: {e}")
-            email_sent = False
-        if email_sent:
-            print(f"[Submissions] Notification email sent for candidate {candidate_id}")
-        else:
-            print(f"[Submissions] Failed to send notification email for candidate {candidate_id}")
+        # Send the admin email after the response goes out: the candidate is already
+        # stored, so the vendor should not wait on SendGrid. Sync background tasks run
+        # in the threadpool, off the event loop.
+        background_tasks.add_task(
+            send_submission_notification_and_log,
+            candidate_doc,
+            vendor_info,
+            user_submission_summary,
+        )
         
         return {
             "message": "Candidate submitted successfully",
@@ -4379,7 +4952,7 @@ async def submit_candidate(
         raise HTTPException(status_code=500, detail=f"Failed to submit candidate: {str(e)}")
 
 @app.get("/api/candidates/job/{job_id}")
-async def get_candidates_for_job(job_id: str):
+def get_candidates_for_job(job_id: str):
     """Get all candidates submitted for a specific job - MongoDB persistent storage"""
     try:
         job_candidates = []
@@ -4407,7 +4980,7 @@ async def get_candidates_for_job(job_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to fetch candidates: {str(e)}")
 
 @app.get("/api/candidates")
-async def get_all_candidates(
+def get_all_candidates(
     current_user: UserDB = Depends(get_current_user)
 ):
     """Get submitted candidates with submitter info. Vendors see only their own submissions, admin sees all. - MongoDB persistent storage"""
@@ -4428,7 +5001,7 @@ async def get_all_candidates(
 
 
 @app.get("/api/submission-history")
-async def get_submission_history(current_user: UserDB = Depends(get_current_user)):
+def get_submission_history(current_user: UserDB = Depends(get_current_user)):
     """Return submission history grouped by user and submission date."""
     try:
         is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
@@ -4446,7 +5019,7 @@ async def get_submission_history(current_user: UserDB = Depends(get_current_user
 
 
 @app.get("/api/submission-logs")
-async def get_submission_logs(current_user: UserDB = Depends(get_current_user)):
+def get_submission_logs(current_user: UserDB = Depends(get_current_user)):
     """Admin-only submission audit log."""
     is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
     if not is_admin:
@@ -4474,7 +5047,7 @@ async def get_submission_logs(current_user: UserDB = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=f"Failed to fetch submission logs: {str(e)}")
 
 @app.patch("/api/candidates/{candidate_id}/status")
-async def update_candidate_status(
+def update_candidate_status(
     candidate_id: str,
     status: str,
     current_user: UserDB = Depends(get_current_user)
@@ -4592,7 +5165,7 @@ async def notify_vendor_about_submission(
 
 
 @app.get("/api/resumes/{candidate_id}")
-async def download_resume(candidate_id: str):
+def download_resume(candidate_id: str):
     """Download resume file for a candidate - MongoDB GridFS or local fallback"""
     try:
         # Find candidate
@@ -4625,16 +5198,14 @@ async def download_resume(candidate_id: str):
             if not grid_file:
                 raise HTTPException(status_code=404, detail="Resume file not found in storage")
             
-            # Create a temporary file for the response
-            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(candidate.get("resume_filename", "resume.pdf"))[1]) as tmp:
-                tmp.write(grid_file.read())
-                tmp_path = tmp.name
-            
-            return FileResponse(
-                tmp_path,
-                filename=candidate.get("resume_filename", "resume.pdf"),
+            # Serve straight from memory (resumes are capped at MAX_FILE_SIZE). This used
+            # to write a NamedTemporaryFile(delete=False) per download that was never removed.
+            download_name = candidate.get("resume_filename", "resume.pdf")
+            return Response(
+                content=grid_file.read(),
                 media_type=grid_file.content_type or "application/octet-stream",
-                background=None  # File will be cleaned up after response
+                # RFC 5987 form, as FileResponse uses, so non-ASCII candidate names stay valid headers.
+                headers={"Content-Disposition": f"attachment; filename*=utf-8''{quote(download_name)}"},
             )
         else:
             # Fallback: Retrieve from local filesystem
@@ -4653,8 +5224,63 @@ async def download_resume(candidate_id: str):
         print(f"[Submissions] Error downloading resume: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to download resume: {str(e)}")
 
+class JobPreferencesUpdate(BaseModel):
+    email_notifications: bool = True
+    professions: List[str] = []
+    specialties: List[str] = []
+    job_types: List[str] = []
+    states: List[str] = []
+
+
+def build_preference_options(prefs: dict) -> dict:
+    """Choices for the preferences form: values present on current jobs, plus
+    anything the user already selected (so a selection never silently vanishes)."""
+    options = {field: {} for field in PREFERENCE_LIST_FIELDS}
+
+    def add(field: str, value: str) -> None:
+        text = _clean_text(value)
+        if text and text.lower() != "not specified":
+            options[field].setdefault(text.lower(), text)
+
+    for job in get_all_jobs():
+        job_dict = {
+            "title": job.title, "profession": job.profession, "specialty": job.specialty,
+            "department": job.department, "state": job.state, "location": job.location,
+        }
+        attrs = job_preference_attributes(job_dict)
+        add("professions", job.profession or "")
+        specialty = job.specialty or ("" if (job.department or "").lower().startswith("job code:") else job.department or "")
+        add("specialties", specialty)
+        add("states", attrs["states"].upper() if len(attrs["states"]) == 2 else "")
+    # Direct/Nexus jobs store the job type (Locum, Permanent, ...) as the title.
+    # Excel titles are free text, so they are not offered as job types.
+    for job in load_manual_jobs():
+        add("job_types", job.title)
+    for field in PREFERENCE_LIST_FIELDS:
+        for value in prefs.get(field) or []:
+            add(field, value)
+    return {field: sorted(values.values(), key=str.lower) for field, values in options.items()}
+
+
+@app.get("/api/preferences")
+def get_job_preferences(current_user: UserDB = Depends(get_current_user)):
+    """Current user's job alert preferences, plus the selectable values."""
+    prefs = get_user_preferences(current_user.email)
+    return {"preferences": prefs, "options": build_preference_options(prefs)}
+
+
+@app.put("/api/preferences")
+def update_job_preferences(
+    payload: JobPreferencesUpdate,
+    current_user: UserDB = Depends(get_current_user),
+):
+    """Save job alert preferences. Empty lists mean 'any'."""
+    prefs = save_user_preferences(current_user.email, payload.dict())
+    return {"message": "Preferences saved", "preferences": prefs}
+
+
 @app.get("/api/notifications")
-async def get_user_notifications(
+def get_user_notifications(
     current_user: UserDB = Depends(get_current_user),
     unread_only: bool = False
 ):
@@ -4697,7 +5323,7 @@ async def get_user_notifications(
         raise HTTPException(status_code=500, detail=f"Failed to fetch notifications: {str(e)}")
 
 @app.patch("/api/notifications/{notification_id}/read")
-async def mark_notification_read(
+def mark_notification_read(
     notification_id: str,
     current_user: UserDB = Depends(get_current_user)
 ):
@@ -4724,7 +5350,7 @@ async def mark_notification_read(
         raise HTTPException(status_code=500, detail=f"Failed to update notification: {str(e)}")
 
 @app.patch("/api/notifications/read-all")
-async def mark_all_notifications_read(
+def mark_all_notifications_read(
     current_user: UserDB = Depends(get_current_user)
 ):
     """Mark all notifications as read"""

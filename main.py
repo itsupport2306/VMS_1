@@ -40,31 +40,6 @@ def run_backend():
         print(f"❌ Failed to start backend: {e}")
         sys.exit(1)
 
-def run_frontend():
-    """Start the Streamlit frontend"""
-    print("🎨 Starting VMS Frontend Dashboard...")
-    print("📍 Frontend will be available at: http://localhost:8501")
-    print("⏹️  Press Ctrl+C to stop the server")
-    print("-" * 50)
-    
-    try:
-        import streamlit.web.cli as stcli
-        
-        # Change to frontend directory
-        frontend_path = project_root / "frontend"
-        sys.argv = ["streamlit", "run", "main.py", "--server.port", "8501"]
-        
-        os.chdir(frontend_path)
-        stcli.main()
-        
-    except ImportError as e:
-        print(f"❌ Missing dependencies: {e}")
-        print("💡 Please install requirements: pip install -r requirements.txt")
-        sys.exit(1)
-    except Exception as e:
-        print(f"❌ Failed to start frontend: {e}")
-        sys.exit(1)
-
 def setup_database():
     """Create database tables"""
     print("🗄️  Setting up database tables...")
@@ -141,7 +116,6 @@ def show_status():
     # Check dependencies
     try:
         import fastapi
-        import streamlit
         import sqlalchemy
         print("✅ Core dependencies installed")
     except ImportError as e:
@@ -154,7 +128,7 @@ def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(description="Vendor Management System")
     parser.add_argument("command", choices=[
-        "backend", "frontend", "setup", "install", "status", "all"
+        "backend", "setup", "install", "status"
     ], help="Command to run")
     
     args = parser.parse_args()
@@ -164,8 +138,6 @@ def main():
     
     if args.command == "backend":
         run_backend()
-    elif args.command == "frontend":
-        run_frontend()
     elif args.command == "setup":
         create_env_file()
         setup_database()
@@ -173,29 +145,11 @@ def main():
         print("💡 Next steps:")
         print("   1. Edit .env file with your configuration")
         print("   2. Run: python main.py backend")
-        print("   3. Run: python main.py frontend")
+        print("   3. Open: http://localhost:8000")
     elif args.command == "install":
         install_requirements()
     elif args.command == "status":
         show_status()
-    elif args.command == "all":
-        print("🚀 Starting complete VMS system...")
-        print("This will start both backend and frontend")
-        print("Backend: http://localhost:8000")
-        print("Frontend: http://localhost:8501")
-        print("-" * 30)
-        
-        # Start backend in background
-        import threading
-        backend_thread = threading.Thread(target=run_backend, daemon=True)
-        backend_thread.start()
-        
-        # Give backend time to start
-        import time
-        time.sleep(3)
-        
-        # Start frontend
-        run_frontend()
 
 if __name__ == "__main__":
     main()

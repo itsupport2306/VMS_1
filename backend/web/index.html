@@ -23,6 +23,7 @@
         <button class="nav__item" data-view="offers">Offers</button>
         <button class="nav__item" data-view="declines">Declines</button>
         <button class="nav__item" data-view="starts">Starts</button>
+        <button class="nav__item" data-view="preferences">Job Alerts</button>
         <button class="nav__item" data-view="settings" id="systemNavBtn" hidden>System</button>
       </nav>
 
@@ -208,6 +209,27 @@
           <div class="panel__title">Starts</div>
           <div class="panel__desc">Track candidates who have started working.</div>
           <div id="startsTable"></div>
+        </div>
+      </section>
+
+      <section class="content" id="viewPreferences" hidden>
+        <div class="panel">
+          <div class="panel__title">Job Alert Preferences</div>
+          <div class="panel__desc">Pick what you work on. New jobs are emailed only when they match every group where you made a selection; leave a group empty to accept any value. New jobs are grouped into one email every few minutes.</div>
+
+          <label class="pref-toggle">
+            <input type="checkbox" id="prefEmailEnabled" checked />
+            <span>Email me about new jobs</span>
+          </label>
+
+          <div id="prefGroups" class="pref-groups"></div>
+
+          <div class="pref-summary" id="prefSummary"></div>
+          <div class="alert" id="prefAlert" hidden></div>
+          <div class="row">
+            <button class="btn" id="prefSaveBtn">Save preferences</button>
+            <button class="btn btn--secondary" id="prefClearBtn" type="button">Clear selections</button>
+          </div>
         </div>
       </section>
 

@@ -9,11 +9,10 @@ A comprehensive Vendor Management System (VMS) that connects to ATS APIs to fetc
 - **Job Board**: Display all available jobs with detailed information
 - **Resume Submission**: Multiple resume submission for candidates
 - **Candidate Management**: Track submitted candidates for each job
-- **Analytics Dashboard**: Visualize job distribution and candidate metrics
 
 ### 🛠 Technical Stack
 - **Backend**: FastAPI with SQLAlchemy ORM
-- **Frontend**: Streamlit for interactive dashboard
+- **Frontend**: HTML/CSS/JS web app served by the backend at `/` (`backend/web/`)
 - **Database**: MySQL/PostgreSQL support
 - **File Storage**: Local file system for resume uploads
 - **API Integration**: HTTP client for ATS connectivity
@@ -23,9 +22,8 @@ A comprehensive Vendor Management System (VMS) that connects to ATS APIs to fetc
 ```
 VMS/
 ├── backend/
-│   └── main.py              # FastAPI backend with Ceipal integration
-├── frontend/
-│   └── main.py              # Streamlit frontend dashboard
+│   ├── main.py              # FastAPI backend with Ceipal integration
+│   └── web/                 # Browser UI served at /
 ├── database/
 │   └── models.py            # SQLAlchemy database models
 ├── uploads/                 # Resume file storage
@@ -73,6 +71,13 @@ Each successful candidate submission is also written to a separate submission au
 
 The authenticated submission history view is available from `GET /api/submission-history`. It groups profiles by user and submission date, includes user details and per-user totals, and powers the browser submission history screen.
 
+#### Job Alert Emails
+Users choose the jobs they want to hear about under **Job Alerts** in the sidebar: profession, specialty, job type, and state. A job must match every group where the user made a selection; an empty group means "any", so users who never set preferences keep receiving every new job. Users can also turn job emails off and keep the in-app bell notifications.
+
+Posted Open jobs (from `/api/nexus/jobs`, `/api/nexus/jobs/bulk` with `send_notifications: true`, and `/api/admin/jobs`) are queued in the `job_notification_outbox` collection. Every `JOB_NOTIFICATION_DIGEST_SECONDS` (default 300), one API worker takes a MongoDB lease and sends each user a single email listing the matching jobs queued since the last run. A single matching job uses the original "New Job Posted" email. Each email links to the preferences page (`?view=preferences`). Preferences are stored in the `user_preferences` collection (`DATA_DIR/user_preferences.json` without MongoDB).
+
+Endpoints: `GET /api/preferences` returns the user's preferences and the selectable values, and `PUT /api/preferences` saves them.
+
 ### 3. Run the Application
 
 #### Backend Server
@@ -80,14 +85,7 @@ The authenticated submission history view is available from `GET /api/submission
 cd backend
 python main.py
 ```
-The backend will start on `http://localhost:8000`
-
-#### Frontend Dashboard
-```bash
-cd frontend
-streamlit run main.py
-```
-The frontend will start on `http://localhost:8501`
+The backend will start on `http://localhost:8000` and serves the web UI at the same address.
 
 ## Docker Deployment
 
@@ -100,8 +98,9 @@ docker compose up --build
 ```
 
 Available services:
-- Backend API: `http://localhost:8000`
-- Streamlit frontend: `http://localhost:8501`
+- Backend API and web UI: `http://localhost:8000`
+
+The old Streamlit frontend has been removed. It no longer worked against the authenticated API and only used memory.
 
 ### Container Data Paths
 
@@ -124,8 +123,8 @@ docker compose up -d --build
 ```
 
 For App Platform:
-- Use the root `Dockerfile` for the backend service.
-- Use `frontend/Dockerfile` for the Streamlit frontend service.
+- Use the root `Dockerfile` for the backend service. It is the only service.
+- Put the MongoDB Atlas cluster in the same region as the app (for example Atlas on AWS `us-east-1` with DigitalOcean `NYC`). `GET /api/health` reports `mongodb_ping_ms`, and the backend logs a warning at startup when it is high.
 - Configure secrets and environment variables in DigitalOcean instead of storing them in the image.
 
 ### 4. Quick Start (All in One)
@@ -133,14 +132,8 @@ For App Platform:
 # Setup everything
 python main.py setup
 
-# Start backend
+# Start backend (web UI at http://localhost:8000)
 python main.py backend
-
-# In another terminal, start frontend
-python main.py frontend
-
-# Or start both at once
-python main.py all
 ```
 
 ## API Endpoints
@@ -160,7 +153,7 @@ python main.py all
 - `POST /api/auth/request-otp` - Request an email verification code
 - `POST /api/auth/verify-otp` - Verify code and receive a 7-day bearer token
 
-## Frontend Features
+## Web UI Features
 
 ### Job Board
 - View all active jobs from ATS
@@ -173,12 +166,6 @@ python main.py all
 - Fill candidate information
 - Upload resume file (PDF, DOC, DOCX, TXT)
 - Get confirmation with candidate ID
-
-### Analytics Dashboard
-- Job distribution by department
-- Employment type statistics
-- Location-based analysis
-- Detailed job listings table
 
 ## ATS Integration
 
@@ -293,9 +280,6 @@ ATS_API_KEY=your_ats_api_key_here
 ```bash
 # Backend (with auto-reload)
 uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
-
-# Frontend
-streamlit run frontend/main.py --server.port 8501
 ```
 
 ### Testing
@@ -355,7 +339,6 @@ The system includes mock data for testing when ATS API is not configured.
 
 ### Logs
 - Backend logs show API requests and errors
-- Frontend shows connection status
 - Database logs available via SQLAlchemy
 
 ## Support
