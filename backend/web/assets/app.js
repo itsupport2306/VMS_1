@@ -785,6 +785,7 @@ async function apiGetAuthUncached(path) {
   try { json = JSON.parse(text); } catch { json = { _raw: text }; }
   if (!res.ok) {
     const err = new Error(`HTTP ${res.status}`);
+    err.status = res.status;
     err.data = json;
     throw err;
   }
@@ -984,24 +985,37 @@ function jobMatches(job) {
 }
 
 // Render in chunks so a long list does not build hundreds of cards on every
-// keystroke; "Show more" appends the next chunk without rebuilding the rest.
+// keystroke. The next chunk is appended as the user scrolls near the end of the
+// list (or presses "Show more"), so every job is reachable without rebuilding the rest.
 const JOBS_PAGE_SIZE = 60;
 let jobsRenderLimit = JOBS_PAGE_SIZE;
 let jobsFiltered = [];
 let jobsMoreBtn = null;
+let jobsMoreObserver = null;
+let jobsMoreVisible = false;
+
+function showMoreJobs() {
+  const from = jobsRenderLimit;
+  if (from >= jobsFiltered.length) return;
+  jobsRenderLimit += JOBS_PAGE_SIZE;
+  appendJobCards(jobsFiltered.slice(from, jobsRenderLimit));
+  updateJobsMoreButton();
+}
 
 function ensureJobsMoreButton() {
   if (jobsMoreBtn) return jobsMoreBtn;
   jobsMoreBtn = document.createElement('button');
   jobsMoreBtn.className = 'btn btn--secondary';
   jobsMoreBtn.style.cssText = 'display:block;margin:16px auto;';
-  jobsMoreBtn.addEventListener('click', () => {
-    const from = jobsRenderLimit;
-    jobsRenderLimit += JOBS_PAGE_SIZE;
-    appendJobCards(jobsFiltered.slice(from, jobsRenderLimit));
-    updateJobsMoreButton();
-  });
+  jobsMoreBtn.addEventListener('click', showMoreJobs);
   els.jobsGrid.insertAdjacentElement('afterend', jobsMoreBtn);
+  if ('IntersectionObserver' in window) {
+    jobsMoreObserver = new IntersectionObserver(entries => {
+      jobsMoreVisible = entries.some(entry => entry.isIntersecting);
+      if (jobsMoreVisible) showMoreJobs();
+    }, { rootMargin: '600px 0px' });
+    jobsMoreObserver.observe(jobsMoreBtn);
+  }
   return jobsMoreBtn;
 }
 
@@ -1010,6 +1024,9 @@ function updateJobsMoreButton() {
   const remaining = jobsFiltered.length - jobsRenderLimit;
   btn.hidden = remaining <= 0;
   if (remaining > 0) btn.textContent = `Show more (${remaining} remaining)`;
+  // The observer only fires when visibility changes; on a tall screen the button
+  // can still be in range after a chunk, so keep filling on the next frame.
+  if (remaining > 0 && jobsMoreVisible) requestAnimationFrame(() => { if (jobsMoreVisible) showMoreJobs(); });
 }
 
 function renderJobs() {
@@ -1456,7 +1473,11 @@ function writeCachedJobs(jobs) {
   if (!key) return;
   try {
     localStorage.setItem(key, JSON.stringify({ at: Date.now(), jobs }));
-  } catch { /* quota or private mode: caching is optional */ }
+  } catch {
+    // Quota or private mode: caching is optional. Drop the old entry so the next
+    // load does not first paint an older, shorter list.
+    try { localStorage.removeItem(key); } catch { /* ignore */ }
+  }
 }
 
 function clearCachedJobs() {
@@ -1467,7 +1488,13 @@ function clearCachedJobs() {
   } catch { /* ignore */ }
 }
 
-async function loadJobs() {
+// Retries while the server is still building its job list (503 right after a
+// deploy) or the request failed, so the page fills in without a manual refresh.
+const JOBS_LOAD_MAX_RETRIES = 8;
+let jobsLoadRetries = 0;
+
+async function loadJobs({ isRetry = false } = {}) {
+  if (!isRetry) jobsLoadRetries = 0;
   // First load of this page: paint the cached list immediately, if there is one.
   const cachedJobs = allJobs.length ? null : readCachedJobs();
   if (cachedJobs && cachedJobs.length) {
@@ -1557,6 +1584,18 @@ async function loadJobs() {
     }
   } catch (e) {
     console.error('[Jobs] Failed to load jobs:', e);
+    const retryable = authToken && e.status !== 401 && e.status !== 403;
+    if (retryable && jobsLoadRetries < JOBS_LOAD_MAX_RETRIES) {
+      jobsLoadRetries++;
+      const delay = Math.min(2000 * jobsLoadRetries, 10000);
+      console.log(`[Jobs] Retrying in ${delay} ms (attempt ${jobsLoadRetries})`);
+      if (!allJobs.length) {
+        els.jobsGrid.innerHTML = '<div class="loading-jobs">Loading jobs...<br><small>Please wait...</small></div>';
+        els.jobsEmpty.hidden = true;
+      }
+      jobsPollTimeout = setTimeout(() => loadJobs({ isRetry: true }), delay);
+      return;
+    }
     // Keep the last good list when a refresh fails; only show the error if there is none.
     if (!allJobs.length) {
       hasMoreJobs = false;

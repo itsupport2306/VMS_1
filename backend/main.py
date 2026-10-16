@@ -5,7 +5,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.security import HTTPBearer, HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, root_validator
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from collections import defaultdict
 import httpx
 import os
@@ -143,7 +143,7 @@ def init_mongodb():
             # Bound the damage from a slow or hung cluster: without these a stuck
             # socket pins one of the 40 worker threads indefinitely.
             connectTimeoutMS=int(os.getenv("MONGODB_CONNECT_TIMEOUT_MS", "5000")),
-            socketTimeoutMS=int(os.getenv("MONGODB_SOCKET_TIMEOUT_MS", "60000")),
+            socketTimeoutMS=int(os.getenv("MONGODB_SOCKET_TIMEOUT_MS", "20000")),
             waitQueueTimeoutMS=int(os.getenv("MONGODB_WAIT_QUEUE_TIMEOUT_MS", "5000")),
         )
         db = mongo_client.vms
@@ -3945,39 +3945,76 @@ MANUAL_JOBS_READ_ATTEMPTS = int(os.getenv("MANUAL_JOBS_READ_ATTEMPTS", "3"))
 MANUAL_JOBS_BATCH_SIZE = int(os.getenv("MANUAL_JOBS_BATCH_SIZE", "200"))
 
 
-def _read_manual_jobs_from_mongo() -> List[Job]:
-    """Read every direct-input job, or raise. Never returns a partial list.
+MANUAL_JOBS_READ_CONCURRENCY = int(os.getenv("MANUAL_JOBS_READ_CONCURRENCY", "4"))
 
-    The cursor is drained completely before anything is parsed, so a timeout on
-    a later batch fails the whole read instead of silently cutting the list off
-    after the first batch (~100 jobs). A single malformed document is skipped
-    and logged without dropping the jobs after it.
-    """
+
+def _with_read_retries(label: str, read: Callable[[], Any]) -> Any:
     last_error: Optional[Exception] = None
     for attempt in range(1, max(1, MANUAL_JOBS_READ_ATTEMPTS) + 1):
         try:
-            docs = list(
-                manual_jobs_collection.find({}, {"_id": 0})
-                .sort("created_at", -1)
-                .batch_size(MANUAL_JOBS_BATCH_SIZE)
-            )
-            break
+            return read()
         except Exception as e:
             last_error = e
-            print(f"[Manual Jobs] MongoDB read attempt {attempt} failed: {e}")
-    else:
-        raise last_error  # type: ignore[misc]
+            print(f"[Manual Jobs] {label} attempt {attempt} failed: {e}")
+    raise last_error  # type: ignore[misc]
 
+
+def _read_manual_jobs_from_mongo() -> List[Job]:
+    """Read every direct-input job, or raise. Never returns a partial list.
+
+    One long cursor over every full document (descriptions included) used to be
+    a single point of failure: a timeout on any later batch either cut the list
+    off after the first batch (~100 jobs) or, with retries, re-read everything
+    from scratch while requests waited. Instead, read the ordered _id list once
+    (tiny, one round trip), then fetch the documents in fixed-size chunks a few
+    at a time. Each chunk is a short, bounded query retried on its own. A single
+    malformed document is skipped and logged without dropping the jobs after it.
+    """
+    ids = _with_read_retries(
+        "ID list read",
+        lambda: [
+            doc["_id"]
+            for doc in manual_jobs_collection.find({}, {"_id": 1})
+            .sort("created_at", -1)
+            .batch_size(100_000)
+        ],
+    )
+    chunk_size = max(1, MANUAL_JOBS_BATCH_SIZE)
+    chunks = [ids[i:i + chunk_size] for i in range(0, len(ids), chunk_size)]
+
+    def read_chunk(chunk_ids: List[Any]) -> List[dict]:
+        return _with_read_retries(
+            f"Chunk read ({len(chunk_ids)} jobs)",
+            lambda: list(manual_jobs_collection.find({"_id": {"$in": chunk_ids}})),
+        )
+
+    if len(chunks) > 1 and MANUAL_JOBS_READ_CONCURRENCY > 1:
+        with ThreadPoolExecutor(max_workers=min(MANUAL_JOBS_READ_CONCURRENCY, len(chunks))) as pool:
+            chunk_docs = list(pool.map(read_chunk, chunks))
+    else:
+        chunk_docs = [read_chunk(chunk) for chunk in chunks]
+
+    # $in returns documents in no particular order; restore created_at order.
+    # A document deleted between the two reads is simply absent.
+    docs_by_id = {doc["_id"]: doc for docs in chunk_docs for doc in docs}
     jobs: List[Job] = []
-    for doc in docs:
+    skipped = 0
+    for _id in ids:
+        doc = docs_by_id.get(_id)
+        if doc is None:
+            continue
         try:
+            doc.pop("_id", None)
             doc.pop("created_at", None)
             if not doc.get("bill_rate_discount_applied"):
                 doc["salary_range"] = display_bill_rate(doc.get("salary_range")) or None
             doc["bill_rate_discount_applied"] = True
             jobs.append(Job(**doc))
         except Exception as e:
+            skipped += 1
             print(f"[Manual Jobs] Skipping malformed job {doc.get('id')!r}: {e}")
+    if skipped:
+        print(f"[Manual Jobs] Loaded {len(jobs)} of {len(ids)} jobs; {skipped} malformed skipped")
     return jobs
 
 
@@ -4075,8 +4112,7 @@ def get_jobs_response_payload(is_admin: bool) -> Dict[str, Any]:
     if _jobs_refresh_wakeup is not None:
         # The background refresher polls the version stamp and reloads jobs, so
         # requests never wait on MongoDB once this worker has built a payload.
-        with _jobs_response_cache_lock:
-            cached = _jobs_response_cache.get(role) or _jobs_response_last_good.get(role)
+        cached = _cached_jobs_payload(role)
         if cached is not None:
             return cached
         return build_jobs_response_payload(is_admin)
@@ -4087,6 +4123,43 @@ def get_jobs_response_payload(is_admin: bool) -> Dict[str, Any]:
     if cached is not None and _manual_jobs_cache_is_current():
         return cached
     return build_jobs_response_payload(is_admin)
+
+
+def _cached_jobs_payload(role: str) -> Optional[Dict[str, Any]]:
+    with _jobs_response_cache_lock:
+        return _jobs_response_cache.get(role) or _jobs_response_last_good.get(role)
+
+
+# How long a request waits for this worker's first job list after startup.
+JOBS_FIRST_LOAD_WAIT_SECONDS = float(os.getenv("JOBS_FIRST_LOAD_WAIT_SECONDS", "25"))
+
+
+async def get_jobs_response_payload_async(is_admin: bool) -> Dict[str, Any]:
+    """get_jobs_response_payload for request handlers.
+
+    While the background refresher runs, only it reads MongoDB and builds
+    payloads. Before its first build (right after startup) requests used to
+    start their own full reads: each pinned a pool thread, queued on the
+    rebuild lock, then re-sanitised every job - a burst of tabs hung the worker.
+    Now they wait here without holding a thread, and get 503 (the page retries)
+    if the list is still not ready.
+    """
+    if _jobs_refresh_wakeup is None:
+        return await asyncio.to_thread(get_jobs_response_payload, is_admin)
+    role = "admin" if is_admin else "vendor"
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + JOBS_FIRST_LOAD_WAIT_SECONDS
+    while True:
+        cached = _cached_jobs_payload(role)
+        if cached is not None:
+            return cached
+        if loop.time() >= deadline:
+            raise HTTPException(
+                status_code=503,
+                detail="Jobs are still loading. Please retry shortly.",
+                headers={"Retry-After": "3"},
+            )
+        await asyncio.sleep(0.1)
 
 
 def build_jobs_response_payload(is_admin: bool) -> Dict[str, Any]:
@@ -4120,10 +4193,12 @@ def build_jobs_response_payload(is_admin: bool) -> Dict[str, Any]:
         "jobs_by_id": {job["id"]: job for job in sanitized_jobs},
     }
     with _jobs_response_cache_lock:
-        # Skip storing if the job lists changed while this payload was built.
+        # Skip caching if the job lists changed while this payload was built;
+        # the refresher was woken and rebuilds. It is still a complete list, so
+        # keep it as the fallback rather than leave requests waiting meanwhile.
         if generation == _jobs_response_generation:
             _jobs_response_cache[role] = payload
-            _jobs_response_last_good[role] = payload
+        _jobs_response_last_good[role] = payload
     return payload
 
 
@@ -5159,7 +5234,7 @@ async def get_jobs(request: Request, current_user: UserDB = Depends(get_current_
     """
     try:
         is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
-        payload = await asyncio.to_thread(get_jobs_response_payload, is_admin)
+        payload = await get_jobs_response_payload_async(is_admin)
         headers = {
             "ETag": payload["etag"],
             # private: the body differs per role, so shared caches must not store it.
@@ -5170,6 +5245,8 @@ async def get_jobs(request: Request, current_user: UserDB = Depends(get_current_
         if request.headers.get("if-none-match") == payload["etag"]:
             return Response(status_code=304, headers=headers)
         return Response(content=payload["body"], media_type="application/json", headers=headers)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch jobs: {str(e)}")
 
@@ -5201,7 +5278,7 @@ async def get_job(job_id: str, current_user: UserDB = Depends(get_current_user))
     """Get one job with its full description (the list endpoint only sends a preview)."""
     try:
         is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
-        payload = await asyncio.to_thread(get_jobs_response_payload, is_admin)
+        payload = await get_jobs_response_payload_async(is_admin)
         job = payload["jobs_by_id"].get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
