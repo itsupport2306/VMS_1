@@ -1434,7 +1434,7 @@ function getJobsPollDelay(pollCount) {
 // The last job list per user, so a reload or a new tab shows jobs at once while
 // /api/jobs (browser -> Cloudflare -> origin, several hundred ms in production)
 // revalidates it. Cleared on logout.
-const JOBS_CACHE_KEY_PREFIX = 'vms_jobs_cache:';
+const JOBS_CACHE_KEY_PREFIX = 'vms_jobs_cache2:';
 const JOBS_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 function jobsCacheKey() {

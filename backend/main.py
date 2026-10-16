@@ -143,7 +143,7 @@ def init_mongodb():
             # Bound the damage from a slow or hung cluster: without these a stuck
             # socket pins one of the 40 worker threads indefinitely.
             connectTimeoutMS=int(os.getenv("MONGODB_CONNECT_TIMEOUT_MS", "5000")),
-            socketTimeoutMS=int(os.getenv("MONGODB_SOCKET_TIMEOUT_MS", "20000")),
+            socketTimeoutMS=int(os.getenv("MONGODB_SOCKET_TIMEOUT_MS", "60000")),
             waitQueueTimeoutMS=int(os.getenv("MONGODB_WAIT_QUEUE_TIMEOUT_MS", "5000")),
         )
         db = mongo_client.vms
@@ -3940,30 +3940,75 @@ def load_manual_jobs(force_refresh: bool = False) -> List[Job]:
         return _read_manual_jobs_from_store()
 
 
+_manual_jobs_last_good: Optional[List[Job]] = None
+MANUAL_JOBS_READ_ATTEMPTS = int(os.getenv("MANUAL_JOBS_READ_ATTEMPTS", "3"))
+MANUAL_JOBS_BATCH_SIZE = int(os.getenv("MANUAL_JOBS_BATCH_SIZE", "200"))
+
+
+def _read_manual_jobs_from_mongo() -> List[Job]:
+    """Read every direct-input job, or raise. Never returns a partial list.
+
+    The cursor is drained completely before anything is parsed, so a timeout on
+    a later batch fails the whole read instead of silently cutting the list off
+    after the first batch (~100 jobs). A single malformed document is skipped
+    and logged without dropping the jobs after it.
+    """
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max(1, MANUAL_JOBS_READ_ATTEMPTS) + 1):
+        try:
+            docs = list(
+                manual_jobs_collection.find({}, {"_id": 0})
+                .sort("created_at", -1)
+                .batch_size(MANUAL_JOBS_BATCH_SIZE)
+            )
+            break
+        except Exception as e:
+            last_error = e
+            print(f"[Manual Jobs] MongoDB read attempt {attempt} failed: {e}")
+    else:
+        raise last_error  # type: ignore[misc]
+
+    jobs: List[Job] = []
+    for doc in docs:
+        try:
+            doc.pop("created_at", None)
+            if not doc.get("bill_rate_discount_applied"):
+                doc["salary_range"] = display_bill_rate(doc.get("salary_range")) or None
+            doc["bill_rate_discount_applied"] = True
+            jobs.append(Job(**doc))
+        except Exception as e:
+            print(f"[Manual Jobs] Skipping malformed job {doc.get('id')!r}: {e}")
+    return jobs
+
+
 def _read_manual_jobs_from_store() -> List[Job]:
-    global _manual_jobs_cache, _manual_jobs_cache_time
+    global _manual_jobs_cache, _manual_jobs_cache_time, _manual_jobs_last_good
 
     jobs: List[Job] = []
 
-    try:
-        if mongodb_enabled and manual_jobs_collection is not None:
-            for doc in manual_jobs_collection.find({}, {"_id": 0}).sort("created_at", -1):
-                doc.pop("created_at", None)
-                if not doc.get("bill_rate_discount_applied"):
-                    doc["salary_range"] = display_bill_rate(doc.get("salary_range")) or None
-                doc["bill_rate_discount_applied"] = True
-                jobs.append(Job(**doc))
-            with _manual_jobs_cache_lock:
-                unchanged = _manual_jobs_cache is not None and _manual_jobs_cache == jobs
-                _manual_jobs_cache = jobs
-                _manual_jobs_cache_time = datetime.now()
-            # Keep the sanitised/serialised payloads when nothing changed, so a
-            # periodic reload no longer forces every request to rebuild them.
-            if not unchanged:
-                clear_jobs_response_cache()
-                print(f"[Manual Jobs] Reloaded {len(jobs)} jobs from MongoDB (changed)")
-            return jobs
+    if mongodb_enabled and manual_jobs_collection is not None:
+        try:
+            jobs = _read_manual_jobs_from_mongo()
+        except Exception as e:
+            print(f"[Manual Jobs] Failed to load direct-input jobs: {e}")
+            # Never publish a truncated list. Keep serving the last complete one;
+            # with none yet, raise so no payload is built or cached from nothing.
+            if _manual_jobs_last_good is not None:
+                return _manual_jobs_last_good
+            raise
+        with _manual_jobs_cache_lock:
+            unchanged = _manual_jobs_cache is not None and _manual_jobs_cache == jobs
+            _manual_jobs_cache = jobs
+            _manual_jobs_cache_time = datetime.now()
+            _manual_jobs_last_good = jobs
+        # Keep the sanitised/serialised payloads when nothing changed, so a
+        # periodic reload no longer forces every request to rebuild them.
+        if not unchanged:
+            clear_jobs_response_cache()
+            print(f"[Manual Jobs] Reloaded {len(jobs)} jobs from MongoDB (changed)")
+        return jobs
 
+    try:
         if not os.path.exists(MANUAL_JOBS_FILE):
             return jobs
 
