@@ -37,13 +37,23 @@ from bson.objectid import ObjectId
 # Load environment variables
 load_dotenv()
 
-# MongoDB setup for persistent storage
+# MongoDB setup for persistent storage.
+#
+# Two clusters are kept connected side by side, not as a primary/failover
+# pair: MONGODB_URI is the original cluster, now at its Atlas storage quota
+# (writes blocked cluster-wide), and MONGODB_URI_2 is a second cluster added
+# for headroom. Existing accounts and whitelist entries stay on MONGODB_URI
+# so none of that data is migrated or lost; every collection that grows
+# quickly (candidates, resumes/GridFS, notifications, logs, auth tokens,
+# job data) is served from MONGODB_URI_2 so it has room to grow.
 MONGODB_URI = os.getenv("MONGODB_URI", "")
-# Fallback cluster, used when the primary one is unreachable or out of storage
-# (e.g. Atlas free-tier quota hit on MONGODB_URI).
 MONGODB_URI_2 = os.getenv("MONGODB_URI_2", "")
-ACTIVE_MONGODB_LABEL: Optional[str] = None  # "primary" or "secondary", once connected
-mongo_client = None
+ACTIVE_MONGODB_LABEL: Optional[str] = None  # e.g. "primary+secondary", "primary-only", "secondary-only"
+primary_mongo_client = None    # MONGODB_URI   - users/whitelist (existing identity data)
+secondary_mongo_client = None  # MONGODB_URI_2 - everything else (growing data, GridFS)
+primary_db = None
+secondary_db = None
+mongo_client = None  # kept for health/ping helpers; points at whichever cluster is connected
 db = None
 users_collection = None
 whitelist_collection = None
@@ -120,75 +130,52 @@ def measure_mongodb_ping_ms(samples: int = 5) -> Optional[float]:
     return round(timings[len(timings) // 2], 1)
 
 
-def _connect_mongodb(uri: str) -> bool:
-    """Connect to a single MongoDB URI and wire up all collection globals.
+def _open_mongo_client(uri: str):
+    """Connect to a single MongoDB URI and return (client, db) on success.
 
-    Returns True on success (connection + ping both succeeded). A full Atlas
-    cluster typically fails here too, since it can no longer accept the write
-    pymongo issues as part of server handshake/ping bookkeeping - so this
-    doubles as the "is this cluster usable" check for failover.
+    Only opens the connection and pings it - does not touch any collection
+    globals, so the caller can route collections to whichever cluster(s)
+    came up without one cluster's failure clobbering the other's globals.
     """
-    global mongo_client, db, users_collection, whitelist_collection, candidates_collection, notifications_collection, jobs_collection, job_status_tracker_collection, closure_audit_collection, manual_jobs_collection, submission_logs_collection, auth_tokens_collection, user_preferences_collection, job_notification_outbox_collection, locks_collection, meta_collection, fs
-
-    try:
-        client = MongoClient(
-            uri,
-            server_api=ServerApi('1'),
-            maxPoolSize=int(os.getenv("MONGODB_MAX_POOL_SIZE", "20")),
-            # Each new connection to a remote cluster costs several round trips
-            # (TCP, TLS, auth), and pymongo opens at most two at a time, so a
-            # burst of tabs waited on connection setup. Keep some open and ready.
-            minPoolSize=int(os.getenv("MONGODB_MIN_POOL_SIZE", "10")),
-            serverSelectionTimeoutMS=int(os.getenv("MONGODB_SERVER_SELECTION_TIMEOUT_MS", "10000")),
-            # Bound the damage from a slow or hung cluster: without these a stuck
-            # socket pins one of the 40 worker threads indefinitely.
-            connectTimeoutMS=int(os.getenv("MONGODB_CONNECT_TIMEOUT_MS", "5000")),
-            socketTimeoutMS=int(os.getenv("MONGODB_SOCKET_TIMEOUT_MS", "20000")),
-            waitQueueTimeoutMS=int(os.getenv("MONGODB_WAIT_QUEUE_TIMEOUT_MS", "5000")),
-        )
-        new_db = client.vms
-
-        # Test connection before committing to this client, so a bad/full
-        # cluster doesn't clobber an already-working one.
-        client.admin.command('ping')
-
-        mongo_client = client
-        db = new_db
-        users_collection = db.users
-        whitelist_collection = db.whitelist
-        candidates_collection = db.candidates
-        notifications_collection = db.notifications
-        jobs_collection = db.jobs  # Track job status changes
-        job_status_tracker_collection = db.job_status_tracker  # Fresh tracker for closure detection (separate from legacy `jobs`)
-        closure_audit_collection = db.closure_audit  # Audit log for detected closures (dry-run + live)
-        manual_jobs_collection = db.manual_jobs  # Direct API-ingested jobs
-        submission_logs_collection = db.submission_logs  # Immutable audit log for candidate submissions
-        auth_tokens_collection = db.auth_tokens  # Password-reset tokens and login/registration OTPs shared across workers
-        user_preferences_collection = db.user_preferences  # Per-user job notification preferences
-        job_notification_outbox_collection = db.job_notification_outbox  # Durable queue of posted jobs awaiting digest emails
-        locks_collection = db.locks  # Cross-worker leases (only one worker sends digests at a time)
-        meta_collection = db.meta  # Small shared state: jobs version stamp, status-report snapshot
-
-        # Initialize GridFS for file storage
-        import gridfs
-        fs = gridfs.GridFS(db)
-
-        ensure_mongodb_indexes()
-        return True
-    except Exception as e:
-        print(f"[MongoDB] Connection failed: {e}")
-        return False
+    client = MongoClient(
+        uri,
+        server_api=ServerApi('1'),
+        maxPoolSize=int(os.getenv("MONGODB_MAX_POOL_SIZE", "20")),
+        # Each new connection to a remote cluster costs several round trips
+        # (TCP, TLS, auth), and pymongo opens at most two at a time, so a
+        # burst of tabs waited on connection setup. Keep some open and ready.
+        minPoolSize=int(os.getenv("MONGODB_MIN_POOL_SIZE", "10")),
+        serverSelectionTimeoutMS=int(os.getenv("MONGODB_SERVER_SELECTION_TIMEOUT_MS", "10000")),
+        # Bound the damage from a slow or hung cluster: without these a stuck
+        # socket pins one of the 40 worker threads indefinitely.
+        connectTimeoutMS=int(os.getenv("MONGODB_CONNECT_TIMEOUT_MS", "5000")),
+        socketTimeoutMS=int(os.getenv("MONGODB_SOCKET_TIMEOUT_MS", "20000")),
+        waitQueueTimeoutMS=int(os.getenv("MONGODB_WAIT_QUEUE_TIMEOUT_MS", "5000")),
+    )
+    new_db = client.vms
+    # Test the connection before handing it back - a ping still succeeds on a
+    # cluster that is over its storage quota (writes are blocked, not reads).
+    client.admin.command('ping')
+    return client, new_db
 
 
 def init_mongodb():
-    """Initialize MongoDB connection, using MONGODB_URI_2 as the primary cluster.
+    """Connect to both MongoDB clusters and route collections between them.
 
-    MONGODB_URI (the original cluster) is over its Atlas storage quota, so we
-    no longer attempt it at all - connecting to it "succeeds" (ping works)
-    even though writes are blocked, which used to mask the problem instead of
-    failing over. MONGODB_URI is kept only as a last-resort fallback.
+    MONGODB_URI (primary) and MONGODB_URI_2 (secondary) are connected
+    independently and both stay open - this is not a primary/failover pair.
+    MONGODB_URI already holds the existing users and whitelist, so that data
+    stays there untouched and readable. MONGODB_URI_2 serves every
+    collection that grows quickly (candidates, resumes/GridFS, notifications,
+    job data, logs, auth tokens, preferences), since MONGODB_URI is at its
+    Atlas storage quota and has writes blocked cluster-wide.
     """
     global mongodb_startup_ping_ms, ACTIVE_MONGODB_LABEL
+    global primary_mongo_client, secondary_mongo_client, primary_db, secondary_db, mongo_client, db
+    global users_collection, whitelist_collection, candidates_collection, notifications_collection
+    global jobs_collection, job_status_tracker_collection, closure_audit_collection, manual_jobs_collection
+    global submission_logs_collection, auth_tokens_collection, user_preferences_collection
+    global job_notification_outbox_collection, locks_collection, meta_collection, fs
 
     print(f"[MongoDB] Checking configuration...")
     print(f"[MongoDB] MONGODB_URI present: {bool(MONGODB_URI)}")
@@ -200,28 +187,59 @@ def init_mongodb():
         print("[MongoDB] Using fallback JSON storage")
         return False
 
-    connected = False
+    primary_ok = False
+    if MONGODB_URI:
+        print("[MongoDB] Connecting to primary cluster (MONGODB_URI) for users/whitelist...")
+        try:
+            primary_mongo_client, primary_db = _open_mongo_client(MONGODB_URI)
+            users_collection = primary_db.users
+            whitelist_collection = primary_db.whitelist
+            primary_ok = True
+            print("[MongoDB] Primary cluster connected.")
+        except Exception as e:
+            print(f"[MongoDB] Primary cluster (MONGODB_URI) unavailable: {e}")
+
+    secondary_ok = False
     if MONGODB_URI_2:
-        print("[MongoDB] Attempting to connect to primary cluster (MONGODB_URI_2)...")
-        if _connect_mongodb(MONGODB_URI_2):
-            ACTIVE_MONGODB_LABEL = "primary"
-            connected = True
-        else:
-            print("[MongoDB] MONGODB_URI_2 unavailable.")
+        print("[MongoDB] Connecting to secondary cluster (MONGODB_URI_2) for job/candidate data...")
+        try:
+            secondary_mongo_client, secondary_db = _open_mongo_client(MONGODB_URI_2)
+            candidates_collection = secondary_db.candidates
+            notifications_collection = secondary_db.notifications
+            jobs_collection = secondary_db.jobs  # Track job status changes
+            job_status_tracker_collection = secondary_db.job_status_tracker  # Fresh tracker for closure detection (separate from legacy `jobs`)
+            closure_audit_collection = secondary_db.closure_audit  # Audit log for detected closures (dry-run + live)
+            manual_jobs_collection = secondary_db.manual_jobs  # Direct API-ingested jobs
+            submission_logs_collection = secondary_db.submission_logs  # Immutable audit log for candidate submissions
+            auth_tokens_collection = secondary_db.auth_tokens  # Password-reset tokens and login/registration OTPs shared across workers
+            user_preferences_collection = secondary_db.user_preferences  # Per-user job notification preferences
+            job_notification_outbox_collection = secondary_db.job_notification_outbox  # Durable queue of posted jobs awaiting digest emails
+            locks_collection = secondary_db.locks  # Cross-worker leases (only one worker sends digests at a time)
+            meta_collection = secondary_db.meta  # Small shared state: jobs version stamp, status-report snapshot
 
-    if not connected and MONGODB_URI:
-        print("[MongoDB] Attempting to connect to fallback cluster (MONGODB_URI)...")
-        if _connect_mongodb(MONGODB_URI):
-            ACTIVE_MONGODB_LABEL = "secondary"
-            connected = True
-        else:
-            print("[MongoDB] Fallback cluster unavailable too.")
+            import gridfs
+            fs = gridfs.GridFS(secondary_db)  # Resume storage - the main driver of quota usage
 
-    if not connected:
+            secondary_ok = True
+            print("[MongoDB] Secondary cluster connected.")
+        except Exception as e:
+            print(f"[MongoDB] Secondary cluster (MONGODB_URI_2) unavailable: {e}")
+
+    if not primary_ok and not secondary_ok:
         print("[MongoDB] Using fallback JSON storage")
         return False
 
-    print(f"[MongoDB] Connected successfully (with GridFS) [{ACTIVE_MONGODB_LABEL}]")
+    # Legacy globals some health/ping helpers still read - point them at
+    # whichever cluster carries the heavier traffic (secondary), falling
+    # back to primary if that one isn't up.
+    mongo_client = secondary_mongo_client or primary_mongo_client
+    db = secondary_db or primary_db
+
+    ACTIVE_MONGODB_LABEL = "+".join(
+        label for label, ok in (("primary", primary_ok), ("secondary", secondary_ok)) if ok
+    )
+
+    ensure_mongodb_indexes()
     try:
         mongodb_startup_ping_ms = measure_mongodb_ping_ms()
         if mongodb_startup_ping_ms is not None and mongodb_startup_ping_ms > MONGODB_SLOW_PING_MS:
