@@ -1076,6 +1076,7 @@ function appendJobCards(jobs) {
     const meta = document.createElement('div');
     meta.className = 'card__meta';
     meta.innerHTML = `
+      <span class="tag">Job ID: ${escapeHtml(job.job_id || job.id || 'N/A')}</span>
       <span class="tag">${escapeHtml(job.department || 'Department: N/A')}</span>
       <span class="tag">${escapeHtml(job.location || 'Location: N/A')}</span>
       <span class="tag">${escapeHtml(job.employment_type || 'Type: N/A')}</span>
@@ -1192,6 +1193,7 @@ function openJobDetailModal(job) {
   els.jobDetailJobTitle.textContent = job.title || 'Selected job';
   
   const parts = [
+    `Job ID: ${job.job_id || job.id || 'N/A'}`,
     job.department ? `Dept: ${job.department}` : null,
     job.location ? `Location: ${job.location}` : null,
     job.employment_type ? `Type: ${job.employment_type}` : null,
@@ -1252,6 +1254,7 @@ function openSubmitModal(job) {
   els.submitJobTitle.textContent = job.title || 'Selected job';
   
   const parts = [
+    `Job ID: ${job.job_id || job.id || 'N/A'}`,
     job.department ? `Dept: ${job.department}` : null,
     job.location ? `Location: ${job.location}` : null,
     job.status ? `Status: ${job.status}` : null,

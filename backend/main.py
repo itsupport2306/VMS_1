@@ -24,7 +24,7 @@ import secrets
 import hashlib
 import smtplib
 from threading import Lock
-from time import monotonic as _monotonic
+from time import monotonic as _monotonic, sleep as _sleep
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from email.message import EmailMessage
@@ -94,6 +94,7 @@ def ensure_mongodb_indexes() -> None:
 
 MONGODB_SLOW_PING_MS = float(os.getenv("MONGODB_SLOW_PING_MS", "15"))
 mongodb_startup_ping_ms: Optional[float] = None
+MONGODB_WRITE_RETRY_ATTEMPTS = int(os.getenv("MONGODB_WRITE_RETRY_ATTEMPTS", "3"))
 
 
 def measure_mongodb_ping_ms(samples: int = 5) -> Optional[float]:
@@ -230,6 +231,7 @@ SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL", "notifications@radixsol.c
 
 BILL_RATE_DISPLAY_MULTIPLIER = 0.93
 BILL_RATE_NUMBER_PATTERN = re.compile(r"\d+(?:,\d{3})*(?:\.\d+)?")
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 COMPENSATION_PATTERN = re.compile(
     r"\b(bill\s*rate|salary|pay\s*rate|hourly\s*pay|weekly\s*pay|regular\s*pay|stipend)\b",
     flags=re.IGNORECASE,
@@ -3603,7 +3605,17 @@ def get_client_ip(request: Request) -> Optional[str]:
 def record_submission_log(audit_doc: dict) -> None:
     """Persist a candidate-submission audit log in MongoDB or JSON fallback."""
     if mongodb_enabled and submission_logs_collection is not None:
-        submission_logs_collection.insert_one(audit_doc)
+        # replace_one(upsert=True) by the doc's own id rather than insert_one: a
+        # retry after a client-side timeout (server may have actually applied the
+        # first attempt) then overwrites with identical data instead of raising
+        # a duplicate-key error or leaving two audit rows for one submission.
+        _with_mongo_retries(
+            f"Submission log write ({audit_doc.get('id')})",
+            lambda: submission_logs_collection.replace_one(
+                {"id": audit_doc["id"]}, dict(audit_doc), upsert=True
+            ),
+            attempts=MONGODB_WRITE_RETRY_ATTEMPTS,
+        )
         print(f"[SubmissionAudit] Logged submission {audit_doc.get('id')} in MongoDB")
         return
 
@@ -3721,8 +3733,18 @@ def store_candidate_doc(candidate_doc: dict) -> None:
     """Persist one candidate submission in MongoDB or the JSON fallback."""
     candidate_id = candidate_doc.get("id")
     if mongodb_enabled and candidates_collection is not None:
-        # insert_one adds _id to the dict it is given; keep the caller's copy JSON-safe.
-        candidates_collection.insert_one(dict(candidate_doc))
+        # replace_one(upsert=True) by our own id instead of insert_one: candidate_id
+        # is already a unique, client-generated key, so a retry after a timed-out
+        # write (the first attempt may have landed server-side) safely overwrites
+        # the same document instead of raising a duplicate-key error or, worse,
+        # creating a second candidate record for one submission.
+        _with_mongo_retries(
+            f"Candidate write ({candidate_id})",
+            lambda: candidates_collection.replace_one(
+                {"id": candidate_id}, dict(candidate_doc), upsert=True
+            ),
+            attempts=MONGODB_WRITE_RETRY_ATTEMPTS,
+        )
         print(f"[Submissions] Candidate {candidate_id} stored in MongoDB")
         return
 
@@ -3766,16 +3788,32 @@ def compute_user_submission_summary(submitter_user_id: Optional[str], submitted_
     submission_date = submitted_at[:10] if len(submitted_at) >= 10 else ""
     base = {"submitted_by_user_id": submitter_user_id}
     projection = {"_id": 0, "submitted_date": 1}
-    total = candidates_collection.count_documents(base)
+    total = _with_mongo_retries(
+        "Submission summary (total count)",
+        lambda: candidates_collection.count_documents(base),
+        attempts=MONGODB_WRITE_RETRY_ATTEMPTS,
+    )
     on_date = 0
     if submission_date:
         # submitted_date is an ISO string, so one day is a contiguous string range.
-        on_date = candidates_collection.count_documents({
-            **base,
-            "submitted_date": {"$gte": submission_date, "$lt": submission_date + "\uffff"},
-        })
-    first = candidates_collection.find_one(base, projection, sort=[("submitted_date", 1)])
-    last = candidates_collection.find_one(base, projection, sort=[("submitted_date", -1)])
+        on_date = _with_mongo_retries(
+            "Submission summary (on-date count)",
+            lambda: candidates_collection.count_documents({
+                **base,
+                "submitted_date": {"$gte": submission_date, "$lt": submission_date + "\uffff"},
+            }),
+            attempts=MONGODB_WRITE_RETRY_ATTEMPTS,
+        )
+    first = _with_mongo_retries(
+        "Submission summary (first)",
+        lambda: candidates_collection.find_one(base, projection, sort=[("submitted_date", 1)]),
+        attempts=MONGODB_WRITE_RETRY_ATTEMPTS,
+    )
+    last = _with_mongo_retries(
+        "Submission summary (last)",
+        lambda: candidates_collection.find_one(base, projection, sort=[("submitted_date", -1)]),
+        attempts=MONGODB_WRITE_RETRY_ATTEMPTS,
+    )
     return {
         "total_profiles_submitted": total,
         "profiles_submitted_on_date": on_date,
@@ -3896,9 +3934,19 @@ def strip_html_job_description(raw_description: str) -> str:
     return text.strip()
 
 
+def generate_unique_job_id() -> str:
+    """A job ID for jobs the caller didn't supply one for.
+
+    upsert_manual_jobs keys every job by its id, so any two jobs that both land
+    here with an empty id would collide on {"id": ""} and silently overwrite
+    one another. Generate a collision-proof one instead.
+    """
+    return f"JOB-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:6].upper()}"
+
+
 def build_job_from_direct_input(payload: DirectJobCreateRequest) -> Job:
     """Map direct endpoint input into the shared Job response model."""
-    job_id = (payload.job_id or payload.job_code or "").strip()
+    job_id = (payload.job_id or payload.job_code or "").strip() or generate_unique_job_id()
     location_parts = [payload.city.strip(), payload.state.strip()]
     full_location = ", ".join([part for part in location_parts if part])
     raw_description = (
@@ -3948,15 +3996,26 @@ MANUAL_JOBS_BATCH_SIZE = int(os.getenv("MANUAL_JOBS_BATCH_SIZE", "200"))
 MANUAL_JOBS_READ_CONCURRENCY = int(os.getenv("MANUAL_JOBS_READ_CONCURRENCY", "4"))
 
 
-def _with_read_retries(label: str, read: Callable[[], Any]) -> Any:
+def _with_mongo_retries(label: str, operation: Callable[[], Any], attempts: int = MANUAL_JOBS_READ_ATTEMPTS, backoff_seconds: float = 0.25) -> Any:
+    """Retry a blocking MongoDB call against the transient timeouts a remote
+    Atlas cluster produces under load (socket timeouts, brief network blips).
+    A short backoff between attempts avoids retrying straight into the same
+    congestion that caused the first timeout.
+    """
     last_error: Optional[Exception] = None
-    for attempt in range(1, max(1, MANUAL_JOBS_READ_ATTEMPTS) + 1):
+    for attempt in range(1, max(1, attempts) + 1):
         try:
-            return read()
+            return operation()
         except Exception as e:
             last_error = e
-            print(f"[Manual Jobs] {label} attempt {attempt} failed: {e}")
+            print(f"[MongoDB] {label} attempt {attempt} failed: {e}")
+            if attempt < attempts:
+                _sleep(backoff_seconds * attempt)
     raise last_error  # type: ignore[misc]
+
+
+# Back-compat alias: the retry helper used to be read-only and manual-jobs-specific.
+_with_read_retries = _with_mongo_retries
 
 
 def _read_manual_jobs_from_mongo() -> List[Job]:
@@ -5409,33 +5468,81 @@ async def submit_candidate(
         # Validate file
         if resume.size > MAX_FILE_SIZE:
             raise HTTPException(status_code=413, detail="File too large")
-        
+
         file_extension = resume.filename.split(".")[-1].lower()
         allowed_extensions = ["pdf", "doc", "docx", "txt"]
         if file_extension not in allowed_extensions:
             raise HTTPException(status_code=400, detail="Invalid file type")
-        
+
+        # Basic shape checks so garbage form data fails fast with a clear 400
+        # instead of being written to the candidate record as-is.
+        email_norm = email.strip()
+        if not EMAIL_PATTERN.match(email_norm):
+            raise HTTPException(status_code=400, detail="Invalid email address")
+        try:
+            years_experience_num = float(years_experience.strip())
+            if years_experience_num < 0 or years_experience_num > 80:
+                raise ValueError
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Years of Experience must be a non-negative number")
+
+        # Guard against duplicate submissions: a client retry after a transient
+        # error (the request timing out before the response arrives, or a user
+        # re-clicking Submit after seeing a false failure) would otherwise create
+        # a second, identical candidate record and a second resume upload. If
+        # this vendor already submitted this candidate for this job in the last
+        # few minutes, treat the retry as a no-op success rather than duplicating it.
+        if mongodb_enabled and candidates_collection is not None:
+            dedupe_cutoff = (datetime.now() - timedelta(minutes=5)).isoformat()
+            existing_submission = await asyncio.to_thread(
+                _with_mongo_retries,
+                "Duplicate submission check",
+                lambda: candidates_collection.find_one(
+                    {
+                        "submitted_by_user_id": current_user.id,
+                        "job_id": job_id,
+                        "email": email_norm,
+                        "submitted_date": {"$gte": dedupe_cutoff},
+                    },
+                    sort=[("submitted_date", -1)],
+                ),
+                MONGODB_WRITE_RETRY_ATTEMPTS,
+            )
+            if existing_submission:
+                return {
+                    "message": "Candidate already submitted",
+                    "candidate_id": existing_submission.get("id"),
+                    "status": existing_submission.get("status", "submitted"),
+                    "submitted_by": current_user.full_name,
+                    "duplicate": True,
+                }
+
         # Read resume content
         content = await resume.read()
-        
+
         # Store resume in GridFS (persistent across redeploys)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{candidate_name.replace(' ', '_')}_{timestamp}.{file_extension}"
-        
+
         if mongodb_enabled and fs is not None:
             # Store in GridFS (off the event loop - a multi-MB upload to Atlas
-            # used to stall every other request on this worker).
+            # used to stall every other request on this worker). Retried: a
+            # socket timeout here previously failed the whole submission outright.
             resume_file_id = await asyncio.to_thread(
-                fs.put,
-                content,
-                filename=filename,
-                content_type=resume.content_type or 'application/octet-stream',
-                metadata={
-                    'candidate_name': candidate_name,
-                    'job_id': job_id,
-                    'uploaded_by': current_user.email,
-                    'uploaded_at': datetime.now().isoformat()
-                }
+                _with_mongo_retries,
+                "GridFS resume upload",
+                lambda: fs.put(
+                    content,
+                    filename=filename,
+                    content_type=resume.content_type or 'application/octet-stream',
+                    metadata={
+                        'candidate_name': candidate_name,
+                        'job_id': job_id,
+                        'uploaded_by': current_user.email,
+                        'uploaded_at': datetime.now().isoformat()
+                    }
+                ),
+                MONGODB_WRITE_RETRY_ATTEMPTS,
             )
             resume_storage_id = str(resume_file_id)
             storage_type = "gridfs"
@@ -5460,7 +5567,7 @@ async def submit_candidate(
         candidate_doc = {
             "id": candidate_id,
             "name": candidate_name,
-            "email": email,
+            "email": email_norm,
             "phone": phone,
             "job_id": job_id,
             "resume_storage_id": resume_storage_id,
@@ -5490,7 +5597,7 @@ async def submit_candidate(
             "id": f"submission_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid4())[:8]}",
             "candidate_id": candidate_id,
             "candidate_name": candidate_name,
-            "candidate_email": email,
+            "candidate_email": email_norm,
             "candidate_phone": phone,
             "job_id": job_id,
             "job_title": job_title,
@@ -5517,11 +5624,26 @@ async def submit_candidate(
         except Exception as e:
             print(f"[SubmissionAudit] Failed to write audit log for {candidate_id}: {e}")
 
-        user_submission_summary = await asyncio.to_thread(
-            compute_user_submission_summary,
-            current_user.id,
-            submitted_at,
-        )
+        # The candidate record above is already durably saved; a failure computing
+        # these display-only counts must not make the API report the submission
+        # as failed, since that would push the vendor to resubmit and hit the
+        # duplicate-submission guard instead of just seeing their confirmation.
+        try:
+            user_submission_summary = await asyncio.to_thread(
+                compute_user_submission_summary,
+                current_user.id,
+                submitted_at,
+            )
+        except Exception as e:
+            print(f"[Submissions] Could not compute submission summary for {candidate_id}: {e}")
+            submission_date = submitted_at[:10] if len(submitted_at) >= 10 else ""
+            user_submission_summary = {
+                "total_profiles_submitted": None,
+                "profiles_submitted_on_date": None,
+                "submission_date": submission_date,
+                "first_submission_at": submitted_at,
+                "last_submission_at": submitted_at,
+            }
 
         # Send email notification to admin
         vendor_info = {
@@ -5547,6 +5669,11 @@ async def submit_candidate(
             "submission_summary": user_submission_summary,
         }
         
+    except HTTPException:
+        # Validation errors raised above (413/400) already carry the right
+        # status code and message; don't let the generic handler below
+        # flatten them into a misleading 500.
+        raise
     except Exception as e:
         print(f"[Submissions] Error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to submit candidate: {str(e)}")
