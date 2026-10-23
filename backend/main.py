@@ -39,6 +39,10 @@ load_dotenv()
 
 # MongoDB setup for persistent storage
 MONGODB_URI = os.getenv("MONGODB_URI", "")
+# Fallback cluster, used when the primary one is unreachable or out of storage
+# (e.g. Atlas free-tier quota hit on MONGODB_URI).
+MONGODB_URI_2 = os.getenv("MONGODB_URI_2", "")
+ACTIVE_MONGODB_LABEL: Optional[str] = None  # "primary" or "secondary", once connected
 mongo_client = None
 db = None
 users_collection = None
@@ -116,24 +120,19 @@ def measure_mongodb_ping_ms(samples: int = 5) -> Optional[float]:
     return round(timings[len(timings) // 2], 1)
 
 
-def init_mongodb():
-    """Initialize MongoDB connection"""
-    global mongodb_startup_ping_ms
+def _connect_mongodb(uri: str) -> bool:
+    """Connect to a single MongoDB URI and wire up all collection globals.
+
+    Returns True on success (connection + ping both succeeded). A full Atlas
+    cluster typically fails here too, since it can no longer accept the write
+    pymongo issues as part of server handshake/ping bookkeeping - so this
+    doubles as the "is this cluster usable" check for failover.
+    """
     global mongo_client, db, users_collection, whitelist_collection, candidates_collection, notifications_collection, jobs_collection, job_status_tracker_collection, closure_audit_collection, manual_jobs_collection, submission_logs_collection, auth_tokens_collection, user_preferences_collection, job_notification_outbox_collection, locks_collection, meta_collection, fs
-    
-    print(f"[MongoDB] Checking configuration...")
-    print(f"[MongoDB] MONGODB_URI present: {bool(MONGODB_URI)}")
-    
-    if not MONGODB_URI:
-        print("[MongoDB] No MONGODB_URI environment variable set!")
-        print("[MongoDB] Set MONGODB_URI in your deployment environment")
-        print("[MongoDB] Using fallback JSON storage")
-        return False
-    
+
     try:
-        print(f"[MongoDB] Attempting to connect...")
-        mongo_client = MongoClient(
-            MONGODB_URI,
+        client = MongoClient(
+            uri,
             server_api=ServerApi('1'),
             maxPoolSize=int(os.getenv("MONGODB_MAX_POOL_SIZE", "20")),
             # Each new connection to a remote cluster costs several round trips
@@ -147,7 +146,14 @@ def init_mongodb():
             socketTimeoutMS=int(os.getenv("MONGODB_SOCKET_TIMEOUT_MS", "20000")),
             waitQueueTimeoutMS=int(os.getenv("MONGODB_WAIT_QUEUE_TIMEOUT_MS", "5000")),
         )
-        db = mongo_client.vms
+        new_db = client.vms
+
+        # Test connection before committing to this client, so a bad/full
+        # cluster doesn't clobber an already-working one.
+        client.admin.command('ping')
+
+        mongo_client = client
+        db = new_db
         users_collection = db.users
         whitelist_collection = db.whitelist
         candidates_collection = db.candidates
@@ -162,31 +168,68 @@ def init_mongodb():
         job_notification_outbox_collection = db.job_notification_outbox  # Durable queue of posted jobs awaiting digest emails
         locks_collection = db.locks  # Cross-worker leases (only one worker sends digests at a time)
         meta_collection = db.meta  # Small shared state: jobs version stamp, status-report snapshot
-        
+
         # Initialize GridFS for file storage
         import gridfs
         fs = gridfs.GridFS(db)
-        
-        # Test connection
-        mongo_client.admin.command('ping')
+
         ensure_mongodb_indexes()
-        print("[MongoDB] Connected successfully (with GridFS)")
-        try:
-            mongodb_startup_ping_ms = measure_mongodb_ping_ms()
-            if mongodb_startup_ping_ms is not None and mongodb_startup_ping_ms > MONGODB_SLOW_PING_MS:
-                print(
-                    f"[MongoDB] WARNING: median round trip is {mongodb_startup_ping_ms} ms "
-                    f"(threshold {MONGODB_SLOW_PING_MS} ms). The Atlas cluster is probably in a "
-                    f"different region from this server; every request pays this delay per query."
-                )
-            else:
-                print(f"[MongoDB] Median round trip: {mongodb_startup_ping_ms} ms")
-        except Exception as e:
-            print(f"[MongoDB] Could not measure round-trip time: {e}")
         return True
     except Exception as e:
         print(f"[MongoDB] Connection failed: {e}")
         return False
+
+
+def init_mongodb():
+    """Initialize MongoDB connection, falling back to MONGODB_URI_2 if the
+    primary cluster is unreachable or out of storage."""
+    global mongodb_startup_ping_ms, ACTIVE_MONGODB_LABEL
+
+    print(f"[MongoDB] Checking configuration...")
+    print(f"[MongoDB] MONGODB_URI present: {bool(MONGODB_URI)}")
+    print(f"[MongoDB] MONGODB_URI_2 present: {bool(MONGODB_URI_2)}")
+
+    if not MONGODB_URI and not MONGODB_URI_2:
+        print("[MongoDB] No MONGODB_URI environment variable set!")
+        print("[MongoDB] Set MONGODB_URI in your deployment environment")
+        print("[MongoDB] Using fallback JSON storage")
+        return False
+
+    connected = False
+    if MONGODB_URI:
+        print("[MongoDB] Attempting to connect to primary cluster (MONGODB_URI)...")
+        if _connect_mongodb(MONGODB_URI):
+            ACTIVE_MONGODB_LABEL = "primary"
+            connected = True
+        else:
+            print("[MongoDB] Primary cluster unavailable (unreachable or out of storage).")
+
+    if not connected and MONGODB_URI_2:
+        print("[MongoDB] Attempting to connect to fallback cluster (MONGODB_URI_2)...")
+        if _connect_mongodb(MONGODB_URI_2):
+            ACTIVE_MONGODB_LABEL = "secondary"
+            connected = True
+        else:
+            print("[MongoDB] Fallback cluster unavailable too.")
+
+    if not connected:
+        print("[MongoDB] Using fallback JSON storage")
+        return False
+
+    print(f"[MongoDB] Connected successfully (with GridFS) [{ACTIVE_MONGODB_LABEL}]")
+    try:
+        mongodb_startup_ping_ms = measure_mongodb_ping_ms()
+        if mongodb_startup_ping_ms is not None and mongodb_startup_ping_ms > MONGODB_SLOW_PING_MS:
+            print(
+                f"[MongoDB] WARNING: median round trip is {mongodb_startup_ping_ms} ms "
+                f"(threshold {MONGODB_SLOW_PING_MS} ms). The Atlas cluster is probably in a "
+                f"different region from this server; every request pays this delay per query."
+            )
+        else:
+            print(f"[MongoDB] Median round trip: {mongodb_startup_ping_ms} ms")
+    except Exception as e:
+        print(f"[MongoDB] Could not measure round-trip time: {e}")
+    return True
 
 # Initialize MongoDB on startup
 mongodb_enabled = init_mongodb()
@@ -5518,6 +5561,7 @@ def health_check():
     return {
         "storage_mode": "mongodb_json",
         "mongodb_enabled": mongodb_enabled,
+        "mongodb_active_cluster": ACTIVE_MONGODB_LABEL,
         "mongodb_ping_ms": mongodb_ping_ms,
         "mongodb_startup_ping_ms": mongodb_startup_ping_ms,
         "mongodb_slow": bool(mongodb_ping_ms is not None and mongodb_ping_ms > MONGODB_SLOW_PING_MS),
