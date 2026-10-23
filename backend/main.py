@@ -788,6 +788,87 @@ def normalize_job_status(status_value: str | None, default: str = "Open") -> str
     return status_text
 
 
+def notify_job_closures(transitions: List[dict], source: str = "ceipal") -> None:
+    """Send closure emails + in-app notifications for detected Open/Active -> Closed transitions.
+
+    Shared by the (disabled-by-default) Ceipal poller and the manual/Nexus job-ingest
+    path, which is what actually drives production since CEIPAL_ENABLED is False.
+    """
+    if not transitions:
+        return
+    global notifications_collection, closure_audit_collection
+
+    if len(transitions) > JOB_CLOSURE_PER_RUN_CAP:
+        print(f"[ClosureDetector] ABORT ({source}) — {len(transitions)} closures exceeds cap of {JOB_CLOSURE_PER_RUN_CAP}. No notifications sent.")
+        if closure_audit_collection is not None:
+            closure_audit_collection.insert_one({
+                "id": str(uuid4()),
+                "type": "abort_cap_exceeded",
+                "source": source,
+                "detected_count": len(transitions),
+                "cap": JOB_CLOSURE_PER_RUN_CAP,
+                "sample_job_ids": [t["job_id"] for t in transitions[:50]],
+                "detected_at": datetime.now().isoformat(),
+            })
+        return
+
+    recipients = sorted(
+        {u.lower() for u in get_whitelisted_emails(force_refresh=True) if u.lower() != ADMIN_EMAIL.lower()}
+    )
+
+    for t in transitions:
+        job_id = t["job_id"]
+        title = t["title"]
+        audit_doc = {
+            "id": str(uuid4()),
+            "type": "closure_detected",
+            "source": source,
+            "job_id": job_id,
+            "job_title": title,
+            "previous_status": t["previous_status"],
+            "current_status": t["current_status"],
+            "recipients_count": len(recipients),
+            "detected_at": datetime.now().isoformat(),
+            "dry_run": not JOB_CLOSURE_NOTIFICATIONS_ENABLED,
+        }
+
+        if not JOB_CLOSURE_NOTIFICATIONS_ENABLED:
+            print(f"[ClosureDetector] DRY RUN ({source}) — would notify {len(recipients)} users about closure of {job_id} ('{title}')")
+            if closure_audit_collection is not None:
+                closure_audit_collection.insert_one(audit_doc)
+            continue
+
+        sent_count = 0
+        for user_email in recipients:
+            if notifications_collection is not None:
+                existing = notifications_collection.find_one({
+                    "type": "job_closed",
+                    "job_id": job_id,
+                    "user_email": user_email,
+                })
+                if existing:
+                    continue
+            email_sent = send_job_closure_notification_email(user_email, title, job_id)
+            if notifications_collection is not None:
+                notifications_collection.insert_one({
+                    "id": str(uuid4()),
+                    "type": "job_closed",
+                    "job_id": job_id,
+                    "job_title": title,
+                    "user_email": user_email,
+                    "email_sent": email_sent,
+                    "created_at": datetime.now().isoformat(),
+                    "read": False,
+                })
+            if email_sent:
+                sent_count += 1
+
+        audit_doc["emails_sent"] = sent_count
+        if closure_audit_collection is not None:
+            closure_audit_collection.insert_one(audit_doc)
+        print(f"[ClosureDetector] Notified ({source}) {sent_count}/{len(recipients)} users about closure of {job_id}")
+
+
 def send_job_closure_notification_email(user_email: str, job_title: str, job_id: str) -> bool:
     """Send a single job-closure notification email via SendGrid."""
     if not SENDGRID_API_KEY:
@@ -1687,56 +1768,7 @@ def detect_and_notify_closures(current_status_map: dict, fetch_complete: bool):
                 closure_audit_collection.insert_one(audit_doc)
             print(f"[ClosureDetector] Notified {sent_count}/{len(recipients)} users about new posting {job_id}")
 
-        for t in transitions:
-            job_id = t["job_id"]
-            title = t["title"]
-            audit_doc = {
-                "id": str(uuid4()),
-                "type": "closure_detected",
-                "job_id": job_id,
-                "job_title": title,
-                "previous_status": t["previous_status"],
-                "current_status": t["current_status"],
-                "recipients_count": len(recipients),
-                "detected_at": datetime.now().isoformat(),
-                "dry_run": not JOB_CLOSURE_NOTIFICATIONS_ENABLED,
-            }
-
-            if not JOB_CLOSURE_NOTIFICATIONS_ENABLED:
-                print(f"[ClosureDetector] DRY RUN — would notify {len(recipients)} users about closure of {job_id} ('{title}')")
-                if closure_audit_collection is not None:
-                    closure_audit_collection.insert_one(audit_doc)
-                continue
-
-            sent_count = 0
-            for user_email in recipients:
-                if notifications_collection is not None:
-                    existing = notifications_collection.find_one({
-                        "type": "job_closed",
-                        "job_id": job_id,
-                        "user_email": user_email,
-                    })
-                    if existing:
-                        continue
-                email_sent = send_job_closure_notification_email(user_email, title, job_id)
-                if notifications_collection is not None:
-                    notifications_collection.insert_one({
-                        "id": str(uuid4()),
-                        "type": "job_closed",
-                        "job_id": job_id,
-                        "job_title": title,
-                        "user_email": user_email,
-                        "email_sent": email_sent,
-                        "created_at": datetime.now().isoformat(),
-                        "read": False,
-                    })
-                if email_sent:
-                    sent_count += 1
-
-            audit_doc["emails_sent"] = sent_count
-            if closure_audit_collection is not None:
-                closure_audit_collection.insert_one(audit_doc)
-            print(f"[ClosureDetector] Notified {sent_count}/{len(recipients)} users about closure of {job_id}")
+        notify_job_closures(transitions, source="ceipal")
 
         # Update tracker AFTER acting on transitions. Crash mid-batch ⇒ next run re-detects;
         # per-user dedupe prevents double-sends to recipients who already received the email.
@@ -3146,7 +3178,10 @@ def create_job_from_payload(
 
     try:
         job = build_job_from_direct_input(payload)
+        closures = detect_manual_job_closures([job])
         upsert_manual_job(job)
+        if closures:
+            background_tasks.add_task(notify_job_closures, closures, "direct_api")
         queue_job_post_notifications(background_tasks, [job], "direct_api", True)
 
         return {
@@ -3181,7 +3216,10 @@ def create_jobs_from_payload_bulk(
             failed_jobs.append({"job_id": job_ref, "error": str(exc)})
 
     try:
+        closures = detect_manual_job_closures(stored_jobs)
         upsert_manual_jobs(stored_jobs)
+        if closures:
+            background_tasks.add_task(notify_job_closures, closures, "direct_api_bulk")
         queue_job_post_notifications(
             background_tasks,
             stored_jobs,
@@ -3197,15 +3235,29 @@ def create_jobs_from_payload_bulk(
 @app.delete("/api/admin/jobs/{job_id}")
 def delete_job_from_payload(
     job_id: str,
-    credentials: AdminJobDeleteRequest
+    credentials: AdminJobDeleteRequest,
+    background_tasks: BackgroundTasks,
 ):
     """Delete a direct API-ingested job by job ID using admin credentials."""
     verify_admin_credentials(credentials.email, credentials.password)
 
     try:
+        prior_doc = None
+        if mongodb_enabled and manual_jobs_collection is not None:
+            prior_doc = manual_jobs_collection.find_one({"id": job_id}, {"id": 1, "title": 1, "status": 1})
+
         deleted = delete_manual_job(job_id)
         if not deleted:
             raise HTTPException(status_code=404, detail=f"Direct API job {job_id} not found")
+
+        if prior_doc and (prior_doc.get("status") or "").strip().lower() in OPEN_STATUSES:
+            closure = [{
+                "job_id": job_id,
+                "title": prior_doc.get("title") or job_id,
+                "previous_status": prior_doc.get("status"),
+                "current_status": "Closed",
+            }]
+            background_tasks.add_task(notify_job_closures, closure, "direct_api_delete")
 
         return {
             "message": "Job deleted successfully",
@@ -3240,7 +3292,10 @@ def create_nexus_job(payload: DirectJobCreateRequest, background_tasks: Backgrou
     """Create or update a job from Nexus-style request parameters."""
     try:
         job = build_job_from_direct_input(payload)
+        closures = detect_manual_job_closures([job])
         upsert_manual_job(job)
+        if closures:
+            background_tasks.add_task(notify_job_closures, closures, "nexus_api")
         queue_job_post_notifications(background_tasks, [job], "nexus_api", True)
 
         return {
@@ -3271,7 +3326,10 @@ def create_nexus_jobs_bulk(
             failed_jobs.append({"job_id": job_ref, "error": str(exc)})
 
     try:
+        closures = detect_manual_job_closures(stored_jobs)
         upsert_manual_jobs(stored_jobs)
+        if closures:
+            background_tasks.add_task(notify_job_closures, closures, "nexus_api_bulk")
         queue_job_post_notifications(
             background_tasks,
             stored_jobs,
@@ -4325,6 +4383,47 @@ async def jobs_refresh_loop() -> None:
             pass
 
 
+def detect_manual_job_closures(jobs: List[Job]) -> List[dict]:
+    """Compare incoming jobs' statuses against what's currently stored to find
+    Open/Active -> Closed transitions. Call BEFORE upsert_manual_jobs(jobs)
+    overwrites the stored status, with the same job list.
+
+    This is the live closure-notification trigger: the Ceipal poller that
+    detect_and_notify_closures was built for is disabled (CEIPAL_ENABLED=False),
+    and jobs only enter the system through this direct/Nexus ingest path.
+    """
+    if not jobs:
+        return []
+    ids = [job.id for job in jobs]
+    prev_status_by_id = {}
+    if mongodb_enabled and manual_jobs_collection is not None:
+        try:
+            for doc in manual_jobs_collection.find({"id": {"$in": ids}}, {"id": 1, "status": 1}):
+                prev_status_by_id[doc["id"]] = doc.get("status") or ""
+        except Exception as e:
+            print(f"[ClosureDetector] Failed to read prior statuses for manual jobs: {e}")
+            return []
+    else:
+        for existing in load_manual_jobs():
+            if existing.id in ids:
+                prev_status_by_id[existing.id] = existing.status or ""
+
+    transitions = []
+    for job in jobs:
+        if job.id not in prev_status_by_id:
+            continue  # brand-new job — not a transition
+        prev_status = (prev_status_by_id.get(job.id) or "").strip().lower()
+        curr_status = (job.status or "").strip().lower()
+        if prev_status in OPEN_STATUSES and curr_status in CLOSED_STATUSES:
+            transitions.append({
+                "job_id": job.id,
+                "title": job.title or job.job_id,
+                "previous_status": prev_status_by_id.get(job.id),
+                "current_status": job.status,
+            })
+    return transitions
+
+
 def upsert_manual_job(job: Job) -> None:
     """Persist one direct-input job by job ID."""
     upsert_manual_jobs([job])
@@ -4335,11 +4434,15 @@ def upsert_manual_jobs(jobs: List[Job]) -> None:
     if not jobs:
         return
 
-    job_payloads = []
+    job_payloads_by_id = {}
     for job in jobs:
         job_payload = job.dict()
         job_payload["bill_rate_discount_applied"] = True
-        job_payloads.append(job_payload)
+        # Last one wins. A single unordered bulk_write with two upserts matching
+        # the same not-yet-existing "id" can race into an E11000 duplicate-key
+        # error against the unique index, failing the whole batch with a 500.
+        job_payloads_by_id[job_payload["id"]] = job_payload
+    job_payloads = list(job_payloads_by_id.values())
 
     if mongodb_enabled and manual_jobs_collection is not None:
         created_at = datetime.now()

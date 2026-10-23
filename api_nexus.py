@@ -942,10 +942,15 @@ async def post_worker(
                     f"leaving CSV status as posting: {exc}"
                 )
             except Exception as exc:
+                error_detail = str(exc)
+                if isinstance(exc, httpx.HTTPStatusError):
+                    # str(exc) is just the status line; the server's actual
+                    # failure reason (e.g. a 500's detail message) is in the body.
+                    error_detail = f"{exc} | response body: {exc.response.text[:2000]}"
                 for job_id, _, _ in valid_entries:
-                    await csv_store.mark_failed(job_id, str(exc))
-                    result["failed"].append({"job_id": job_id, "error": str(exc)})
-                    print(f"Failed to post job {job_id} to VMS: {exc}")
+                    await csv_store.mark_failed(job_id, error_detail)
+                    result["failed"].append({"job_id": job_id, "error": error_detail})
+                    print(f"Failed to post job {job_id} to VMS: {error_detail}")
         finally:
             for _ in batch_rows:
                 post_queue.task_done()
