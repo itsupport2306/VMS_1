@@ -232,8 +232,8 @@ def init_mongodb():
     # Legacy globals some health/ping helpers still read - point them at
     # whichever cluster carries the heavier traffic (secondary), falling
     # back to primary if that one isn't up.
-    mongo_client = secondary_mongo_client or primary_mongo_client
-    db = secondary_db or primary_db
+    mongo_client = secondary_mongo_client if secondary_mongo_client is not None else primary_mongo_client
+    db = secondary_db if secondary_db is not None else primary_db
 
     ACTIVE_MONGODB_LABEL = "+".join(
         label for label, ok in (("primary", primary_ok), ("secondary", secondary_ok)) if ok
