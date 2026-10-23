@@ -181,8 +181,13 @@ def _connect_mongodb(uri: str) -> bool:
 
 
 def init_mongodb():
-    """Initialize MongoDB connection, falling back to MONGODB_URI_2 if the
-    primary cluster is unreachable or out of storage."""
+    """Initialize MongoDB connection, using MONGODB_URI_2 as the primary cluster.
+
+    MONGODB_URI (the original cluster) is over its Atlas storage quota, so we
+    no longer attempt it at all - connecting to it "succeeds" (ping works)
+    even though writes are blocked, which used to mask the problem instead of
+    failing over. MONGODB_URI is kept only as a last-resort fallback.
+    """
     global mongodb_startup_ping_ms, ACTIVE_MONGODB_LABEL
 
     print(f"[MongoDB] Checking configuration...")
@@ -196,17 +201,17 @@ def init_mongodb():
         return False
 
     connected = False
-    if MONGODB_URI:
-        print("[MongoDB] Attempting to connect to primary cluster (MONGODB_URI)...")
-        if _connect_mongodb(MONGODB_URI):
+    if MONGODB_URI_2:
+        print("[MongoDB] Attempting to connect to primary cluster (MONGODB_URI_2)...")
+        if _connect_mongodb(MONGODB_URI_2):
             ACTIVE_MONGODB_LABEL = "primary"
             connected = True
         else:
-            print("[MongoDB] Primary cluster unavailable (unreachable or out of storage).")
+            print("[MongoDB] MONGODB_URI_2 unavailable.")
 
-    if not connected and MONGODB_URI_2:
-        print("[MongoDB] Attempting to connect to fallback cluster (MONGODB_URI_2)...")
-        if _connect_mongodb(MONGODB_URI_2):
+    if not connected and MONGODB_URI:
+        print("[MongoDB] Attempting to connect to fallback cluster (MONGODB_URI)...")
+        if _connect_mongodb(MONGODB_URI):
             ACTIVE_MONGODB_LABEL = "secondary"
             connected = True
         else:
