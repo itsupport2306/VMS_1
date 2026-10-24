@@ -5,7 +5,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.security import HTTPBearer, HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, root_validator
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from collections import defaultdict
 import httpx
 import os
@@ -63,6 +63,7 @@ jobs_collection = None
 job_status_tracker_collection = None
 closure_audit_collection = None
 manual_jobs_collection = None
+primary_manual_jobs_collection = None  # legacy jobs created before the dual-cluster split - read-only, MONGODB_URI is over quota
 submission_logs_collection = None
 auth_tokens_collection = None
 user_preferences_collection = None
@@ -173,7 +174,7 @@ def init_mongodb():
     global mongodb_startup_ping_ms, ACTIVE_MONGODB_LABEL
     global primary_mongo_client, secondary_mongo_client, primary_db, secondary_db, mongo_client, db
     global users_collection, whitelist_collection, candidates_collection, notifications_collection
-    global jobs_collection, job_status_tracker_collection, closure_audit_collection, manual_jobs_collection
+    global jobs_collection, job_status_tracker_collection, closure_audit_collection, manual_jobs_collection, primary_manual_jobs_collection
     global submission_logs_collection, auth_tokens_collection, user_preferences_collection
     global job_notification_outbox_collection, locks_collection, meta_collection, fs
 
@@ -194,6 +195,7 @@ def init_mongodb():
             primary_mongo_client, primary_db = _open_mongo_client(MONGODB_URI)
             users_collection = primary_db.users
             whitelist_collection = primary_db.whitelist
+            primary_manual_jobs_collection = primary_db.manual_jobs  # jobs created before the split; read-only
             primary_ok = True
             print("[MongoDB] Primary cluster connected.")
         except Exception as e:
@@ -4143,33 +4145,50 @@ _with_read_retries = _with_mongo_retries
 
 
 def _read_manual_jobs_from_mongo() -> List[Job]:
-    """Read every direct-input job, or raise. Never returns a partial list.
+    """Read every direct-input job across both clusters, or raise. Never
+    returns a partial list.
+
+    manual_jobs now spans two collections: the legacy one on MONGODB_URI's
+    cluster (read-only - that cluster is over its Atlas storage quota, so
+    every job created before the dual-cluster split still lives there,
+    frozen) and the current one on MONGODB_URI_2 (every job created since).
+    Both are read and merged so jobs from before the split don't silently
+    vanish from listings.
 
     One long cursor over every full document (descriptions included) used to be
     a single point of failure: a timeout on any later batch either cut the list
     off after the first batch (~100 jobs) or, with retries, re-read everything
     from scratch while requests waited. Instead, read the ordered _id list once
-    (tiny, one round trip), then fetch the documents in fixed-size chunks a few
-    at a time. Each chunk is a short, bounded query retried on its own. A single
-    malformed document is skipped and logged without dropping the jobs after it.
+    (tiny, one round trip) per source, then fetch the documents in fixed-size
+    chunks a few at a time. Each chunk is a short, bounded query retried on its
+    own. A single malformed document is skipped and logged without dropping
+    the jobs after it.
     """
-    ids = _with_read_retries(
-        "ID list read",
-        lambda: [
-            doc["_id"]
-            for doc in manual_jobs_collection.find({}, {"_id": 1})
-            .sort("created_at", -1)
-            .batch_size(100_000)
-        ],
-    )
-    chunk_size = max(1, MANUAL_JOBS_BATCH_SIZE)
-    chunks = [ids[i:i + chunk_size] for i in range(0, len(ids), chunk_size)]
+    sources = [c for c in (manual_jobs_collection, primary_manual_jobs_collection) if c is not None]
 
-    def read_chunk(chunk_ids: List[Any]) -> List[dict]:
-        return _with_read_retries(
-            f"Chunk read ({len(chunk_ids)} jobs)",
-            lambda: list(manual_jobs_collection.find({"_id": {"$in": chunk_ids}})),
+    entries: List[Tuple[Any, Any, Any]] = []  # (source collection, _id, created_at)
+    for collection in sources:
+        rows = _with_read_retries(
+            "ID list read",
+            lambda c=collection: list(c.find({}, {"_id": 1, "created_at": 1}).batch_size(100_000)),
         )
+        entries.extend((collection, row["_id"], row.get("created_at")) for row in rows)
+    entries.sort(key=lambda e: e[2] or datetime.min, reverse=True)
+
+    chunk_size = max(1, MANUAL_JOBS_BATCH_SIZE)
+    chunks = [entries[i:i + chunk_size] for i in range(0, len(entries), chunk_size)]
+
+    def read_chunk(chunk_entries: List[Tuple[Any, Any, Any]]) -> List[dict]:
+        ids_by_collection: Dict[Any, List[Any]] = defaultdict(list)
+        for collection, _id, _created_at in chunk_entries:
+            ids_by_collection[collection].append(_id)
+        docs: List[dict] = []
+        for collection, id_list in ids_by_collection.items():
+            docs.extend(_with_read_retries(
+                f"Chunk read ({len(id_list)} jobs)",
+                lambda c=collection, ids=id_list: list(c.find({"_id": {"$in": ids}})),
+            ))
+        return docs
 
     if len(chunks) > 1 and MANUAL_JOBS_READ_CONCURRENCY > 1:
         with ThreadPoolExecutor(max_workers=min(MANUAL_JOBS_READ_CONCURRENCY, len(chunks))) as pool:
@@ -4182,7 +4201,7 @@ def _read_manual_jobs_from_mongo() -> List[Job]:
     docs_by_id = {doc["_id"]: doc for docs in chunk_docs for doc in docs}
     jobs: List[Job] = []
     skipped = 0
-    for _id in ids:
+    for _collection, _id, _created_at in entries:
         doc = docs_by_id.get(_id)
         if doc is None:
             continue
@@ -4197,7 +4216,7 @@ def _read_manual_jobs_from_mongo() -> List[Job]:
             skipped += 1
             print(f"[Manual Jobs] Skipping malformed job {doc.get('id')!r}: {e}")
     if skipped:
-        print(f"[Manual Jobs] Loaded {len(jobs)} of {len(ids)} jobs; {skipped} malformed skipped")
+        print(f"[Manual Jobs] Loaded {len(jobs)} of {len(entries)} jobs; {skipped} malformed skipped")
     return jobs
 
 
@@ -4206,7 +4225,7 @@ def _read_manual_jobs_from_store() -> List[Job]:
 
     jobs: List[Job] = []
 
-    if mongodb_enabled and manual_jobs_collection is not None:
+    if mongodb_enabled and (manual_jobs_collection is not None or primary_manual_jobs_collection is not None):
         try:
             jobs = _read_manual_jobs_from_mongo()
         except Exception as e:
