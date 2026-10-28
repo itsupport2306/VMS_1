@@ -78,6 +78,15 @@ Posted Open jobs (from `/api/nexus/jobs`, `/api/nexus/jobs/bulk` with `send_noti
 
 Endpoints: `GET /api/preferences` returns the user's preferences and the selectable values, and `PUT /api/preferences` saves them.
 
+#### Closed Jobs and Nexus Sync
+Vendors only see open jobs: `GET /api/jobs` and `GET /api/jobs/{job_id}` leave out jobs whose status is closed (`Closed`, `Inactive`, `Filled`, `On Hold`, `Cancelled`), and submissions to them are rejected with 409. The admin still sees closed jobs, marked as closed, and can filter for them.
+
+- **Admin close/reopen.** Admin closes a job with the **Close job** button on its card (`POST /api/admin/jobs/{job_id}/close`) and undoes it with **Reopen job** (`POST /api/admin/jobs/{job_id}/reopen`). An admin closure sticks: if the Nexus sync posts the job again, it stays closed.
+- **Sync closes removed jobs.** `api_nexus_oauth_jobs.py` records every job id the Nexus OPEN job search returns in each polling cycle. After a cycle that read every page, it closes on the VMS any job marked posted in `oauth_jobs.csv` that Nexus no longer returns (`POST /api/admin/jobs/bulk/close`), and sets its `post_status` to `closed`. A job that comes back on Nexus is posted again and reopens. A job the admin closed does not reopen.
+- **Safety limit.** If more than half of the posted jobs disappear in one cycle (for example during a Nexus outage), the sync closes nothing and logs a warning. Change the limit with `--max-close-fraction`, or turn closing off with `--no-close-removed`.
+
+A closed job keeps its record and submissions. Closing a job also takes it out of the pending new-job digest. Jobs that are still on the read-only legacy cluster (`MONGODB_URI`) are closed by writing a closed copy to the current cluster, which takes precedence when jobs are read.
+
 ### 3. Run the Application
 
 #### Backend Server
@@ -139,8 +148,12 @@ python main.py backend
 ## API Endpoints
 
 ### Jobs
-- `GET /api/jobs` - Get all active jobs
+- `GET /api/jobs` - Get all active jobs (admin also gets closed jobs)
 - `GET /api/jobs/{job_id}` - Get specific job details
+- `POST /api/admin/jobs/{job_id}/close` - Admin: close a job
+- `POST /api/admin/jobs/{job_id}/reopen` - Admin: reopen a closed job
+- `POST /api/admin/jobs/bulk/close` - Close jobs removed from the source site (`{"job_ids": [...]}`, admin token)
+- `POST /api/nexus/jobs/bulk/close` - Same, for the Nexus sync without admin login (ingest token)
 
 ### Candidates
 - `POST /api/candidates/submit` - Submit candidate with resume

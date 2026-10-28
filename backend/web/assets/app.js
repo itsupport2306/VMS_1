@@ -277,6 +277,15 @@ function updateAuthUI() {
     if (els.systemNavBtn) {
       els.systemNavBtn.hidden = !isAdmin();
     }
+
+    // Only admin receives closed jobs, so only admin gets the Closed filter.
+    let closedOption = els.statusFilter.querySelector('option[value="closed"]');
+    if (isAdmin() && !closedOption) {
+      closedOption = new Option('Closed', 'closed');
+      els.statusFilter.appendChild(closedOption);
+    } else if (!isAdmin() && closedOption) {
+      closedOption.remove();
+    }
   } else {
     // Not logged in - show auth form
     els.userInfo.hidden = true;
@@ -820,6 +829,34 @@ async function apiPatchAuth(path) {
   return json;
 }
 
+async function apiPostAuth(path) {
+  clearGetCache();
+  const headers = {};
+  if (authToken) {
+    headers['Authorization'] = `Bearer ${authToken}`;
+  }
+
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers
+  });
+
+  if (res.status === 401) {
+    logout();
+    throw new Error('Session expired. Please login again.');
+  }
+
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = { _raw: text }; }
+  if (!res.ok) {
+    const err = new Error(json.detail || `HTTP ${res.status}`);
+    err.data = json;
+    throw err;
+  }
+  return json;
+}
+
 async function apiPostForm(path, formData) {
   const res = await fetch(`${API_BASE}${path}`, { method: 'POST', body: formData });
   const text = await res.text();
@@ -1064,10 +1101,37 @@ function renderJobs() {
   updateJobsMoreButton();
 }
 
+// Mirrors CLOSED_STATUSES in backend/main.py. Vendors never receive closed jobs;
+// admin sees them so they can be reopened.
+const CLOSED_JOB_STATUSES = ['closed', 'inactive', 'filled', 'on hold', 'cancelled'];
+
+function isJobClosed(job) {
+  return CLOSED_JOB_STATUSES.includes(normalizeText(job.status).trim());
+}
+
+async function setJobClosed(job, closed) {
+  const label = job.title || job.job_id || job.id;
+  const question = closed
+    ? `Close "${label}"? Vendors will no longer see this job or be able to submit to it.`
+    : `Reopen "${label}"? Vendors will see this job again.`;
+  if (!confirm(question)) return;
+  try {
+    const action = closed ? 'close' : 'reopen';
+    const data = await apiPostAuth(`/api/admin/jobs/${encodeURIComponent(job.id)}/${action}`);
+    job.status = data.status || (closed ? 'Closed' : 'Open');
+    writeCachedJobs(allJobs);
+    renderJobs();
+    showToast(closed ? 'Job closed' : 'Job reopened', 'success');
+  } catch (e) {
+    showToast(`Failed to ${closed ? 'close' : 'reopen'} job: ${e.message}`, 'error', 5000);
+  }
+}
+
 function appendJobCards(jobs) {
   for (const job of jobs) {
+    const closed = isJobClosed(job);
     const card = document.createElement('div');
-    card.className = 'card';
+    card.className = closed ? 'card card--closed' : 'card';
 
     const title = document.createElement('div');
     title.className = 'card__title';
@@ -1080,7 +1144,7 @@ function appendJobCards(jobs) {
       <span class="tag">${escapeHtml(job.department || 'Department: N/A')}</span>
       <span class="tag">${escapeHtml(job.location || 'Location: N/A')}</span>
       <span class="tag">${escapeHtml(job.employment_type || 'Type: N/A')}</span>
-      <span class="tag">Status: ${escapeHtml(job.status || 'N/A')}</span>
+      <span class="tag${closed ? ' tag--closed' : ''}">Status: ${escapeHtml(job.status || 'N/A')}</span>
       ${job.end_client ? `<span class="tag">End Client: ${escapeHtml(job.end_client)}</span>` : ''}
     `;
 
@@ -1103,7 +1167,15 @@ function appendJobCards(jobs) {
     btnSubmit.addEventListener('click', () => openSubmitModal(job));
 
     actions.appendChild(btnDetails);
-    actions.appendChild(btnSubmit);
+    if (!closed) actions.appendChild(btnSubmit);
+
+    if (isAdmin()) {
+      const btnStatus = document.createElement('button');
+      btnStatus.className = closed ? 'btn btn--secondary' : 'btn btn--danger-outline';
+      btnStatus.textContent = closed ? 'Reopen job' : 'Close job';
+      btnStatus.addEventListener('click', () => setJobClosed(job, !closed));
+      actions.appendChild(btnStatus);
+    }
 
     card.appendChild(title);
     card.appendChild(meta);

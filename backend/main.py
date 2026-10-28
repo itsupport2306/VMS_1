@@ -856,6 +856,11 @@ def normalize_job_status(status_value: str | None, default: str = "Open") -> str
     return status_text
 
 
+def is_job_open(status_value: str | None) -> bool:
+    """Whether a job may be shown to vendors and receive submissions."""
+    return normalize_job_status(status_value).lower() not in CLOSED_STATUSES
+
+
 def notify_job_closures(transitions: List[dict], source: str = "ceipal") -> None:
     """Send closure emails + in-app notifications for detected Open/Active -> Closed transitions.
 
@@ -2623,6 +2628,10 @@ class AdminJobDeleteRequest(BaseModel):
     password: str
 
 
+class BulkJobCloseRequest(BaseModel):
+    job_ids: List[str]
+
+
 class Candidate(BaseModel):
     id: str
     name: str
@@ -3339,6 +3348,76 @@ def delete_job_from_payload(
         raise HTTPException(status_code=500, detail=f"Failed to delete job: {str(e)}")
 
 
+def close_jobs_for_sync(job_ids: List[str], source: str, background_tasks: BackgroundTasks) -> dict:
+    """Close jobs the sync found are no longer listed on the source site."""
+    try:
+        result = set_manual_jobs_closed(job_ids, source=source, closed_by_admin=False)
+    except Exception as e:
+        print(f"[Manual Jobs] Error closing jobs from {source}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to close jobs: {str(e)}")
+    transitions = result.pop("transitions")
+    if transitions:
+        background_tasks.add_task(notify_job_closures, transitions, source)
+    print(
+        f"[Manual Jobs] {source}: closed {len(result['closed'])}, already closed "
+        f"{len(result['already_closed'])}, not found {len(result['not_found'])}"
+    )
+    return {"message": "Bulk job close completed", "source": source, **result}
+
+
+# Declared before /api/admin/jobs/{job_id}/close so "bulk" is not taken as a job id.
+@app.post("/api/admin/jobs/bulk/close")
+def close_jobs_bulk(
+    payload: BulkJobCloseRequest,
+    background_tasks: BackgroundTasks,
+    current_user: UserDB = Depends(get_current_user),
+):
+    """Close many jobs that are no longer available on the source site (admin token)."""
+    if current_user.email.lower() != ADMIN_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Only admin can close jobs")
+    return close_jobs_for_sync(payload.job_ids, "direct_api_sync_close", background_tasks)
+
+
+@app.post("/api/admin/jobs/{job_id}/close")
+def close_job_by_admin(
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: UserDB = Depends(get_current_user),
+):
+    """Admin: close a job so it is no longer shown to vendors.
+
+    Stays closed even if the source-site sync posts the job again; use
+    /api/admin/jobs/{job_id}/reopen to undo.
+    """
+    if current_user.email.lower() != ADMIN_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Only admin can close jobs")
+    try:
+        result = set_manual_jobs_closed([job_id], source="admin", closed_by_admin=True)
+    except Exception as e:
+        print(f"[Manual Jobs] Error closing job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to close job: {str(e)}")
+    if result["not_found"]:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    if result["transitions"]:
+        background_tasks.add_task(notify_job_closures, result["transitions"], "admin_close")
+    return {"message": "Job closed", "job_id": job_id, "status": "Closed"}
+
+
+@app.post("/api/admin/jobs/{job_id}/reopen")
+def reopen_job_by_admin(job_id: str, current_user: UserDB = Depends(get_current_user)):
+    """Admin: reopen a closed job so vendors can see it again."""
+    if current_user.email.lower() != ADMIN_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Only admin can reopen jobs")
+    try:
+        doc = set_manual_job_reopened(job_id)
+    except Exception as e:
+        print(f"[Manual Jobs] Error reopening job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to reopen job: {str(e)}")
+    if doc is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    return {"message": "Job reopened", "job_id": job_id, "status": doc.get("status")}
+
+
 NEXUS_INGEST_TOKEN = os.getenv("NEXUS_INGEST_TOKEN", "")
 
 
@@ -3408,6 +3487,12 @@ def create_nexus_jobs_bulk(
     except Exception as e:
         print(f"[Nexus Jobs] Error storing bulk Nexus jobs: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to store bulk jobs: {str(e)}")
+
+
+@app.post("/api/nexus/jobs/bulk/close", dependencies=[Depends(require_ingest_access)])
+def close_nexus_jobs_bulk(payload: BulkJobCloseRequest, background_tasks: BackgroundTasks):
+    """Close many jobs that are no longer listed on Nexus."""
+    return close_jobs_for_sync(payload.job_ids, "nexus_api_sync_close", background_tasks)
 
 @app.get("/api/admin/jobs/excel-files")
 async def list_uploaded_excel_files(current_user: UserDB = Depends(get_current_user)):
@@ -4167,11 +4252,18 @@ def _read_manual_jobs_from_mongo() -> List[Job]:
     sources = [c for c in (manual_jobs_collection, primary_manual_jobs_collection) if c is not None]
 
     entries: List[Tuple[Any, Any, Any]] = []  # (source collection, _id, created_at)
+    current_ids: set = set()
     for collection in sources:
         rows = _with_read_retries(
             "ID list read",
-            lambda c=collection: list(c.find({}, {"_id": 1, "created_at": 1}).batch_size(100_000)),
+            lambda c=collection: list(c.find({}, {"_id": 1, "id": 1, "created_at": 1}).batch_size(100_000)),
         )
+        if collection is manual_jobs_collection:
+            current_ids = {row.get("id") for row in rows}
+        else:
+            # A legacy job that was re-posted or closed since the split has a
+            # newer copy on the current cluster; that copy is the live one.
+            rows = [row for row in rows if row.get("id") not in current_ids]
         entries.extend((collection, row["_id"], row.get("created_at")) for row in rows)
     entries.sort(key=lambda e: e[2] or datetime.min, reverse=True)
 
@@ -4373,7 +4465,10 @@ def build_jobs_response_payload(is_admin: bool) -> Dict[str, Any]:
     if cached is not None:
         return cached
 
-    sanitized_jobs = [sanitize_job_for_display(job, is_admin) for job in all_jobs]
+    # Vendors only ever see jobs that are still open. Admin sees closed jobs too,
+    # so they can be checked and reopened.
+    visible_jobs = all_jobs if is_admin else [job for job in all_jobs if is_job_open(job.status)]
+    sanitized_jobs = [sanitize_job_for_display(job, is_admin) for job in visible_jobs]
     slim_jobs = [to_list_item(job) for job in sanitized_jobs]
     body = json.dumps(
         {
@@ -4509,6 +4604,173 @@ def detect_manual_job_closures(jobs: List[Job]) -> List[dict]:
     return transitions
 
 
+JOB_CLOSURE_FIELDS = ("closed_at", "closed_source", "closed_by_admin", "previous_status")
+
+
+def _read_manual_jobs_file() -> List[dict]:
+    if not os.path.exists(MANUAL_JOBS_FILE):
+        return []
+    with open(MANUAL_JOBS_FILE, "r") as f:
+        return json.load(f)
+
+
+def keep_admin_closures(jobs: List[Job]) -> None:
+    """Keep jobs an admin closed closed when they are posted again.
+
+    The Nexus sync re-posts jobs that are still listed on the source site, so
+    without this an admin closure would be undone on the next sync. Mutates
+    the jobs in place, so callers that queue notifications afterwards see the
+    stored status. An admin reopens a job with /api/admin/jobs/{id}/reopen.
+    """
+    ids = [job.id for job in jobs]
+    if mongodb_enabled and manual_jobs_collection is not None:
+        admin_closed = {
+            doc["id"]
+            for doc in manual_jobs_collection.find({"id": {"$in": ids}, "closed_by_admin": True}, {"id": 1})
+        }
+    else:
+        admin_closed = {job.get("id") for job in _read_manual_jobs_file() if job.get("closed_by_admin")}
+    for job in jobs:
+        if job.id in admin_closed:
+            job.status = "Closed"
+
+
+def _find_manual_job_docs(job_ids: List[str]) -> Dict[str, Tuple[Any, dict]]:
+    """Map job id -> (collection, stored doc), preferring the current cluster's copy."""
+    found: Dict[str, Tuple[Any, dict]] = {}
+    for collection in (manual_jobs_collection, primary_manual_jobs_collection):
+        missing = [job_id for job_id in job_ids if job_id not in found]
+        if collection is None or not missing:
+            continue
+        for doc in collection.find({"id": {"$in": missing}}):
+            found[doc["id"]] = (collection, doc)
+    return found
+
+
+def set_manual_jobs_closed(job_ids: List[str], source: str, closed_by_admin: bool) -> dict:
+    """Mark direct-input jobs Closed so they stop being shown to vendors.
+
+    The job record is kept (submissions still reference it) and admin can
+    reopen it. Jobs still on the read-only legacy cluster are closed by writing
+    a closed copy to the current cluster, which takes precedence when reading.
+    Returns the closed, already-closed and unknown ids plus the Open -> Closed
+    transitions for notify_job_closures.
+    """
+    ids = list(dict.fromkeys((job_id or "").strip() for job_id in job_ids if (job_id or "").strip()))
+    result = {"closed": [], "already_closed": [], "not_found": [], "transitions": []}
+    if not ids:
+        return result
+
+    closure = {
+        "status": "Closed",
+        "closed_at": datetime.now().isoformat(),
+        "closed_source": source,
+        "closed_by_admin": closed_by_admin,
+    }
+
+    def plan(job_id: str, doc: dict) -> Optional[dict]:
+        """The fields to write for one stored job, or None when nothing changes."""
+        prev_status = doc.get("status") or ""
+        if not is_job_open(prev_status) and (doc.get("closed_by_admin") or not closed_by_admin):
+            # Already closed. An admin closing a sync-closed job still records
+            # the admin flag, so the job stays closed if it reappears upstream.
+            result["already_closed"].append(job_id)
+            return None
+        result["closed"].append(job_id)
+        if is_job_open(prev_status):
+            result["transitions"].append({
+                "job_id": job_id,
+                "title": doc.get("title") or job_id,
+                "previous_status": prev_status,
+                "current_status": "Closed",
+            })
+        # Remember the last open status so a reopen can restore it.
+        last_open_status = prev_status if is_job_open(prev_status) else doc.get("previous_status", "")
+        return {**closure, "previous_status": last_open_status}
+
+    if mongodb_enabled and manual_jobs_collection is not None:
+        found = _find_manual_job_docs(ids)
+        operations = []
+        for job_id in ids:
+            if job_id not in found:
+                result["not_found"].append(job_id)
+                continue
+            collection, doc = found[job_id]
+            fields = plan(job_id, doc)
+            if fields is None:
+                continue
+            if collection is not manual_jobs_collection:
+                fields = {**{k: v for k, v in doc.items() if k != "_id"}, **fields}
+            operations.append(UpdateOne({"id": job_id}, {"$set": fields}, upsert=True))
+        if operations:
+            manual_jobs_collection.bulk_write(operations, ordered=False)
+    else:
+        stored_jobs = _read_manual_jobs_file()
+        by_id = {job.get("id"): job for job in stored_jobs}
+        changed = False
+        for job_id in ids:
+            doc = by_id.get(job_id)
+            if doc is None:
+                result["not_found"].append(job_id)
+                continue
+            fields = plan(job_id, doc)
+            if fields is not None:
+                doc.update(fields)
+                changed = True
+        if changed:
+            with open(MANUAL_JOBS_FILE, "w") as f:
+                json.dump(stored_jobs, f, indent=2, default=str)
+
+    if result["closed"]:
+        clear_manual_jobs_cache()
+        drop_pending_job_notifications(result["closed"])
+    return result
+
+
+def set_manual_job_reopened(job_id: str) -> Optional[dict]:
+    """Reopen a closed direct-input job. Returns the stored job, or None if unknown."""
+    job_id = (job_id or "").strip()
+    if mongodb_enabled and manual_jobs_collection is not None:
+        found = _find_manual_job_docs([job_id])
+        if job_id not in found:
+            return None
+        collection, doc = found[job_id]
+        if is_job_open(doc.get("status")):
+            return doc
+        reopened_status = doc.get("previous_status") if is_job_open(doc.get("previous_status")) else "Open"
+        unset = {field: "" for field in JOB_CLOSURE_FIELDS}
+        if collection is manual_jobs_collection:
+            manual_jobs_collection.update_one({"id": job_id}, {"$set": {"status": reopened_status}, "$unset": unset})
+        else:
+            copy = {k: v for k, v in doc.items() if k != "_id" and k not in JOB_CLOSURE_FIELDS}
+            manual_jobs_collection.update_one({"id": job_id}, {"$set": {**copy, "status": reopened_status}}, upsert=True)
+        doc["status"] = reopened_status
+    else:
+        stored_jobs = _read_manual_jobs_file()
+        doc = next((job for job in stored_jobs if job.get("id") == job_id), None)
+        if doc is None:
+            return None
+        if is_job_open(doc.get("status")):
+            return doc
+        doc["status"] = doc.get("previous_status") if is_job_open(doc.get("previous_status")) else "Open"
+        for field in JOB_CLOSURE_FIELDS:
+            doc.pop(field, None)
+        with open(MANUAL_JOBS_FILE, "w") as f:
+            json.dump(stored_jobs, f, indent=2, default=str)
+    clear_manual_jobs_cache()
+    return doc
+
+
+def drop_pending_job_notifications(job_ids: List[str]) -> None:
+    """Keep closed jobs out of the next new-job digest email."""
+    if not mongodb_enabled or job_notification_outbox_collection is None:
+        return
+    try:
+        job_notification_outbox_collection.delete_many({"job_id": {"$in": job_ids}, "status": "pending"})
+    except Exception as e:
+        print(f"[JobPosted] Failed to drop pending notifications for closed jobs: {e}")
+
+
 def upsert_manual_job(job: Job) -> None:
     """Persist one direct-input job by job ID."""
     upsert_manual_jobs([job])
@@ -4519,6 +4781,7 @@ def upsert_manual_jobs(jobs: List[Job]) -> None:
     if not jobs:
         return
 
+    keep_admin_closures(jobs)
     job_payloads_by_id = {}
     for job in jobs:
         job_payload = job.dict()
@@ -4532,17 +4795,14 @@ def upsert_manual_jobs(jobs: List[Job]) -> None:
     if mongodb_enabled and manual_jobs_collection is not None:
         created_at = datetime.now()
         # One round trip for the whole batch instead of one per job.
-        manual_jobs_collection.bulk_write(
-            [
-                UpdateOne(
-                    {"id": job_payload["id"]},
-                    {"$set": {**job_payload, "created_at": created_at}},
-                    upsert=True,
-                )
-                for job_payload in job_payloads
-            ],
-            ordered=False,
-        )
+        operations = []
+        for job_payload in job_payloads:
+            update = {"$set": {**job_payload, "created_at": created_at}}
+            if is_job_open(job_payload.get("status")):
+                # Re-posted as open (e.g. back on the source site): drop stale closure details.
+                update["$unset"] = {field: "" for field in JOB_CLOSURE_FIELDS}
+            operations.append(UpdateOne({"id": job_payload["id"]}, update, upsert=True))
+        manual_jobs_collection.bulk_write(operations, ordered=False)
         clear_manual_jobs_cache()
         return
 
@@ -4561,7 +4821,12 @@ def upsert_manual_jobs(jobs: List[Job]) -> None:
     for job_payload in job_payloads:
         job_id = (job_payload.get("id") or "").strip()
         if job_id and job_id in existing_index:
-            existing_jobs[existing_index[job_id]] = job_payload
+            idx = existing_index[job_id]
+            merged = {**existing_jobs[idx], **job_payload}
+            if is_job_open(job_payload.get("status")):
+                for field in JOB_CLOSURE_FIELDS:
+                    merged.pop(field, None)
+            existing_jobs[idx] = merged
         else:
             new_jobs.append(job_payload)
 
@@ -5674,6 +5939,14 @@ async def submit_candidate(
                 raise ValueError
         except ValueError:
             raise HTTPException(status_code=400, detail="Years of Experience must be a non-negative number")
+
+        # A vendor may still have a job open in the browser after it closed.
+        # Only reject jobs known to be closed; an unknown id or a job list that
+        # is still loading must not block submissions.
+        admin_payload = _cached_jobs_payload("admin")
+        known_job = admin_payload["jobs_by_id"].get(job_id) if admin_payload else None
+        if known_job and not is_job_open(known_job.get("status")):
+            raise HTTPException(status_code=409, detail="This job is closed and no longer accepts submissions")
 
         # Guard against duplicate submissions: a client retry after a transient
         # error (the request timing out before the response arrives, or a user
