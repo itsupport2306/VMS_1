@@ -4,18 +4,81 @@ A comprehensive Vendor Management System (VMS) that connects to ATS APIs to fetc
 
 ## Features
 
-### 🎯 Core Functionality
-- **ATS Integration**: Connects to external ATS APIs to fetch active/open jobs
-- **Job Board**: Display all available jobs with detailed information
-- **Resume Submission**: Multiple resume submission for candidates
-- **Candidate Management**: Track submitted candidates for each job
+### 1. Job board
+- **Job source**: jobs are pulled from Nexus (LaborEdge) by the sync script `api_nexus_oauth_jobs.py` and posted to the VMS through `/api/nexus/jobs`. Admins can also add jobs by hand, in bulk, or by Excel upload.
+- **Search and filters**: free-text search plus State, Specialty and Status filters.
+- **Job cards and detail view**: short description preview on the card, full description loaded on demand ("Show more" renders cards in chunks).
+- **Vendors see open jobs only**: closed jobs (`Closed`, `Inactive`, `Filled`, `On Hold`, `Cancelled`) are hidden from vendors.
+- **Bill rate display**: the rate shown to vendors is the actual rate reduced by 7%. Raw salary or pay text is stripped from descriptions.
+- **Fast loading**: the job list is cached in memory and kept in sync across workers.
 
-### 🛠 Technical Stack
-- **Backend**: FastAPI with SQLAlchemy ORM
+### 2. Job alerts (new jobs)
+- **Email alerts for new jobs**: when an Open job is posted, every vendor whose preferences match is emailed.
+- **Digest emails**: new jobs are queued and sent as one email per user every 5 minutes (`JOB_NOTIFICATION_DIGEST_SECONDS`). A single job uses the "New Job Posted" email.
+- **Personal preferences**: the **Job Alerts** page lets each user pick profession, specialty, job type and state. A job must match every group with a selection. An empty group means "any".
+- **Email on or off**: users can turn job emails off and keep the in-app bell notifications.
+- Only one API worker sends per cycle (MongoDB lease), so users never get duplicates.
+
+### 3. Job closure alerts
+- **Closure emails and in-app notifications**: when a tracked job goes from Open/Active to Closed, every vendor is emailed and gets a bell notification. One notification per user per job.
+- **Notification bell**: list notifications, mark one as read, or mark all as read (`GET /api/notifications`, `PATCH /api/notifications/{id}/read`, `PATCH /api/notifications/read-all`).
+- **Circuit breaker**: if more jobs than `JOB_CLOSURE_PER_RUN_CAP` (default 25) close in one run, nothing is sent and the event is written to an audit collection.
+- **Dry-run mode**: with `JOB_CLOSURE_NOTIFICATIONS_ENABLED` off, closures are only logged.
+- Every closure is recorded in a closure audit log.
+
+### 4. Admin: close and reopen jobs
+- **Close job / Reopen job** buttons on each job card (`POST /api/admin/jobs/{job_id}/close` and `/reopen`).
+- **Admin closure is sticky**: if Nexus posts the job again, it stays closed until the admin reopens it.
+- **Sync closes removed jobs**: jobs that disappear from Nexus are closed automatically (`POST /api/admin/jobs/bulk/close`, or `/api/nexus/jobs/bulk/close` for the sync).
+- **Safety limit**: if more than half of the posted jobs vanish in one cycle (for example a Nexus outage), nothing is closed. Tune with `--max-close-fraction` or disable with `--no-close-removed`.
+- Closed jobs keep their record and submissions, and leave the pending new-job digest.
+- Admin can filter to see closed jobs.
+
+### 5. Candidate submission (vendors)
+- Submit a candidate with resume against an open job. Resume formats: PDF, DOC, DOCX, TXT, up to 10 MB.
+- **Submit & Add Another** and **Submit & Close** buttons for fast multi-candidate entry.
+- **Duplicate guard**: the same vendor cannot submit the same candidate for the same job twice in a short window, which protects against double clicks and retries.
+- Submissions to closed jobs are rejected (HTTP 409).
+- Each job shows its existing submissions. Vendors see only their own.
+- **Submission history**: grouped by user and date, with per-user totals.
+
+### 6. Admin: candidate management
+- **Status tracking**: move a candidate between `submitted`, `offer`, `decline` and `start`. The **Offers**, **Declines** and **Starts** pages list each group.
+- **Email the vendor**: admin sends a free-form message to the vendor who submitted a candidate (`POST /api/candidates/{id}/notify-vendor`).
+- **Resume download** for any candidate.
+- **Submission audit log**: every submission is logged with submitter, candidate, timestamp, IP, user agent, resume and job metadata (`GET /api/submission-logs`).
+- **Admin submission alert**: an email goes to `SUBMISSION_NOTIFICATION_RECIPIENTS` on every new submission.
+
+### 7. Admin: users and system
+- **User whitelist**: only whitelisted emails can sign in. Admin adds and removes users (`/api/admin/users`).
+- **System page**: admin tools including user management and Excel job file management.
+- **Excel job upload**: upload job files, list them, and remove them. Uploaded jobs are combined with the base job file.
+- **Delete job**: admin can remove a job.
+- **Open/closed job count report**: an email with open and closed counts every 2 hours (`JOB_STATUS_REPORT_*`). Admin can send one now with `POST /api/admin/job-status-report/send`.
+
+### 8. Sign-in and security
+- **Email OTP sign-in**: a 6-digit code via SendGrid (10 minute expiry, 5 attempts), then a 7-day bearer token.
+- **Registration with email verification**, password login, and forgot/reset password by email.
+- Passwords hashed with bcrypt. Show/hide password toggle on forms.
+- **Role-based access**: admin-only routes return 403 for vendors. Vendors can read only their own candidates.
+- Optional `X-Ingest-Token` protection for the Nexus ingest routes.
+- Upload validation (type and size), escaped job-card fields, CORS configuration.
+
+### 9. Operations
+- **Storage**: MongoDB (primary and fallback cluster for quota or outage), with JSON-file fallback under `DATA_DIR`.
+- **Email**: SendGrid, with an optional SMTP fallback for local development.
+- **Health endpoints**: `/healthz`, `/readyz`, `/api/health` (reports MongoDB ping time).
+- **Slow-request logging** and a request timing header.
+- **Docker** and **docker-compose** deployment, with a DigitalOcean App Platform spec.
+- Legacy Ceipal ATS integration is kept but disabled by default.
+
+### Technical stack
+- **Backend**: FastAPI
 - **Frontend**: HTML/CSS/JS web app served by the backend at `/` (`backend/web/`)
-- **Database**: MySQL/PostgreSQL support
-- **File Storage**: Local file system for resume uploads
-- **API Integration**: HTTP client for ATS connectivity
+- **Database**: MongoDB, with JSON-file fallback
+- **Email**: SendGrid
+- **File storage**: MongoDB GridFS, with local file system fallback
+- **Job source**: Nexus (LaborEdge) API
 
 ## Project Structure
 

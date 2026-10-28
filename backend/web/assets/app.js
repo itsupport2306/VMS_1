@@ -999,7 +999,7 @@ function jobMatches(job) {
   const specialty = normalizeText(els.specialtyFilter ? els.specialtyFilter.value : '').trim();
 
   if (q) {
-    const hay = [job.title, job.department, job.location, job.employment_type, job.specialty, job.state, getCanonicalState(getJobState(job))].map(normalizeText).join(' ');
+    const hay = [job.job_id, job.id, job.title,job.department, job.location, job.employment_type, job.specialty, job.state, getCanonicalState(getJobState(job))].map(normalizeText).join(' ');
     if (!hay.includes(q)) return false;
   }
 
