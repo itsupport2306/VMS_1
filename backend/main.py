@@ -3418,6 +3418,36 @@ def reopen_job_by_admin(job_id: str, current_user: UserDB = Depends(get_current_
     return {"message": "Job reopened", "job_id": job_id, "status": doc.get("status")}
 
 
+class JobDescriptionBackfillRequest(BaseModel):
+    description: str
+
+
+@app.put("/api/admin/jobs/{job_id}/description")
+def backfill_job_description(
+    job_id: str,
+    payload: JobDescriptionBackfillRequest,
+    current_user: UserDB = Depends(get_current_user),
+):
+    """Admin: fill in a job's description only if it is currently missing.
+
+    Touches nothing else (posted date, status, notifications), unlike re-posting
+    the job. A job that already has a real description is left unchanged.
+    """
+    if current_user.email.lower() != ADMIN_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Only admin can update job descriptions")
+    new_description = strip_html_job_description((payload.description or "").strip())
+    if not new_description or new_description == NO_DESCRIPTION_PLACEHOLDER:
+        raise HTTPException(status_code=400, detail="Description is empty")
+    try:
+        outcome = set_manual_job_description_if_missing(job_id.strip(), new_description)
+    except Exception as e:
+        print(f"[Manual Jobs] Error updating description for {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update description: {str(e)}")
+    if outcome == "not_found":
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    return {"job_id": job_id, "result": outcome}
+
+
 NEXUS_INGEST_TOKEN = os.getenv("NEXUS_INGEST_TOKEN", "")
 
 
@@ -4759,6 +4789,48 @@ def set_manual_job_reopened(job_id: str) -> Optional[dict]:
             json.dump(stored_jobs, f, indent=2, default=str)
     clear_manual_jobs_cache()
     return doc
+
+
+NO_DESCRIPTION_PLACEHOLDER = "No description provided by Nexus."
+
+
+def set_manual_job_description_if_missing(job_id: str, description: str) -> str:
+    """Set only the description of a stored job, and only if it has none.
+
+    Returns "updated", "already_has_description" or "not_found". A job still on
+    the read-only legacy cluster is copied to the current cluster, which takes
+    precedence when reading (same approach as set_manual_jobs_closed).
+    """
+    def is_missing(current: Any) -> bool:
+        text = (current or "").strip()
+        return not text or text == NO_DESCRIPTION_PLACEHOLDER
+
+    if mongodb_enabled and manual_jobs_collection is not None:
+        found = _find_manual_job_docs([job_id])
+        if job_id not in found:
+            return "not_found"
+        collection, doc = found[job_id]
+        if not is_missing(doc.get("description")):
+            return "already_has_description"
+        if collection is manual_jobs_collection:
+            manual_jobs_collection.update_one({"id": job_id}, {"$set": {"description": description}})
+        else:
+            copy = {k: v for k, v in doc.items() if k != "_id"}
+            manual_jobs_collection.update_one(
+                {"id": job_id}, {"$set": {**copy, "description": description}}, upsert=True
+            )
+    else:
+        stored_jobs = _read_manual_jobs_file()
+        doc = next((job for job in stored_jobs if job.get("id") == job_id), None)
+        if doc is None:
+            return "not_found"
+        if not is_missing(doc.get("description")):
+            return "already_has_description"
+        doc["description"] = description
+        with open(MANUAL_JOBS_FILE, "w") as f:
+            json.dump(stored_jobs, f, indent=2, default=str)
+    clear_manual_jobs_cache()
+    return "updated"
 
 
 def drop_pending_job_notifications(job_ids: List[str]) -> None:
