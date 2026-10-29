@@ -333,14 +333,6 @@ label { font-size: 12px; color: var(--muted-2); }
   color: var(--ok);
 }
 
-.tag--closed {
-  background: var(--danger-soft);
-  border-color: var(--danger-light);
-  color: var(--danger);
-}
-
-.card--closed { opacity: 0.7; }
-
 .btn--danger-outline {
   background: var(--panel);
   border: 2px solid var(--danger-light);

@@ -277,15 +277,6 @@ function updateAuthUI() {
     if (els.systemNavBtn) {
       els.systemNavBtn.hidden = !isAdmin();
     }
-
-    // Only admin receives closed jobs, so only admin gets the Closed filter.
-    let closedOption = els.statusFilter.querySelector('option[value="closed"]');
-    if (isAdmin() && !closedOption) {
-      closedOption = new Option('Closed', 'closed');
-      els.statusFilter.appendChild(closedOption);
-    } else if (!isAdmin() && closedOption) {
-      closedOption.remove();
-    }
   } else {
     // Not logged in - show auth form
     els.userInfo.hidden = true;
@@ -1101,37 +1092,37 @@ function renderJobs() {
   updateJobsMoreButton();
 }
 
-// Mirrors CLOSED_STATUSES in backend/main.py. Vendors never receive closed jobs;
-// admin sees them so they can be reopened.
+// Mirrors CLOSED_STATUSES in backend/main.py. The API only sends active jobs, but
+// a list cached in the browser from before a job closed can still hold closed ones.
 const CLOSED_JOB_STATUSES = ['closed', 'inactive', 'filled', 'on hold', 'cancelled'];
 
 function isJobClosed(job) {
   return CLOSED_JOB_STATUSES.includes(normalizeText(job.status).trim());
 }
 
-async function setJobClosed(job, closed) {
+function onlyActiveJobs(jobs) {
+  return (jobs || []).filter(job => !isJobClosed(job));
+}
+
+async function closeJob(job) {
   const label = job.title || job.job_id || job.id;
-  const question = closed
-    ? `Close "${label}"? Vendors will no longer see this job or be able to submit to it.`
-    : `Reopen "${label}"? Vendors will see this job again.`;
-  if (!confirm(question)) return;
+  if (!confirm(`Close "${label}"? It is removed from the job list for everyone, and submissions to it are no longer accepted.`)) return;
   try {
-    const action = closed ? 'close' : 'reopen';
-    const data = await apiPostAuth(`/api/admin/jobs/${encodeURIComponent(job.id)}/${action}`);
-    job.status = data.status || (closed ? 'Closed' : 'Open');
+    await apiPostAuth(`/api/admin/jobs/${encodeURIComponent(job.id)}/close`);
+    allJobs = allJobs.filter(j => j.id !== job.id);
     writeCachedJobs(allJobs);
+    updateJobFilterOptions();
     renderJobs();
-    showToast(closed ? 'Job closed' : 'Job reopened', 'success');
+    showToast('Job closed', 'success');
   } catch (e) {
-    showToast(`Failed to ${closed ? 'close' : 'reopen'} job: ${e.message}`, 'error', 5000);
+    showToast(`Failed to close job: ${e.message}`, 'error', 5000);
   }
 }
 
 function appendJobCards(jobs) {
   for (const job of jobs) {
-    const closed = isJobClosed(job);
     const card = document.createElement('div');
-    card.className = closed ? 'card card--closed' : 'card';
+    card.className = 'card';
 
     const title = document.createElement('div');
     title.className = 'card__title';
@@ -1144,7 +1135,7 @@ function appendJobCards(jobs) {
       <span class="tag">${escapeHtml(job.department || 'Department: N/A')}</span>
       <span class="tag">${escapeHtml(job.location || 'Location: N/A')}</span>
       <span class="tag">${escapeHtml(job.employment_type || 'Type: N/A')}</span>
-      <span class="tag${closed ? ' tag--closed' : ''}">Status: ${escapeHtml(job.status || 'N/A')}</span>
+      <span class="tag">Status: ${escapeHtml(job.status || 'N/A')}</span>
       ${job.end_client ? `<span class="tag">End Client: ${escapeHtml(job.end_client)}</span>` : ''}
     `;
 
@@ -1167,14 +1158,14 @@ function appendJobCards(jobs) {
     btnSubmit.addEventListener('click', () => openSubmitModal(job));
 
     actions.appendChild(btnDetails);
-    if (!closed) actions.appendChild(btnSubmit);
+    actions.appendChild(btnSubmit);
 
     if (isAdmin()) {
-      const btnStatus = document.createElement('button');
-      btnStatus.className = closed ? 'btn btn--secondary' : 'btn btn--danger-outline';
-      btnStatus.textContent = closed ? 'Reopen job' : 'Close job';
-      btnStatus.addEventListener('click', () => setJobClosed(job, !closed));
-      actions.appendChild(btnStatus);
+      const btnClose = document.createElement('button');
+      btnClose.className = 'btn btn--danger-outline';
+      btnClose.textContent = 'Close job';
+      btnClose.addEventListener('click', () => closeJob(job));
+      actions.appendChild(btnClose);
     }
 
     card.appendChild(title);
@@ -1573,7 +1564,7 @@ async function loadJobs({ isRetry = false } = {}) {
   // First load of this page: paint the cached list immediately, if there is one.
   const cachedJobs = allJobs.length ? null : readCachedJobs();
   if (cachedJobs && cachedJobs.length) {
-    allJobs = cachedJobs;
+    allJobs = onlyActiveJobs(cachedJobs);
     updateJobFilterOptions();
     renderJobs();
   } else {
@@ -1591,7 +1582,7 @@ async function loadJobs({ isRetry = false } = {}) {
   try {
     // Fetch jobs (returns immediately with cached data, background fetch continues)
     const data = await apiGetAuth('/api/jobs');
-    const jobs = data.jobs || [];
+    const jobs = onlyActiveJobs(data.jobs);
     // Re-render only if the cached list was stale, so the view doesn't jump.
     const unchanged = cachedJobs && JSON.stringify(jobs) === JSON.stringify(cachedJobs);
     allJobs = jobs;
@@ -1616,7 +1607,7 @@ async function loadJobs({ isRetry = false } = {}) {
 
         try {
           const pollData = await apiGetAuth('/api/jobs');
-          const newJobs = pollData.jobs || [];
+          const newJobs = onlyActiveJobs(pollData.jobs);
           const previousJobIds = allJobs.map(job => job.id).join('|');
           const nextJobIds = newJobs.map(job => job.id).join('|');
           const jobsChanged = previousJobIds !== nextJobIds;
@@ -1690,7 +1681,7 @@ async function loadMoreJobs() {
   try {
     console.log(`[Jobs] Loading more from page ${nextStartPage}...`);
     const data = await apiGet(`/api/jobs/load-more?start_page=${nextStartPage}&max_pages=25`);
-    const newJobs = data.jobs || [];
+    const newJobs = onlyActiveJobs(data.jobs);
     
     if (newJobs.length > 0) {
       allJobs = [...allJobs, ...newJobs];

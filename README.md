@@ -8,7 +8,7 @@ A comprehensive Vendor Management System (VMS) that connects to ATS APIs to fetc
 - **Job source**: jobs are pulled from Nexus (LaborEdge) by the sync script `api_nexus_oauth_jobs.py` and posted to the VMS through `/api/nexus/jobs`. Admins can also add jobs by hand, in bulk, or by Excel upload.
 - **Search and filters**: free-text search plus State, Specialty and Status filters.
 - **Job cards and detail view**: short description preview on the card, full description loaded on demand ("Show more" renders cards in chunks).
-- **Vendors see open jobs only**: closed jobs (`Closed`, `Inactive`, `Filled`, `On Hold`, `Cancelled`) are hidden from vendors.
+- **Only active jobs are shown**: closed jobs (`Closed`, `Inactive`, `Filled`, `On Hold`, `Cancelled`) are deleted from the database and never shown, to vendors or admin.
 - **Bill rate display**: the rate shown to vendors is the actual rate reduced by 7%. Raw salary or pay text is stripped from descriptions.
 - **Fast loading**: the job list is cached in memory and kept in sync across workers.
 
@@ -26,13 +26,12 @@ A comprehensive Vendor Management System (VMS) that connects to ATS APIs to fetc
 - **Dry-run mode**: with `JOB_CLOSURE_NOTIFICATIONS_ENABLED` off, closures are only logged.
 - Every closure is recorded in a closure audit log.
 
-### 4. Admin: close and reopen jobs
-- **Close job / Reopen job** buttons on each job card (`POST /api/admin/jobs/{job_id}/close` and `/reopen`).
-- **Admin closure is sticky**: if Nexus posts the job again, it stays closed until the admin reopens it.
-- **Sync closes removed jobs**: jobs that disappear from Nexus are closed automatically (`POST /api/admin/jobs/bulk/close`, or `/api/nexus/jobs/bulk/close` for the sync).
-- **Safety limit**: if more than half of the posted jobs vanish in one cycle (for example a Nexus outage), nothing is closed. Tune with `--max-close-fraction` or disable with `--no-close-removed`.
-- Closed jobs keep their record and submissions, and leave the pending new-job digest.
-- Admin can filter to see closed jobs.
+### 4. Admin: close jobs
+- **Close job** button on each job card (`POST /api/admin/jobs/{job_id}/close`). Closing removes the job from the database. There is no reopen: if Nexus still lists the job, the next sync posts it again.
+- **Sync closes removed jobs**: after each complete scan, every job missing from the Nexus OPEN search (jobs the sync posted, and jobs open on the VMS with a numeric Nexus id) is looked up by id on Nexus. It is closed (`POST /api/admin/jobs/bulk/close`, or `/api/nexus/jobs/bulk/close` for the sync) if Nexus reports a non-open status, or has no record of a job the sync posted. A failed lookup leaves the job open until the next cycle.
+- **Safety limit**: if Nexus has no record of more than half of the posted jobs in one cycle (for example a Nexus fault), those are not closed; jobs Nexus reports as closed still are. Tune with `--max-close-fraction` or disable with `--no-close-removed`.
+- A closed job is deleted and leaves the pending new-job digest. Candidate submissions are kept (they store their own job title and id).
+- A job posted with a closed status is not stored, and any stored copy is deleted.
 
 ### 5. Candidate submission (vendors)
 - Submit a candidate with resume against an open job. Resume formats: PDF, DOC, DOCX, TXT, up to 10 MB.
@@ -142,13 +141,15 @@ Posted Open jobs (from `/api/nexus/jobs`, `/api/nexus/jobs/bulk` with `send_noti
 Endpoints: `GET /api/preferences` returns the user's preferences and the selectable values, and `PUT /api/preferences` saves them.
 
 #### Closed Jobs and Nexus Sync
-Vendors only see open jobs: `GET /api/jobs` and `GET /api/jobs/{job_id}` leave out jobs whose status is closed (`Closed`, `Inactive`, `Filled`, `On Hold`, `Cancelled`), and submissions to them are rejected with 409. The admin still sees closed jobs, marked as closed, and can filter for them.
+Only active jobs are stored and shown: `GET /api/jobs` and `GET /api/jobs/{job_id}` leave out jobs whose status is closed (`Closed`, `Inactive`, `Filled`, `On Hold`, `Cancelled`) for admin and vendors alike, and submissions to a job that is no longer listed are rejected with 409. Closed Excel jobs are left out too.
 
-- **Admin close/reopen.** Admin closes a job with the **Close job** button on its card (`POST /api/admin/jobs/{job_id}/close`) and undoes it with **Reopen job** (`POST /api/admin/jobs/{job_id}/reopen`). An admin closure sticks: if the Nexus sync posts the job again, it stays closed.
-- **Sync closes removed jobs.** `api_nexus_oauth_jobs.py` records every job id the Nexus OPEN job search returns in each polling cycle. After a cycle that read every page, it closes on the VMS any job marked posted in `oauth_jobs.csv` that Nexus no longer returns (`POST /api/admin/jobs/bulk/close`), and sets its `post_status` to `closed`. A job that comes back on Nexus is posted again and reopens. A job the admin closed does not reopen.
+- **Admin close.** Admin closes a job with the **Close job** button on its card (`POST /api/admin/jobs/{job_id}/close`). The job is deleted, not hidden.
+- **Sync closes removed jobs.** `api_nexus_oauth_jobs.py` records every job id the Nexus OPEN job search returns in each polling cycle. After a cycle that read every page, it closes on the VMS any job marked posted in `oauth_jobs.csv` that Nexus no longer returns (`POST /api/admin/jobs/bulk/close`), and sets its `post_status` to `closed`. A job that comes back on Nexus is posted again as a new job.
 - **Safety limit.** If more than half of the posted jobs disappear in one cycle (for example during a Nexus outage), the sync closes nothing and logs a warning. Change the limit with `--max-close-fraction`, or turn closing off with `--no-close-removed`.
 
-A closed job keeps its record and submissions. Closing a job also takes it out of the pending new-job digest. Jobs that are still on the read-only legacy cluster (`MONGODB_URI`) are closed by writing a closed copy to the current cluster, which takes precedence when jobs are read.
+Closing a job deletes it from both clusters and takes it out of the pending new-job digest. Candidate submissions are kept. The ingest routes never store a job posted with a closed status. If the read-only legacy cluster (`MONGODB_URI`) refuses the delete, the job is hidden instead: a closed copy on the current cluster takes precedence when jobs are read.
+
+Closed jobs already in the database are deleted automatically when the API starts (one worker, under a lock; turn off with `PURGE_CLOSED_JOBS_ON_STARTUP=false`). Jobs the legacy cluster refused to delete are retried on the next start.
 
 ### 3. Run the Application
 
@@ -211,10 +212,9 @@ python main.py backend
 ## API Endpoints
 
 ### Jobs
-- `GET /api/jobs` - Get all active jobs (admin also gets closed jobs)
+- `GET /api/jobs` - Get all active jobs
 - `GET /api/jobs/{job_id}` - Get specific job details
-- `POST /api/admin/jobs/{job_id}/close` - Admin: close a job
-- `POST /api/admin/jobs/{job_id}/reopen` - Admin: reopen a closed job
+- `POST /api/admin/jobs/{job_id}/close` - Admin: close (delete) a job
 - `POST /api/admin/jobs/bulk/close` - Close jobs removed from the source site (`{"job_ids": [...]}`, admin token)
 - `POST /api/nexus/jobs/bulk/close` - Same, for the Nexus sync without admin login (ingest token)
 
