@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from collections import defaultdict
 import httpx
 import os
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import aiofiles
 import json
 import html
@@ -67,6 +67,7 @@ closure_audit_collection = None
 manual_jobs_collection = None
 primary_manual_jobs_collection = None  # legacy jobs created before the dual-cluster split - read-only, MONGODB_URI is over quota
 submission_logs_collection = None
+activity_logs_collection = None
 auth_tokens_collection = None
 user_preferences_collection = None
 job_notification_outbox_collection = None
@@ -97,6 +98,8 @@ def ensure_mongodb_indexes() -> None:
         ("notifications.user_read", notifications_collection, [("user_email", 1), ("read", 1)], {"name": "notifications_user_read_idx"}),
         ("notifications.type_job_user", notifications_collection, [("type", 1), ("job_id", 1), ("user_email", 1)], {"name": "notifications_type_job_user_idx"}),
         ("submission_logs.submitted_at", submission_logs_collection, [("submitted_at", -1)], {"name": "submission_logs_submitted_at_idx"}),
+        ("activity_logs.organisation_time", activity_logs_collection, [("organisation_id", 1), ("occurred_at", -1)], {"name": "activity_logs_organisation_time_idx"}),
+        ("activity_logs.occurred_at", activity_logs_collection, [("occurred_at", -1)], {"name": "activity_logs_occurred_at_idx"}),
         ("whitelist.email", whitelist_collection, "email", {"name": "whitelist_email_idx"}),
         ("job_status_tracker.job_id", job_status_tracker_collection, "job_id", {"name": "job_status_tracker_job_id_idx"}),
         ("user_preferences.email", user_preferences_collection, "email", {"name": "user_preferences_email_idx", "unique": True}),
@@ -181,7 +184,7 @@ def init_mongodb():
     global primary_mongo_client, secondary_mongo_client, primary_db, secondary_db, mongo_client, db
     global users_collection, whitelist_collection, secondary_users_collection, secondary_whitelist_collection, candidates_collection, notifications_collection
     global jobs_collection, job_status_tracker_collection, closure_audit_collection, manual_jobs_collection, primary_manual_jobs_collection
-    global submission_logs_collection, auth_tokens_collection, user_preferences_collection
+    global submission_logs_collection, activity_logs_collection, auth_tokens_collection, user_preferences_collection
     global job_notification_outbox_collection, locks_collection, meta_collection, organisations_collection, fs
 
     print(f"[MongoDB] Checking configuration...")
@@ -221,6 +224,7 @@ def init_mongodb():
             closure_audit_collection = secondary_db.closure_audit  # Audit log for detected closures (dry-run + live)
             manual_jobs_collection = secondary_db.manual_jobs  # Direct API-ingested jobs
             submission_logs_collection = secondary_db.submission_logs  # Immutable audit log for candidate submissions
+            activity_logs_collection = secondary_db.activity_logs
             auth_tokens_collection = secondary_db.auth_tokens  # Password-reset tokens and login/registration OTPs shared across workers
             user_preferences_collection = secondary_db.user_preferences  # Per-user job notification preferences
             job_notification_outbox_collection = secondary_db.job_notification_outbox  # Durable queue of posted jobs awaiting digest emails
@@ -2619,6 +2623,38 @@ def uploaded_excel_files() -> List[str]:
         if name.lower().endswith(".xlsx") and os.path.isfile(os.path.join(EXCEL_UPLOAD_DIR, name))
     )
 
+
+def excel_upload_metadata(file_path: str) -> dict:
+    metadata_path = os.path.splitext(file_path)[0] + ".json"
+    if not os.path.exists(metadata_path):
+        return {"organisation_id": None, "expires_on": None}
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+        if isinstance(metadata, dict):
+            return metadata
+    except (OSError, ValueError):
+        pass
+    return {"organisation_id": None, "expires_on": "0001-01-01"}
+
+
+def excel_upload_is_active(file_path: str) -> bool:
+    expires_on = excel_upload_metadata(file_path).get("expires_on")
+    try:
+        return not expires_on or date.fromisoformat(expires_on) >= datetime.now(timezone.utc).date()
+    except (TypeError, ValueError):
+        return False
+
+
+def excel_files_for_user(current_user: "UserDB") -> List[str]:
+    if current_user.email.lower() == ADMIN_EMAIL.lower():
+        return uploaded_excel_files()
+    organisation = _organisation_for_admin(current_user.email)
+    if organisation is None:
+        raise HTTPException(status_code=403, detail="Only portal or organisation admins can manage Excel files")
+    return [path for path in uploaded_excel_files()
+            if excel_upload_metadata(path).get("organisation_id") == organisation["id"]]
+
 # Pydantic Models
 class Job(BaseModel):
     id: str
@@ -2857,7 +2893,7 @@ async def register(user_data: UserCreate, request: Request):
 
 
 @app.post("/api/auth/verify-registration-otp")
-async def verify_registration_otp(request_data: OtpVerify):
+async def verify_registration_otp(request_data: OtpVerify, background_tasks: BackgroundTasks):
     """Create and verify the account only when the registration OTP is correct."""
     cleanup_expired_otps()
 
@@ -2897,6 +2933,7 @@ async def verify_registration_otp(request_data: OtpVerify):
     add_whitelisted_email(email_lower)
     clear_users_cache()
     delete_auth_token("otp", email_lower)
+    background_tasks.add_task(record_organisation_activity, email_lower, "account_registered")
 
     return {"message": "Account verified. You can now log in."}
 
@@ -2965,7 +3002,7 @@ async def request_login_otp(request_data: OtpRequest, request: Request):
 
 
 @app.post("/api/auth/verify-otp", response_model=Token)
-def verify_login_otp(request_data: OtpVerify):
+def verify_login_otp(request_data: OtpVerify, background_tasks: BackgroundTasks):
     """Verify email OTP and return a 7-day JWT session."""
     cleanup_expired_otps()
 
@@ -2993,6 +3030,7 @@ def verify_login_otp(request_data: OtpVerify):
         data={"sub": user["email"]},
         expires_delta=timedelta(days=SESSION_EXPIRE_DAYS),
     )
+    background_tasks.add_task(record_organisation_activity, email_lower, "signed_in")
 
     return {
         "access_token": access_token,
@@ -3008,7 +3046,7 @@ def verify_login_otp(request_data: OtpVerify):
 
 
 @app.post("/api/auth/login", response_model=Token)
-async def login(user_data: UserLogin):
+async def login(user_data: UserLogin, background_tasks: BackgroundTasks):
     """Login existing users with email and password."""
     global _users_cache
 
@@ -3050,6 +3088,7 @@ async def login(user_data: UserLogin):
         data={"sub": user["email"]},
         expires_delta=timedelta(days=SESSION_EXPIRE_DAYS),
     )
+    background_tasks.add_task(record_organisation_activity, email_lower, "signed_in")
 
     return {
         "access_token": access_token,
@@ -3168,6 +3207,8 @@ async def reset_password_with_token(data: ResetPasswordWithToken):
 
 ORGANISATIONS_FILE = os.path.join(DATA_DIR, "organisations.json")
 _organisations_lock = Lock()
+ACTIVITY_LOG_FILE = os.path.join(DATA_DIR, "activity_logs.json")
+_activity_log_lock = Lock()
 
 
 def _valid_email(email: str) -> str:
@@ -3196,6 +3237,112 @@ def _write_organisations(organisations: List[dict]) -> None:
 
 def _organisation_for_admin(email: str) -> Optional[dict]:
     return next((org for org in _read_organisations() if org["admin_email"] == email.lower()), None)
+
+
+def _organisation_for_member(email: str) -> Optional[dict]:
+    return next((org for org in _read_organisations() if email.lower() in org["member_emails"]), None)
+
+
+def record_organisation_activity(actor_email: str, action: str, detail: str = "", organisation_id: Optional[str] = None) -> None:
+    try:
+        email = actor_email.lower()
+        organisations = _read_organisations()
+        organisation = next((org for org in organisations if org["id"] == organisation_id), None) if organisation_id else next(
+            (org for org in organisations if email in org["member_emails"]), None
+        )
+        if organisation is None:
+            return
+        actor_role = "portal_admin" if email == ADMIN_EMAIL.lower() else (
+            "organisation_admin" if email == organisation["admin_email"] else "member"
+        )
+        event = {
+            "id": str(uuid4()),
+            "organisation_id": organisation["id"],
+            "actor_email": email,
+            "actor_role": actor_role,
+            "action": action,
+            "detail": detail,
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if activity_logs_collection is not None:
+            activity_logs_collection.insert_one(event)
+            return
+        with _activity_log_lock:
+            events = []
+            if os.path.exists(ACTIVITY_LOG_FILE):
+                with open(ACTIVITY_LOG_FILE, "r", encoding="utf-8") as handle:
+                    events = json.load(handle)
+            events.append(event)
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=DATA_DIR, delete=False) as handle:
+                json.dump(events, handle)
+                temporary_path = handle.name
+            os.replace(temporary_path, ACTIVITY_LOG_FILE)
+    except Exception as error:
+        print(f"[Activity] Could not record {action} for {actor_email}: {error}")
+
+
+@app.get("/api/admin/activity")
+def get_organisation_activity(
+    limit: int = 200,
+    organisation_id: Optional[str] = None,
+    current_user: UserDB = Depends(get_current_user),
+):
+    if current_user.email.lower() != ADMIN_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Only portal admin can view organisation activity")
+    if limit < 1 or limit > 500:
+        raise HTTPException(status_code=400, detail="Limit must be between 1 and 500")
+    organisations = _read_organisations()
+    organisation_by_id = {org["id"]: org for org in organisations}
+    organisation_by_email = {
+        email.lower(): org for org in organisations for email in org["member_emails"]
+    }
+    if activity_logs_collection is not None:
+        query = {"organisation_id": organisation_id} if organisation_id else {}
+        activities = list(activity_logs_collection.find(query).sort("occurred_at", -1).limit(500))
+    elif os.path.exists(ACTIVITY_LOG_FILE):
+        with open(ACTIVITY_LOG_FILE, "r", encoding="utf-8") as handle:
+            activities = json.load(handle)
+    else:
+        activities = []
+    events = [
+        {key: value for key, value in activity.items() if key != "_id"}
+        for activity in activities
+        if activity.get("organisation_id") in organisation_by_id
+        and (not organisation_id or activity["organisation_id"] == organisation_id)
+    ]
+    if submission_logs_collection is not None:
+        submissions = list(submission_logs_collection.find().sort("submitted_at", -1).limit(500))
+    else:
+        logs_file = os.path.join(DATA_DIR, "submission_logs.json")
+        if os.path.exists(logs_file):
+            with open(logs_file, "r", encoding="utf-8") as handle:
+                submissions = json.load(handle)
+        else:
+            submissions = []
+    for submission in submissions:
+        email = (submission.get("submitted_by_email") or "").lower()
+        organisation = organisation_by_id.get(submission.get("organisation_id")) or organisation_by_email.get(email)
+        if organisation is None or (organisation_id and organisation["id"] != organisation_id):
+            continue
+        events.append({
+            "id": submission.get("id"),
+            "organisation_id": organisation["id"],
+            "actor_email": email,
+            "actor_role": submission.get("actor_role") or (
+                "organisation_admin" if email == organisation["admin_email"] else "member"
+            ),
+            "action": "candidate_submitted",
+            "detail": f"{submission.get('candidate_name', 'Candidate')} for {submission.get('job_title') or submission.get('job_id', 'job')}",
+            "occurred_at": submission.get("submitted_at", ""),
+        })
+    events.sort(key=lambda event: event.get("occurred_at", ""), reverse=True)
+    events = events[:limit]
+    for event in events:
+        event["organisation_name"] = organisation_by_id[event["organisation_id"]]["name"]
+    return {
+        "events": events,
+        "organisations": [{"id": org["id"], "name": org["name"]} for org in organisations],
+    }
 
 
 @app.get("/api/organisations/mine")
@@ -3253,7 +3400,7 @@ def create_organisation(payload: OrganisationCreate, current_user: UserDB = Depe
 
 
 @app.post("/api/organisations/members", status_code=201)
-def add_organisation_member(payload: OrganisationMemberCreate, current_user: UserDB = Depends(get_current_user)):
+def add_organisation_member(payload: OrganisationMemberCreate, background_tasks: BackgroundTasks, current_user: UserDB = Depends(get_current_user)):
     organisation = _organisation_for_admin(current_user.email)
     if organisation is None:
         raise HTTPException(status_code=403, detail="Only organisation admin can add members")
@@ -3285,11 +3432,12 @@ def add_organisation_member(payload: OrganisationMemberCreate, current_user: Use
                         org["member_emails"].remove(email)
                 _write_organisations(organisations)
         raise HTTPException(status_code=500, detail="Could not add member")
+    background_tasks.add_task(record_organisation_activity, current_user.email, "member_added", email, organisation["id"])
     return {"email": email, "message": "Member added. Ask them to sign up with this email."}
 
 
 @app.delete("/api/organisations/members/{email}")
-def remove_organisation_member(email: str, current_user: UserDB = Depends(get_current_user)):
+def remove_organisation_member(email: str, background_tasks: BackgroundTasks, current_user: UserDB = Depends(get_current_user)):
     organisation = _organisation_for_admin(current_user.email)
     if organisation is None:
         raise HTTPException(status_code=403, detail="Only organisation admin can remove members")
@@ -3312,6 +3460,7 @@ def remove_organisation_member(email: str, current_user: UserDB = Depends(get_cu
                 if org["id"] == organisation["id"]:
                     org["member_emails"].remove(member_email)
             _write_organisations(organisations)
+    background_tasks.add_task(record_organisation_activity, current_user.email, "member_removed", member_email, organisation["id"])
     return {"message": "Member removed"}
 
 
@@ -3429,14 +3578,24 @@ def validate_excel_jobs_file(file_path: str) -> int:
 
 @app.post("/api/admin/jobs/upload-excel")
 async def upload_excel_jobs(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
+    expires_on: Optional[str] = Form(None),
     current_user: UserDB = Depends(get_current_user)
 ):
     """Validate and store an Excel workbook of jobs alongside the base workbook."""
-    # Verify admin
-    is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
-    if not is_admin:
-        raise HTTPException(status_code=403, detail="Only admin can upload Excel files")
+    organisation = None
+    if current_user.email.lower() != ADMIN_EMAIL.lower():
+        organisation = _organisation_for_admin(current_user.email)
+        if organisation is None:
+            raise HTTPException(status_code=403, detail="Only portal or organisation admins can upload Excel files")
+    if expires_on:
+        try:
+            expiry_date = date.fromisoformat(expires_on)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Expiry date must be YYYY-MM-DD")
+        if expiry_date < datetime.now(timezone.utc).date():
+            raise HTTPException(status_code=400, detail="Expiry date cannot be in the past")
     
     # Validate file type
     if not (file.filename or "").lower().endswith(".xlsx"):
@@ -3449,31 +3608,45 @@ async def upload_excel_jobs(
         raise HTTPException(status_code=400, detail="Excel file is empty")
     file_path = os.path.join(EXCEL_UPLOAD_DIR, f"jobs_{uuid4().hex}.xlsx")
     temporary_path = f"{file_path}.uploading"
+    metadata_path = os.path.splitext(file_path)[0] + ".json"
     try:
         with open(temporary_path, "wb") as handle:
             handle.write(content)
         new_jobs_count = validate_excel_jobs_file(temporary_path)
+        with open(metadata_path, "w", encoding="utf-8") as handle:
+            json.dump({"organisation_id": organisation["id"] if organisation else None,
+                       "expires_on": expires_on or None}, handle)
         os.replace(temporary_path, file_path)
         clear_excel_jobs_cache()
         all_jobs = load_excel_jobs()
+        if organisation is not None:
+            background_tasks.add_task(
+                record_organisation_activity, current_user.email, "jobs_uploaded",
+                f"{file.filename} ({new_jobs_count} jobs; expires {expires_on or 'never'})", organisation["id"],
+            )
         return {
             "message": f"Excel file uploaded successfully. Added {new_jobs_count} jobs from this file.",
             "filename": file.filename,
             "new_jobs_count": new_jobs_count,
             "total_jobs_count": len(all_jobs),
-            "uploaded_files_count": len(uploaded_excel_files()),
+            "uploaded_files_count": len(excel_files_for_user(current_user)),
+            "expires_on": expires_on or None,
         }
     except HTTPException:
         if os.path.exists(temporary_path):
             os.remove(temporary_path)
         if os.path.exists(file_path):
             os.remove(file_path)
+        if os.path.exists(metadata_path):
+            os.remove(metadata_path)
         raise
     except Exception as e:
         if os.path.exists(temporary_path):
             os.remove(temporary_path)
         if os.path.exists(file_path):
             os.remove(file_path)
+        if os.path.exists(metadata_path):
+            os.remove(metadata_path)
         print(f"[Excel Upload] Error: {e}")
         raise HTTPException(status_code=500, detail="Failed to upload Excel file")
 
@@ -3746,32 +3919,33 @@ def close_nexus_jobs_bulk(payload: BulkJobCloseRequest, background_tasks: Backgr
 
 @app.get("/api/admin/jobs/excel-files")
 async def list_uploaded_excel_files(current_user: UserDB = Depends(get_current_user)):
-    """List all uploaded Excel files (admin only)"""
-    is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
-    if not is_admin:
-        raise HTTPException(status_code=403, detail="Only admin can view uploaded files")
-    
+    """List uploads visible to the portal or organisation admin."""
     files_info = []
-    uploaded_files = uploaded_excel_files()
+    uploaded_files = excel_files_for_user(current_user)
     for idx, file_path in enumerate(uploaded_files):
+        metadata = excel_upload_metadata(file_path)
         if os.path.exists(file_path):
             files_info.append({
                 "index": idx,
                 "filename": os.path.basename(file_path),
                 "path": file_path,
-                "exists": True
+                "exists": True,
+                "expires_on": metadata.get("expires_on"),
+                "is_active": excel_upload_is_active(file_path),
             })
         else:
             files_info.append({
                 "index": idx,
                 "filename": os.path.basename(file_path),
                 "path": file_path,
-                "exists": False
+                "exists": False,
+                "expires_on": metadata.get("expires_on"),
+                "is_active": False,
             })
     
     return {
-        "original_file": EXCEL_JOBS_FILE,
-        "original_exists": os.path.exists(EXCEL_JOBS_FILE),
+        "original_file": EXCEL_JOBS_FILE if current_user.email.lower() == ADMIN_EMAIL.lower() else None,
+        "original_exists": os.path.exists(EXCEL_JOBS_FILE) if current_user.email.lower() == ADMIN_EMAIL.lower() else False,
         "uploaded_files": files_info,
         "total_uploaded": len(uploaded_files)
     }
@@ -3779,44 +3953,51 @@ async def list_uploaded_excel_files(current_user: UserDB = Depends(get_current_u
 @app.delete("/api/admin/jobs/excel-files/{file_index}")
 async def remove_uploaded_excel_file(
     file_index: int,
+    background_tasks: BackgroundTasks,
     current_user: UserDB = Depends(get_current_user)
 ):
-    """Remove a specific uploaded Excel file by index (admin only)"""
-    is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
-    if not is_admin:
-        raise HTTPException(status_code=403, detail="Only admin can remove uploaded files")
-    
-    uploaded_files = uploaded_excel_files()
+    """Remove an uploaded Excel file by index within the user's scope."""
+    uploaded_files = excel_files_for_user(current_user)
     if file_index < 0 or file_index >= len(uploaded_files):
         raise HTTPException(status_code=404, detail=f"File index {file_index} not found")
     
     file_path = uploaded_files[file_index]
     filename = os.path.basename(file_path)
+    organisation_id = excel_upload_metadata(file_path).get("organisation_id")
     
     # Remove file from disk if exists
     if os.path.exists(file_path):
         os.remove(file_path)
         print(f"[Excel] Deleted file: {file_path}")
+    metadata_path = os.path.splitext(file_path)[0] + ".json"
+    if os.path.exists(metadata_path):
+        os.remove(metadata_path)
     
     # Clear cache to force reload
     clear_excel_jobs_cache()
+    if organisation_id:
+        background_tasks.add_task(record_organisation_activity, current_user.email, "jobs_file_removed", filename, organisation_id)
     
     return {
         "message": f"Excel file '{filename}' removed successfully",
         "removed_file": filename,
-        "remaining_uploaded_files": len(uploaded_excel_files())
+        "remaining_uploaded_files": len(excel_files_for_user(current_user))
     }
 
 
 @app.delete("/api/admin/jobs/excel-files/by-name/{filename}")
-def remove_uploaded_excel_file_by_name(filename: str, current_user: UserDB = Depends(get_current_user)):
-    if current_user.email.lower() != ADMIN_EMAIL.lower():
-        raise HTTPException(status_code=403, detail="Only admin can remove uploaded files")
-    file_path = next((path for path in uploaded_excel_files() if os.path.basename(path) == filename), None)
+def remove_uploaded_excel_file_by_name(filename: str, background_tasks: BackgroundTasks, current_user: UserDB = Depends(get_current_user)):
+    file_path = next((path for path in excel_files_for_user(current_user) if os.path.basename(path) == filename), None)
     if file_path is None:
         raise HTTPException(status_code=404, detail="Excel file not found")
+    organisation_id = excel_upload_metadata(file_path).get("organisation_id")
     os.remove(file_path)
+    metadata_path = os.path.splitext(file_path)[0] + ".json"
+    if os.path.exists(metadata_path):
+        os.remove(metadata_path)
     clear_excel_jobs_cache()
+    if organisation_id:
+        background_tasks.add_task(record_organisation_activity, current_user.email, "jobs_file_removed", filename, organisation_id)
     return {"message": f"Excel file '{filename}' removed successfully"}
 
 @app.get("/api/auth/me", response_model=UserResponse)
@@ -3850,6 +4031,7 @@ CLIENT_NAME_PATTERNS = [
 _excel_jobs_cache: Optional[List[Job]] = None
 _excel_jobs_cache_time: Optional[datetime] = None
 _excel_upload_dir_mtime: Optional[float] = None
+_excel_jobs_cache_date: Optional[date] = None
 _excel_jobs_rebuild_lock = Lock()
 
 EXCEL_CACHE_MINUTES = 1440  # Cache Excel jobs for 24 hours (1 day) - Excel jobs are static
@@ -4015,13 +4197,14 @@ def _excel_jobs_cache_is_fresh() -> bool:
     return bool(
         _excel_jobs_cache is not None
         and _excel_jobs_cache_time
+        and _excel_jobs_cache_date == datetime.now(timezone.utc).date()
         and _excel_upload_dir_mtime == os.path.getmtime(EXCEL_UPLOAD_DIR)
         and datetime.now() - _excel_jobs_cache_time < timedelta(minutes=EXCEL_CACHE_MINUTES)
     )
 
 
 def _read_all_excel_jobs() -> List[Job]:
-    global _excel_jobs_cache, _excel_jobs_cache_time, _excel_upload_dir_mtime
+    global _excel_jobs_cache, _excel_jobs_cache_time, _excel_upload_dir_mtime, _excel_jobs_cache_date
 
     all_jobs: List[Job] = []
     
@@ -4036,19 +4219,18 @@ def _read_all_excel_jobs() -> List[Job]:
     # Load from all uploaded files
     uploaded_count = 0
     for uploaded_file in uploaded_excel_files():
-        if os.path.exists(uploaded_file):
+        if os.path.exists(uploaded_file) and excel_upload_is_active(uploaded_file):
             uploaded_jobs = load_excel_jobs_from_file(uploaded_file)
             all_jobs.extend(uploaded_jobs)
             uploaded_count += len(uploaded_jobs)
             print(f"[Excel] Uploaded file {os.path.basename(uploaded_file)}: {len(uploaded_jobs)} jobs")
-        else:
-            print(f"[Excel] Uploaded file not found: {uploaded_file}")
     
     print(f"[Excel] Total jobs from all files: {len(all_jobs)} (original + {uploaded_count} from uploads)")
     
     # Cache the combined jobs
     _excel_jobs_cache = all_jobs
     _excel_jobs_cache_time = datetime.now()
+    _excel_jobs_cache_date = datetime.now(timezone.utc).date()
     _excel_upload_dir_mtime = os.path.getmtime(EXCEL_UPLOAD_DIR)
     
     return all_jobs
@@ -4056,10 +4238,11 @@ def _read_all_excel_jobs() -> List[Job]:
 
 def clear_excel_jobs_cache():
     """Clear the Excel jobs cache to force reload on next request"""
-    global _excel_jobs_cache, _excel_jobs_cache_time, _excel_upload_dir_mtime
+    global _excel_jobs_cache, _excel_jobs_cache_time, _excel_upload_dir_mtime, _excel_jobs_cache_date
     _excel_jobs_cache = None
     _excel_jobs_cache_time = None
     _excel_upload_dir_mtime = None
+    _excel_jobs_cache_date = None
     clear_jobs_response_cache()
     print("[Excel] Cache cleared")
 
@@ -4673,7 +4856,7 @@ def get_jobs_response_payload(is_admin: bool) -> Dict[str, Any]:
     different worker still gets a correct 304 or a fresh body.
     """
     role = "admin" if is_admin else "vendor"
-    if _jobs_refresh_wakeup is None and _excel_upload_dir_mtime is not None and _excel_upload_dir_mtime != os.path.getmtime(EXCEL_UPLOAD_DIR):
+    if (_excel_jobs_cache_date is not None and _excel_jobs_cache_date != datetime.now(timezone.utc).date()) or (_jobs_refresh_wakeup is None and _excel_upload_dir_mtime is not None and _excel_upload_dir_mtime != os.path.getmtime(EXCEL_UPLOAD_DIR)):
         clear_excel_jobs_cache()
     if _jobs_refresh_wakeup is not None:
         # The background refresher polls the version stamp and reloads jobs, so
@@ -4693,7 +4876,8 @@ def get_jobs_response_payload(is_admin: bool) -> Dict[str, Any]:
 
 def _cached_jobs_payload(role: str) -> Optional[Dict[str, Any]]:
     with _jobs_response_cache_lock:
-        return _jobs_response_cache.get(role) or _jobs_response_last_good.get(role)
+        payload = _jobs_response_cache.get(role) or _jobs_response_last_good.get(role)
+    return payload if payload and payload.get("date") == datetime.now(timezone.utc).date() else None
 
 
 # How long a request waits for this worker's first job list after startup.
@@ -4758,6 +4942,7 @@ def build_jobs_response_payload(is_admin: bool) -> Dict[str, Any]:
         "body": body,
         "etag": f'"jobs-{role}-{hashlib.sha1(body).hexdigest()[:20]}"',
         "jobs_by_id": {job["id"]: job for job in sanitized_jobs},
+        "date": datetime.now(timezone.utc).date(),
     }
     with _jobs_response_cache_lock:
         # Skip caching if the job lists changed while this payload was built;
@@ -4799,7 +4984,7 @@ def refresh_users_in_background() -> None:
 def refresh_jobs_in_background() -> None:
     """One refresher pass: pick up foreign changes, honour the TTL, rebuild payloads."""
     refresh_jobs_if_version_changed()
-    if _excel_upload_dir_mtime is not None and _excel_upload_dir_mtime != os.path.getmtime(EXCEL_UPLOAD_DIR):
+    if (_excel_jobs_cache_date is not None and _excel_jobs_cache_date != datetime.now(timezone.utc).date()) or (_excel_upload_dir_mtime is not None and _excel_upload_dir_mtime != os.path.getmtime(EXCEL_UPLOAD_DIR)):
         clear_excel_jobs_cache()
     if not _manual_jobs_cache_is_current():
         load_manual_jobs()  # clears the payloads only if the jobs actually changed
@@ -6106,7 +6291,7 @@ async def get_ceipal_status():
     }
 
 @app.get("/api/jobs/{job_id}", response_model=Job)
-async def get_job(job_id: str, current_user: UserDB = Depends(get_current_user)):
+async def get_job(job_id: str, background_tasks: BackgroundTasks, current_user: UserDB = Depends(get_current_user)):
     """Get one job with its full description (the list endpoint only sends a preview)."""
     try:
         is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
@@ -6114,6 +6299,7 @@ async def get_job(job_id: str, current_user: UserDB = Depends(get_current_user))
         job = payload["jobs_by_id"].get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
+        background_tasks.add_task(record_organisation_activity, current_user.email, "job_viewed", job_id)
         return job
     except HTTPException:
         raise
@@ -6374,6 +6560,11 @@ async def submit_candidate(
         
         await asyncio.to_thread(store_candidate_doc, candidate_doc)
 
+        try:
+            submitter_organisation = await asyncio.to_thread(_organisation_for_member, current_user.email)
+        except Exception:
+            submitter_organisation = None
+
         audit_doc = {
             "id": f"submission_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid4())[:8]}",
             "candidate_id": candidate_id,
@@ -6386,6 +6577,11 @@ async def submit_candidate(
             "submitted_by_user_id": current_user.id,
             "submitted_by_name": current_user.full_name,
             "submitted_by_email": current_user.email,
+            "organisation_id": submitter_organisation["id"] if submitter_organisation else None,
+            "actor_role": (
+                "organisation_admin" if submitter_organisation and current_user.email.lower() == submitter_organisation["admin_email"]
+                else "member"
+            ),
             "ip_address": submission_ip_address,
             "user_agent": submission_user_agent,
             "metadata": {

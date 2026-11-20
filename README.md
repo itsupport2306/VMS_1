@@ -50,9 +50,10 @@ A comprehensive Vendor Management System (VMS) that connects to ATS APIs to fetc
 
 ### 7. Admin: users and system
 - **Organisations**: the portal admin creates an organisation with an admin name and email from the System page. The organisation admin uses **Forgot Password** to set their password, then manages team members from the same page. Members sign up with their invited email. Removing a member disables an existing account.
+- **Organisation activity**: the portal admin's Activity tab shows recent sign-ins, registrations, job views, candidate submissions, team changes, and job-file changes across organisations, with an organisation filter. Activity is recorded from this release onward; earlier candidate submissions appear when they can be matched to a current organisation member.
 - **User whitelist**: only whitelisted emails can sign in. Admin adds and removes users (`/api/admin/users`).
 - **System page**: admin tools including user management and Excel job file management.
-- **Excel job upload**: upload job files, list them, and remove them. Uploaded jobs are combined with the base job file.
+- **Excel job upload**: portal and organisation admins can upload `.xlsx` job files, set an optional expiry date, list uploads, and remove files they manage. Organisation admins can only manage their own uploads. Jobs are visible through the expiry date in UTC, then disappear from the job list and details; existing uploads without an expiry remain visible.
 - **Required Excel columns**: `JobID`, `Job Title`, `Pay Rate`, `Facility Location`, and `Job Description`. `State`, `Status`, `Profession`, `Specialty`, and `End Client` are optional. Upload `.xlsx` files up to `MAX_FILE_SIZE`; rows with missing required values or duplicate IDs in the file are rejected. Uploaded files are stored in `DATA_DIR/excel_uploads` and restored after restart.
 - **Delete job**: admin can remove a job.
 - **Open/closed job count report**: an email with open and closed counts every 2 hours (`JOB_STATUS_REPORT_*`). Admin can send one now with `POST /api/admin/job-status-report/send`.
@@ -234,8 +235,10 @@ python main.py backend
 ### Organisation and job import
 - `POST /api/admin/organisations` - Portal admin: create an organisation and its admin account
 - `GET /api/organisations/mine` - Organisation admin: view their organisation and team
+- `GET /api/admin/activity` - Portal admin: recent organisation activity (`organisation_id` and `limit` filters)
 - `POST /api/organisations/members` and `DELETE /api/organisations/members/{email}` - Organisation admin: add or remove a team member
-- `POST /api/admin/jobs/upload-excel` - Portal admin: upload a validated `.xlsx` job workbook
+- `POST /api/admin/jobs/upload-excel` - Portal or organisation admin: upload a validated `.xlsx` job workbook; optional multipart `expires_on=YYYY-MM-DD` is inclusive in UTC
+- `GET /api/admin/jobs/excel-files` and `DELETE /api/admin/jobs/excel-files/by-name/{filename}` - List or remove uploads within the admin's scope
 
 ## Web UI Features
 

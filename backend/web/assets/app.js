@@ -39,6 +39,7 @@ const els = {
   organisationMembersList: document.getElementById('organisationMembersList'),
   excelUploadPanel: document.getElementById('excelUploadPanel'),
   excelJobsFile: document.getElementById('excelJobsFile'),
+  excelExpiresOn: document.getElementById('excelExpiresOn'),
   excelUploadAlert: document.getElementById('excelUploadAlert'),
   excelFilesList: document.getElementById('excelFilesList'),
   apiBase: document.getElementById('apiBase'),
@@ -61,6 +62,11 @@ const els = {
   userName: document.getElementById('userName'),
   logoutBtn: document.getElementById('logoutBtn'),
   systemNavBtn: document.getElementById('systemNavBtn'),
+  activityNavBtn: document.getElementById('activityNavBtn'),
+  viewActivity: document.getElementById('viewActivity'),
+  activityOrganisationFilter: document.getElementById('activityOrganisationFilter'),
+  refreshActivityBtn: document.getElementById('refreshActivityBtn'),
+  activityList: document.getElementById('activityList'),
   authTitle: document.getElementById('authTitle'),
   authDesc: document.getElementById('authDesc'),
   authMainForm: document.getElementById('authMainForm'),
@@ -149,6 +155,10 @@ function isAdmin() {
   return currentUser && currentUser.email && currentUser.email.toLowerCase() === ADMIN_EMAIL.toLowerCase();
 }
 
+function isOrganisationAdmin() {
+  return currentOrganisation && currentUser && currentOrganisation.admin_email === currentUser.email.toLowerCase();
+}
+
 function setPanelAlert(element, kind, message) {
   element.className = `alert alert--${kind}`;
   element.textContent = message;
@@ -174,6 +184,8 @@ async function loadMyOrganisation() {
     els.systemNavBtn.hidden = !isAdmin() && !currentOrganisation;
     els.systemNavBtn.textContent = isAdmin() ? 'System' : 'Organisation';
     els.organisationMembersPanel.hidden = !currentOrganisation;
+    els.excelUploadPanel.hidden = !isAdmin() && !isOrganisationAdmin();
+    if (isAdmin() || isOrganisationAdmin()) loadExcelFiles();
     if (currentOrganisation) {
       els.organisationMembersTitle.textContent = `${currentOrganisation.name} Team Members`;
       const members = currentOrganisation.member_emails.filter(email => email !== currentOrganisation.admin_email);
@@ -218,7 +230,7 @@ async function loadOrganisations() {
 }
 
 async function loadExcelFiles() {
-  if (!isAdmin()) return;
+  if (!isAdmin() && !isOrganisationAdmin()) return;
   try {
     const result = await apiGetAuth('/api/admin/jobs/excel-files', { fresh: true });
     els.excelFilesList.replaceChildren();
@@ -228,7 +240,7 @@ async function loadExcelFiles() {
       row.className = 'row';
       row.style.marginBottom = '8px';
       const label = document.createElement('span');
-      label.textContent = file.filename;
+      label.textContent = `${file.filename}${file.expires_on ? ` — expires ${file.expires_on} UTC${file.is_active ? '' : ' (expired)'}` : ' — no expiry'}`;
       const button = document.createElement('button');
       button.className = 'btn btn--secondary btn--small';
       button.textContent = 'Remove';
@@ -248,6 +260,71 @@ async function loadExcelFiles() {
       els.excelFilesList.append(row);
     });
   } catch (error) { setPanelAlert(els.excelUploadAlert, 'error', error.message); }
+}
+
+async function loadActivity() {
+  if (!isAdmin()) return;
+  els.activityList.textContent = 'Loading activity...';
+  try {
+    const organisationId = els.activityOrganisationFilter.value;
+    const path = `/api/admin/activity?limit=200${organisationId ? `&organisation_id=${encodeURIComponent(organisationId)}` : ''}`;
+    const result = await apiGetAuth(path, { fresh: true });
+    els.activityOrganisationFilter.replaceChildren();
+    const allOption = document.createElement('option');
+    allOption.value = '';
+    allOption.textContent = 'All organisations';
+    els.activityOrganisationFilter.append(allOption);
+    result.organisations.forEach(organisation => {
+      const option = document.createElement('option');
+      option.value = organisation.id;
+      option.textContent = organisation.name;
+      els.activityOrganisationFilter.append(option);
+    });
+    els.activityOrganisationFilter.value = organisationId;
+    if (!result.events.length) {
+      els.activityList.textContent = 'No activity recorded yet.';
+      return;
+    }
+    const container = document.createElement('div');
+    container.className = 'table-container';
+    const table = document.createElement('table');
+    const header = document.createElement('thead');
+    const headerRow = document.createElement('tr');
+    ['When', 'Organisation', 'User', 'Role', 'Activity', 'Details'].forEach(title => {
+      const cell = document.createElement('th');
+      cell.textContent = title;
+      headerRow.append(cell);
+    });
+    header.append(headerRow);
+    table.append(header);
+    const body = document.createElement('tbody');
+    const actionNames = {
+      account_registered: 'Account registered', signed_in: 'Signed in', job_viewed: 'Viewed job',
+      candidate_submitted: 'Submitted candidate', member_added: 'Added member',
+      member_removed: 'Removed member', jobs_uploaded: 'Uploaded jobs', jobs_file_removed: 'Removed job file'
+    };
+    result.events.forEach(event => {
+      const row = document.createElement('tr');
+      const timestamp = new Date(event.occurred_at);
+      const values = [
+        Number.isNaN(timestamp.getTime()) ? event.occurred_at : timestamp.toLocaleString(),
+        event.organisation_name, event.actor_email,
+        (event.actor_role || '').replaceAll('_', ' '), actionNames[event.action] || event.action,
+        event.detail || '—'
+      ];
+      values.forEach(value => {
+        const cell = document.createElement('td');
+        cell.textContent = value || '';
+        row.append(cell);
+      });
+      body.append(row);
+    });
+    table.append(body);
+    container.append(table);
+    els.activityList.replaceChildren(container);
+  } catch (error) {
+    els.activityList.textContent = error.message || 'Could not load activity.';
+  }
 }
 
 // Admin user management functions
@@ -394,6 +471,7 @@ function updateAuthUI() {
     if (els.systemNavBtn) {
       els.systemNavBtn.hidden = !isAdmin();
     }
+    els.activityNavBtn.hidden = !isAdmin();
     loadMyOrganisation();
   } else {
     // Not logged in - show auth form
@@ -401,6 +479,8 @@ function updateAuthUI() {
     els.viewAuth.hidden = false;
     els.viewJobs.hidden = true;
     els.viewSubmissions.hidden = true;
+    els.viewActivity.hidden = true;
+    els.activityNavBtn.hidden = true;
     els.viewSettings.hidden = true;
     if (els.viewPreferences) els.viewPreferences.hidden = true;
     // Hide any previous auth alerts
@@ -1297,6 +1377,7 @@ function appendJobCards(jobs) {
 }
 
 function setView(view) {
+  if (view === 'activity' && !isAdmin()) view = 'jobs';
   document.querySelectorAll('.nav__item').forEach(btn => {
     btn.classList.toggle('nav__item--active', btn.dataset.view === view);
   });
@@ -1304,6 +1385,7 @@ function setView(view) {
   els.viewAuth.hidden = view !== 'auth';
   els.viewJobs.hidden = view !== 'jobs';
   els.viewSubmissions.hidden = view !== 'submissions';
+  els.viewActivity.hidden = view !== 'activity';
   els.viewOffers.hidden = view !== 'offers';
   els.viewDeclines.hidden = view !== 'declines';
   els.viewStarts.hidden = view !== 'starts';
@@ -1322,6 +1404,11 @@ function setView(view) {
     els.pageTitle.textContent = 'Submissions';
     els.pageSubtitle.textContent = 'Submission history grouped by user and date.';
     loadSubmissions();
+  }
+  if (view === 'activity') {
+    els.pageTitle.textContent = 'Activity';
+    els.pageSubtitle.textContent = 'See recent actions by organisation admins and team members.';
+    loadActivity();
   }
   if (view === 'offers') {
     els.pageTitle.textContent = 'Offers';
@@ -1345,14 +1432,13 @@ function setView(view) {
   }
   if (view === 'settings') {
     els.pageTitle.textContent = isAdmin() ? 'System' : 'Organisation';
-    els.pageSubtitle.textContent = isAdmin() ? 'Manage organisations, users, and job imports.' : 'Manage your team members.';
+    els.pageSubtitle.textContent = isAdmin() ? 'Manage organisations, users, and job imports.' : 'Manage your team and job imports.';
     els.organisationCreatePanel.hidden = !isAdmin();
-    els.excelUploadPanel.hidden = !isAdmin();
+    els.excelUploadPanel.hidden = !isAdmin() && !isOrganisationAdmin();
     document.getElementById('systemDiagnosticsPanel').hidden = !isAdmin();
     loadMyOrganisation();
     if (isAdmin()) {
       loadOrganisations();
-      loadExcelFiles();
     }
     // Show admin user panel only for admin
     if (els.adminUserPanel) {
@@ -1646,6 +1732,15 @@ function getJobsPollDelay(pollCount) {
 // revalidates it. Cleared on logout.
 const JOBS_CACHE_KEY_PREFIX = 'vms_jobs_cache2:';
 const JOBS_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+let jobsCacheDay = new Date().toISOString().slice(0, 10);
+
+setInterval(() => {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== jobsCacheDay) {
+    jobsCacheDay = today;
+    if (authToken) loadJobs();
+  }
+}, 60 * 1000);
 
 function jobsCacheKey() {
   return currentUser && currentUser.email ? JOBS_CACHE_KEY_PREFIX + currentUser.email.toLowerCase() : null;
@@ -1656,7 +1751,7 @@ function readCachedJobs() {
   if (!key) return null;
   try {
     const cached = JSON.parse(localStorage.getItem(key) || 'null');
-    if (cached && Array.isArray(cached.jobs) && Date.now() - cached.at < JOBS_CACHE_MAX_AGE_MS) return cached.jobs;
+    if (cached && Array.isArray(cached.jobs) && cached.day === new Date().toISOString().slice(0, 10) && Date.now() - cached.at < JOBS_CACHE_MAX_AGE_MS) return cached.jobs;
   } catch { /* storage unavailable or corrupt: fall back to the network */ }
   return null;
 }
@@ -1665,7 +1760,7 @@ function writeCachedJobs(jobs) {
   const key = jobsCacheKey();
   if (!key) return;
   try {
-    localStorage.setItem(key, JSON.stringify({ at: Date.now(), jobs }));
+    localStorage.setItem(key, JSON.stringify({ at: Date.now(), day: new Date().toISOString().slice(0, 10), jobs }));
   } catch {
     // Quota or private mode: caching is optional. Drop the old entry so the next
     // load does not first paint an older, shorter list.
@@ -2574,6 +2669,9 @@ document.querySelectorAll('.nav__item').forEach(btn => {
   btn.addEventListener('click', () => setView(btn.dataset.view));
 });
 
+els.activityOrganisationFilter.addEventListener('change', loadActivity);
+els.refreshActivityBtn.addEventListener('click', loadActivity);
+
 if (els.logoutBtn) {
   els.logoutBtn.addEventListener('click', logout);
 }
@@ -2680,6 +2778,7 @@ document.getElementById('uploadExcelJobsBtn').addEventListener('click', async ()
   if (!file) return setPanelAlert(els.excelUploadAlert, 'error', 'Choose an .xlsx file first.');
   const form = new FormData();
   form.append('file', file);
+  if (els.excelExpiresOn.value) form.append('expires_on', els.excelExpiresOn.value);
   try {
     const response = await fetch(`${API_BASE}/api/admin/jobs/upload-excel`, {
       method: 'POST', headers: { Authorization: `Bearer ${authToken}` }, body: form
@@ -2688,6 +2787,7 @@ document.getElementById('uploadExcelJobsBtn').addEventListener('click', async ()
     if (!response.ok) throw new Error(result.detail || 'Upload failed');
     setPanelAlert(els.excelUploadAlert, 'ok', result.message);
     els.excelJobsFile.value = '';
+    els.excelExpiresOn.value = '';
     await loadExcelFiles();
     await loadJobs();
   } catch (error) { setPanelAlert(els.excelUploadAlert, 'error', error.message); }
