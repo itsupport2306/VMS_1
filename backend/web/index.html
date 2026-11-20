@@ -245,6 +245,38 @@
       </section>
 
       <section class="content" id="viewSettings" hidden>
+        <div class="panel" id="organisationCreatePanel" hidden>
+          <div class="panel__title">Create Organisation</div>
+          <div class="panel__desc">Create an organisation and its admin account. The admin sets a password with Forgot Password.</div>
+          <div class="row" style="gap: 12px; flex-wrap: wrap; margin-top: 16px;">
+            <input id="organisationName" class="input" placeholder="Organisation name" />
+            <input id="organisationAdminName" class="input" placeholder="Admin full name" />
+            <input id="organisationAdminEmail" class="input" type="email" placeholder="Admin email" />
+            <button class="btn" id="createOrganisationBtn">Create</button>
+          </div>
+          <div id="organisationCreateAlert" class="alert" hidden></div>
+          <div id="organisationsList" style="margin-top: 16px;"></div>
+        </div>
+        <div class="panel" id="organisationMembersPanel" hidden>
+          <div class="panel__title" id="organisationMembersTitle">Team Members</div>
+          <div class="panel__desc">Add a team member by email, then ask them to sign up to access the portal.</div>
+          <div class="row" style="gap: 12px; margin-top: 16px;">
+            <input id="organisationMemberEmail" class="input" type="email" placeholder="Member email" />
+            <button class="btn" id="addOrganisationMemberBtn">Add Member</button>
+          </div>
+          <div id="organisationMembersAlert" class="alert" hidden></div>
+          <div id="organisationMembersList" style="margin-top: 16px;"></div>
+        </div>
+        <div class="panel" id="excelUploadPanel" hidden>
+          <div class="panel__title">Upload Jobs from Excel</div>
+          <div class="panel__desc">Upload an .xlsx file with JobID, Job Title, Pay Rate, Facility Location, and Job Description columns. Optional: State, Status, Profession, Specialty, and End Client.</div>
+          <div class="row" style="gap: 12px; margin-top: 16px;">
+            <input id="excelJobsFile" class="input" type="file" accept=".xlsx" />
+            <button class="btn" id="uploadExcelJobsBtn">Upload Jobs</button>
+          </div>
+          <div id="excelUploadAlert" class="alert" hidden></div>
+          <div id="excelFilesList" style="margin-top: 16px;"></div>
+        </div>
         <!-- Admin User Management (admin only) -->
         <div class="panel" id="adminUserPanel" hidden>
           <div class="panel__title">User Management (Admin Only)</div>
@@ -267,7 +299,7 @@
           </div>
         </div>
         
-        <div class="panel">
+        <div class="panel" id="systemDiagnosticsPanel">
           <div class="panel__title">System</div>
           <div class="panel__desc">Integration status and backend diagnostics.</div>
           <!-- Debug buttons hidden for production -->

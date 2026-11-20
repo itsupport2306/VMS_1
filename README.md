@@ -49,9 +49,11 @@ A comprehensive Vendor Management System (VMS) that connects to ATS APIs to fetc
 - **Admin submission alert**: an email goes to `SUBMISSION_NOTIFICATION_RECIPIENTS` on every new submission.
 
 ### 7. Admin: users and system
+- **Organisations**: the portal admin creates an organisation with an admin name and email from the System page. The organisation admin uses **Forgot Password** to set their password, then manages team members from the same page. Members sign up with their invited email. Removing a member disables an existing account.
 - **User whitelist**: only whitelisted emails can sign in. Admin adds and removes users (`/api/admin/users`).
 - **System page**: admin tools including user management and Excel job file management.
 - **Excel job upload**: upload job files, list them, and remove them. Uploaded jobs are combined with the base job file.
+- **Required Excel columns**: `JobID`, `Job Title`, `Pay Rate`, `Facility Location`, and `Job Description`. `State`, `Status`, `Profession`, `Specialty`, and `End Client` are optional. Upload `.xlsx` files up to `MAX_FILE_SIZE`; rows with missing required values or duplicate IDs in the file are rejected. Uploaded files are stored in `DATA_DIR/excel_uploads` and restored after restart.
 - **Delete job**: admin can remove a job.
 - **Open/closed job count report**: an email with open and closed counts every 2 hours (`JOB_STATUS_REPORT_*`). Admin can send one now with `POST /api/admin/job-status-report/send`.
 
@@ -228,6 +230,12 @@ python main.py backend
 ### Authentication
 - `POST /api/auth/request-otp` - Request an email verification code
 - `POST /api/auth/verify-otp` - Verify code and receive a 7-day bearer token
+
+### Organisation and job import
+- `POST /api/admin/organisations` - Portal admin: create an organisation and its admin account
+- `GET /api/organisations/mine` - Organisation admin: view their organisation and team
+- `POST /api/organisations/members` and `DELETE /api/organisations/members/{email}` - Organisation admin: add or remove a team member
+- `POST /api/admin/jobs/upload-excel` - Portal admin: upload a validated `.xlsx` job workbook
 
 ## Web UI Features
 

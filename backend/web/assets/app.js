@@ -26,6 +26,21 @@ const els = {
   addUserAlert: document.getElementById('addUserAlert'),
   userCount: document.getElementById('userCount'),
   usersList: document.getElementById('usersList'),
+  organisationCreatePanel: document.getElementById('organisationCreatePanel'),
+  organisationName: document.getElementById('organisationName'),
+  organisationAdminName: document.getElementById('organisationAdminName'),
+  organisationAdminEmail: document.getElementById('organisationAdminEmail'),
+  organisationCreateAlert: document.getElementById('organisationCreateAlert'),
+  organisationsList: document.getElementById('organisationsList'),
+  organisationMembersPanel: document.getElementById('organisationMembersPanel'),
+  organisationMembersTitle: document.getElementById('organisationMembersTitle'),
+  organisationMemberEmail: document.getElementById('organisationMemberEmail'),
+  organisationMembersAlert: document.getElementById('organisationMembersAlert'),
+  organisationMembersList: document.getElementById('organisationMembersList'),
+  excelUploadPanel: document.getElementById('excelUploadPanel'),
+  excelJobsFile: document.getElementById('excelJobsFile'),
+  excelUploadAlert: document.getElementById('excelUploadAlert'),
+  excelFilesList: document.getElementById('excelFilesList'),
   apiBase: document.getElementById('apiBase'),
   pageTitle: document.getElementById('pageTitle'),
   pageSubtitle: document.getElementById('pageSubtitle'),
@@ -124,6 +139,7 @@ let jobsPollTimeout = null;
 // Auth state
 let authToken = localStorage.getItem('vms_token') || null;
 let currentUser = JSON.parse(localStorage.getItem('vms_user') || 'null');
+let currentOrganisation = null;
 let authMode = 'login';
 let pendingOtpEmail = '';
 
@@ -131,6 +147,107 @@ const ADMIN_EMAIL = 'Admin@radixsol.com';
 
 function isAdmin() {
   return currentUser && currentUser.email && currentUser.email.toLowerCase() === ADMIN_EMAIL.toLowerCase();
+}
+
+function setPanelAlert(element, kind, message) {
+  element.className = `alert alert--${kind}`;
+  element.textContent = message;
+  element.hidden = false;
+}
+
+async function organisationRequest(path, method, body) {
+  const response = await fetch(`${API_BASE}${path}`, {
+    method,
+    headers: { Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
+  return result;
+}
+
+async function loadMyOrganisation() {
+  if (!authToken) return;
+  try {
+    const result = await apiGetAuth('/api/organisations/mine', { fresh: true });
+    currentOrganisation = result.organisation;
+    els.systemNavBtn.hidden = !isAdmin() && !currentOrganisation;
+    els.systemNavBtn.textContent = isAdmin() ? 'System' : 'Organisation';
+    els.organisationMembersPanel.hidden = !currentOrganisation;
+    if (currentOrganisation) {
+      els.organisationMembersTitle.textContent = `${currentOrganisation.name} Team Members`;
+      const members = currentOrganisation.member_emails.filter(email => email !== currentOrganisation.admin_email);
+      els.organisationMembersList.replaceChildren();
+      if (!members.length) els.organisationMembersList.textContent = 'No team members yet.';
+      members.forEach(email => {
+        const row = document.createElement('div');
+        row.className = 'row';
+        row.style.marginBottom = '8px';
+        const label = document.createElement('span');
+        label.textContent = email;
+        const button = document.createElement('button');
+        button.className = 'btn btn--secondary btn--small';
+        button.textContent = 'Remove';
+        button.addEventListener('click', async () => {
+          if (!confirm(`Remove ${email} from your team?`)) return;
+          try {
+            await organisationRequest(`/api/organisations/members/${encodeURIComponent(email)}`, 'DELETE');
+            await loadMyOrganisation();
+          } catch (error) { setPanelAlert(els.organisationMembersAlert, 'error', error.message); }
+        });
+        row.append(label, button);
+        els.organisationMembersList.append(row);
+      });
+    }
+  } catch (error) {
+    console.error('Could not load organisation:', error);
+  }
+}
+
+async function loadOrganisations() {
+  if (!isAdmin()) return;
+  try {
+    const result = await apiGetAuth('/api/admin/organisations', { fresh: true });
+    els.organisationsList.replaceChildren();
+    result.organisations.forEach(org => {
+      const row = document.createElement('div');
+      row.textContent = `${org.name} — ${org.admin_email} (${org.member_emails.length} users)`;
+      els.organisationsList.append(row);
+    });
+  } catch (error) { setPanelAlert(els.organisationCreateAlert, 'error', error.message); }
+}
+
+async function loadExcelFiles() {
+  if (!isAdmin()) return;
+  try {
+    const result = await apiGetAuth('/api/admin/jobs/excel-files', { fresh: true });
+    els.excelFilesList.replaceChildren();
+    if (!result.uploaded_files.length) els.excelFilesList.textContent = 'No uploaded files.';
+    result.uploaded_files.forEach(file => {
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.style.marginBottom = '8px';
+      const label = document.createElement('span');
+      label.textContent = file.filename;
+      const button = document.createElement('button');
+      button.className = 'btn btn--secondary btn--small';
+      button.textContent = 'Remove';
+      button.addEventListener('click', async () => {
+        if (!confirm(`Remove ${file.filename}?`)) return;
+        try {
+          const response = await fetch(`${API_BASE}/api/admin/jobs/excel-files/by-name/${encodeURIComponent(file.filename)}`, {
+            method: 'DELETE', headers: { Authorization: `Bearer ${authToken}` }
+          });
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.detail || 'Could not remove file');
+          await loadExcelFiles();
+          await loadJobs();
+        } catch (error) { setPanelAlert(els.excelUploadAlert, 'error', error.message); }
+      });
+      row.append(label, button);
+      els.excelFilesList.append(row);
+    });
+  } catch (error) { setPanelAlert(els.excelUploadAlert, 'error', error.message); }
 }
 
 // Admin user management functions
@@ -277,6 +394,7 @@ function updateAuthUI() {
     if (els.systemNavBtn) {
       els.systemNavBtn.hidden = !isAdmin();
     }
+    loadMyOrganisation();
   } else {
     // Not logged in - show auth form
     els.userInfo.hidden = true;
@@ -294,6 +412,7 @@ function updateAuthUI() {
 function logout() {
   authToken = null;
   currentUser = null;
+  currentOrganisation = null;
   pendingOtpEmail = '';
   authMode = 'login';
   localStorage.removeItem('vms_token');
@@ -1225,8 +1344,16 @@ function setView(view) {
     loadPreferences();
   }
   if (view === 'settings') {
-    els.pageTitle.textContent = 'System';
-    els.pageSubtitle.textContent = 'Ceipal connectivity and cached raw responses.';
+    els.pageTitle.textContent = isAdmin() ? 'System' : 'Organisation';
+    els.pageSubtitle.textContent = isAdmin() ? 'Manage organisations, users, and job imports.' : 'Manage your team members.';
+    els.organisationCreatePanel.hidden = !isAdmin();
+    els.excelUploadPanel.hidden = !isAdmin();
+    document.getElementById('systemDiagnosticsPanel').hidden = !isAdmin();
+    loadMyOrganisation();
+    if (isAdmin()) {
+      loadOrganisations();
+      loadExcelFiles();
+    }
     // Show admin user panel only for admin
     if (els.adminUserPanel) {
       els.adminUserPanel.hidden = !isAdmin();
@@ -1234,7 +1361,7 @@ function setView(view) {
         loadWhitelistedUsers();
       }
     }
-    loadSystem();
+    if (isAdmin()) loadSystem();
   }
 }
 
@@ -2521,6 +2648,50 @@ if (resetToken && els.resetPasswordForm) {
 if (els.addUserBtn) {
   els.addUserBtn.addEventListener('click', addUser);
 }
+
+document.getElementById('createOrganisationBtn').addEventListener('click', async () => {
+  try {
+    const result = await organisationRequest('/api/admin/organisations', 'POST', {
+      name: els.organisationName.value.trim(),
+      admin_name: els.organisationAdminName.value.trim(),
+      admin_email: els.organisationAdminEmail.value.trim()
+    });
+    setPanelAlert(els.organisationCreateAlert, 'ok', result.message);
+    els.organisationName.value = '';
+    els.organisationAdminName.value = '';
+    els.organisationAdminEmail.value = '';
+    await loadOrganisations();
+  } catch (error) { setPanelAlert(els.organisationCreateAlert, 'error', error.message); }
+});
+
+document.getElementById('addOrganisationMemberBtn').addEventListener('click', async () => {
+  try {
+    const result = await organisationRequest('/api/organisations/members', 'POST', {
+      email: els.organisationMemberEmail.value.trim()
+    });
+    setPanelAlert(els.organisationMembersAlert, 'ok', result.message);
+    els.organisationMemberEmail.value = '';
+    await loadMyOrganisation();
+  } catch (error) { setPanelAlert(els.organisationMembersAlert, 'error', error.message); }
+});
+
+document.getElementById('uploadExcelJobsBtn').addEventListener('click', async () => {
+  const file = els.excelJobsFile.files[0];
+  if (!file) return setPanelAlert(els.excelUploadAlert, 'error', 'Choose an .xlsx file first.');
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    const response = await fetch(`${API_BASE}/api/admin/jobs/upload-excel`, {
+      method: 'POST', headers: { Authorization: `Bearer ${authToken}` }, body: form
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || 'Upload failed');
+    setPanelAlert(els.excelUploadAlert, 'ok', result.message);
+    els.excelJobsFile.value = '';
+    await loadExcelFiles();
+    await loadJobs();
+  } catch (error) { setPanelAlert(els.excelUploadAlert, 'error', error.message); }
+});
 
 // Register toggle removed - only login allowed
 // if (els.authToggleBtn) {

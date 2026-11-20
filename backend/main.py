@@ -57,6 +57,8 @@ mongo_client = None  # kept for health/ping helpers; points at whichever cluster
 db = None
 users_collection = None
 whitelist_collection = None
+secondary_users_collection = None
+secondary_whitelist_collection = None
 candidates_collection = None
 notifications_collection = None
 jobs_collection = None
@@ -70,6 +72,7 @@ user_preferences_collection = None
 job_notification_outbox_collection = None
 locks_collection = None
 meta_collection = None
+organisations_collection = None
 fs = None
 
 
@@ -77,6 +80,8 @@ def ensure_mongodb_indexes() -> None:
     """Create the indexes required for fast auth lookups and manual job reads."""
     index_specs = [
         ("users.email", users_collection, "email", {"name": "users_email_idx", "unique": True}),
+        ("secondary_users.email", secondary_users_collection, "email", {"name": "users_email_idx", "unique": True}),
+        ("secondary_whitelist.email", secondary_whitelist_collection, "email", {"name": "whitelist_email_idx", "unique": True}),
         ("candidates.submitted_by_user_id", candidates_collection, "submitted_by_user_id", {"name": "candidates_submitted_by_user_id_idx"}),
         ("candidates.submitted_date", candidates_collection, [("submitted_date", -1)], {"name": "candidates_submitted_date_desc_idx"}),
         ("manual_jobs.created_at", manual_jobs_collection, [("created_at", -1)], {"name": "manual_jobs_created_at_desc_idx"}),
@@ -97,6 +102,7 @@ def ensure_mongodb_indexes() -> None:
         ("user_preferences.email", user_preferences_collection, "email", {"name": "user_preferences_email_idx", "unique": True}),
         ("job_notification_outbox.job_id", job_notification_outbox_collection, "job_id", {"name": "job_outbox_job_id_idx", "unique": True}),
         ("job_notification_outbox.status", job_notification_outbox_collection, [("status", 1), ("queued_at", 1)], {"name": "job_outbox_status_idx"}),
+        ("organisations.member_emails", organisations_collection, "member_emails", {"name": "organisation_member_email_idx", "unique": True}),
     ]
     for label, collection, keys, kwargs in index_specs:
         if collection is None:
@@ -173,10 +179,10 @@ def init_mongodb():
     """
     global mongodb_startup_ping_ms, ACTIVE_MONGODB_LABEL
     global primary_mongo_client, secondary_mongo_client, primary_db, secondary_db, mongo_client, db
-    global users_collection, whitelist_collection, candidates_collection, notifications_collection
+    global users_collection, whitelist_collection, secondary_users_collection, secondary_whitelist_collection, candidates_collection, notifications_collection
     global jobs_collection, job_status_tracker_collection, closure_audit_collection, manual_jobs_collection, primary_manual_jobs_collection
     global submission_logs_collection, auth_tokens_collection, user_preferences_collection
-    global job_notification_outbox_collection, locks_collection, meta_collection, fs
+    global job_notification_outbox_collection, locks_collection, meta_collection, organisations_collection, fs
 
     print(f"[MongoDB] Checking configuration...")
     print(f"[MongoDB] MONGODB_URI present: {bool(MONGODB_URI)}")
@@ -207,6 +213,8 @@ def init_mongodb():
         try:
             secondary_mongo_client, secondary_db = _open_mongo_client(MONGODB_URI_2)
             candidates_collection = secondary_db.candidates
+            secondary_users_collection = secondary_db.users
+            secondary_whitelist_collection = secondary_db.whitelist
             notifications_collection = secondary_db.notifications
             jobs_collection = secondary_db.jobs  # Track job status changes
             job_status_tracker_collection = secondary_db.job_status_tracker  # Fresh tracker for closure detection (separate from legacy `jobs`)
@@ -218,6 +226,7 @@ def init_mongodb():
             job_notification_outbox_collection = secondary_db.job_notification_outbox  # Durable queue of posted jobs awaiting digest emails
             locks_collection = secondary_db.locks  # Cross-worker leases (only one worker sends digests at a time)
             meta_collection = secondary_db.meta  # Small shared state: jobs version stamp, status-report snapshot
+            organisations_collection = secondary_db.organisations
 
             import gridfs
             fs = gridfs.GridFS(secondary_db)  # Resume storage - the main driver of quota usage
@@ -1863,10 +1872,12 @@ def load_whitelisted_users():
     WHITELISTED_USERS = set()
     
     # Try MongoDB first
-    if mongodb_enabled and whitelist_collection is not None:
+    if mongodb_enabled and (whitelist_collection is not None or secondary_whitelist_collection is not None):
         try:
-            for doc in whitelist_collection.find():
-                WHITELISTED_USERS.add(doc["email"].lower())
+            for collection in (whitelist_collection, secondary_whitelist_collection):
+                if collection is not None:
+                    for doc in collection.find():
+                        WHITELISTED_USERS.add(doc["email"].lower())
             print(f"[Auth] Loaded {len(WHITELISTED_USERS)} whitelisted users from MongoDB")
             return
         except Exception as e:
@@ -1915,14 +1926,15 @@ def is_whitelisted(email: str) -> bool:
 def save_whitelisted_users():
     """Save whitelisted users to MongoDB or fallback to Users file"""
     # Try MongoDB first
-    if mongodb_enabled and whitelist_collection is not None:
+    target_collection = secondary_whitelist_collection if secondary_whitelist_collection is not None else whitelist_collection
+    if mongodb_enabled and target_collection is not None:
         try:
             # Upsert instead of clear-and-reinsert. With several workers, a worker
             # holding a stale set used to delete every whitelist entry it had not
             # seen, silently cutting newly registered users off from portal access
             # and from job notification emails.
             for email in WHITELISTED_USERS:
-                whitelist_collection.update_one(
+                target_collection.update_one(
                     {"email": email.lower()}, {"$set": {"email": email.lower()}}, upsert=True
                 )
             print(f"[Auth] Saved {len(WHITELISTED_USERS)} whitelisted users to MongoDB")
@@ -2152,12 +2164,14 @@ def load_users_from_json(force_refresh: bool = False):
             return dict(_users_cache)
 
     # Try MongoDB first
-    if mongodb_enabled and users_collection is not None:
+    if mongodb_enabled and (users_collection is not None or secondary_users_collection is not None):
         try:
             users = {}
-            for doc in users_collection.find():
-                email = doc["email"].lower()
-                users[email] = _normalize_user_doc(doc)
+            for collection in (users_collection, secondary_users_collection):
+                if collection is not None:
+                    for doc in collection.find():
+                        email = doc["email"].lower()
+                        users[email] = _normalize_user_doc(doc)
             print(f"[Auth] Loaded {len(users)} users from MongoDB")
             with _users_cache_lock:
                 _users_cache = users
@@ -2219,16 +2233,19 @@ def load_user_by_email(email: str, prefer_cache: bool = True) -> Optional[dict]:
         # created by another worker after this cache was built. Fall through to
         # the shared store rather than reporting the user as unknown.
 
-    if mongodb_enabled and users_collection is not None:
+    if mongodb_enabled and (users_collection is not None or secondary_users_collection is not None):
         try:
-            doc = users_collection.find_one({"email": email_lower})
-            if doc is None:
-                doc = users_collection.find_one({
-                    "email": {
-                        "$regex": f"^{re.escape(email_lower)}$",
-                        "$options": "i",
-                    }
-                })
+            doc = None
+            for collection in (secondary_users_collection, users_collection):
+                if collection is None:
+                    continue
+                doc = collection.find_one({"email": email_lower})
+                if doc is None:
+                    doc = collection.find_one({
+                        "email": {"$regex": f"^{re.escape(email_lower)}$", "$options": "i"}
+                    })
+                if doc is not None:
+                    break
             if doc is None:
                 # Unknown account. This used to reload the whole users collection
                 # (a full scan) for every unknown or mistyped e-mail.
@@ -2307,9 +2324,10 @@ def save_user_record(user_data: dict) -> bool:
     if not email_lower:
         return False
 
-    if mongodb_enabled and users_collection is not None:
+    target_collection = secondary_users_collection if secondary_users_collection is not None else users_collection
+    if mongodb_enabled and target_collection is not None:
         try:
-            users_collection.update_one(
+            target_collection.update_one(
                 {"email": email_lower},
                 {"$set": {
                     "id": user["id"],
@@ -2353,9 +2371,10 @@ def add_whitelisted_email(email: str) -> bool:
         return False
 
     WHITELISTED_USERS.add(email_lower)
-    if mongodb_enabled and whitelist_collection is not None:
+    target_collection = secondary_whitelist_collection if secondary_whitelist_collection is not None else whitelist_collection
+    if mongodb_enabled and target_collection is not None:
         try:
-            whitelist_collection.update_one(
+            target_collection.update_one(
                 {"email": email_lower}, {"$set": {"email": email_lower}}, upsert=True
             )
             return True
@@ -2369,9 +2388,15 @@ def remove_whitelisted_email(email: str) -> bool:
     global WHITELISTED_USERS
     email_lower = (email or "").strip().lower()
     WHITELISTED_USERS.discard(email_lower)
-    if mongodb_enabled and whitelist_collection is not None:
+    target_collection = secondary_whitelist_collection if secondary_whitelist_collection is not None else whitelist_collection
+    if mongodb_enabled and target_collection is not None:
         try:
-            whitelist_collection.delete_many({"email": email_lower})
+            target_collection.delete_many({"email": email_lower})
+            if whitelist_collection is not None and whitelist_collection is not target_collection:
+                try:
+                    whitelist_collection.delete_many({"email": email_lower})
+                except Exception:
+                    pass
             return True
         except Exception as e:
             print(f"[Auth] Error removing {email_lower} from MongoDB whitelist: {e}, falling back to file")
@@ -2578,12 +2603,21 @@ MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 10485760))  # 10MB
 
 # Excel Jobs File Configuration
 EXCEL_JOBS_FILE = os.getenv("EXCEL_JOBS_FILE", "VMS Job Fiule.xlsx")
-UPLOADED_EXCEL_FILES: List[str] = []  # Track admin-uploaded Excel files (multiple files supported)
+EXCEL_UPLOAD_DIR = os.path.join(DATA_DIR, "excel_uploads")
 MANUAL_JOBS_FILE = os.path.join(DATA_DIR, "manual_jobs.json")
 
 # Ensure directories exist
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(EXCEL_UPLOAD_DIR, exist_ok=True)
+
+
+def uploaded_excel_files() -> List[str]:
+    return sorted(
+        os.path.join(EXCEL_UPLOAD_DIR, name)
+        for name in os.listdir(EXCEL_UPLOAD_DIR)
+        if name.lower().endswith(".xlsx") and os.path.isfile(os.path.join(EXCEL_UPLOAD_DIR, name))
+    )
 
 # Pydantic Models
 class Job(BaseModel):
@@ -2670,6 +2704,16 @@ class UserCreate(BaseModel):
     email: str
     full_name: Optional[str] = None
     password: str
+
+
+class OrganisationCreate(BaseModel):
+    name: str
+    admin_email: str
+    admin_name: str
+
+
+class OrganisationMemberCreate(BaseModel):
+    email: str
 
 class UserLogin(BaseModel):
     email: str
@@ -2775,6 +2819,8 @@ async def register(user_data: UserCreate, request: Request):
         raise HTTPException(status_code=400, detail="Valid email is required")
     if len(password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    if not is_whitelisted(email_lower):
+        raise HTTPException(status_code=403, detail="Email is not authorized for portal access")
 
     existing = await asyncio.to_thread(load_user_by_email, email_lower)
     if existing and is_user_active(existing):
@@ -2836,6 +2882,9 @@ async def verify_registration_otp(request_data: OtpVerify):
     if not pending_user:
         delete_auth_token("otp", email_lower)
         raise HTTPException(status_code=400, detail="Registration session has expired")
+    if email_lower not in get_whitelisted_emails(force_refresh=True):
+        delete_auth_token("otp", email_lower)
+        raise HTTPException(status_code=403, detail="Email is not authorized for portal access")
 
     existing = await asyncio.to_thread(load_user_by_email, email_lower, False)
     if existing and is_user_active(existing):
@@ -2977,6 +3026,8 @@ async def login(user_data: UserLogin):
     if not user:
         # Restore legacy behavior: whitelisted users without a stored password
         # can be provisioned again on first password login.
+        if any(email_lower in org["member_emails"] for org in _read_organisations()):
+            raise HTTPException(status_code=401, detail="Sign up with email verification before logging in")
         print(f"[Auth] Recreating missing password user for whitelisted email: {email_lower}")
         user = {
             "id": str(uuid4()),
@@ -3115,6 +3166,155 @@ async def reset_password_with_token(data: ResetPasswordWithToken):
     print(f"[Auth] Password reset successful for {email_lower}")
     return {"message": "Password reset successfully. Please login with your new password."}
 
+ORGANISATIONS_FILE = os.path.join(DATA_DIR, "organisations.json")
+_organisations_lock = Lock()
+
+
+def _valid_email(email: str) -> str:
+    normalized = (email or "").strip().lower()
+    if not EMAIL_PATTERN.fullmatch(normalized):
+        raise HTTPException(status_code=400, detail="Valid email is required")
+    return normalized
+
+
+def _read_organisations() -> List[dict]:
+    if organisations_collection is not None:
+        return [{key: value for key, value in doc.items() if key != "_id"}
+                for doc in organisations_collection.find()]
+    if not os.path.exists(ORGANISATIONS_FILE):
+        return []
+    with open(ORGANISATIONS_FILE, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _write_organisations(organisations: List[dict]) -> None:
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=DATA_DIR, delete=False) as handle:
+        json.dump(organisations, handle, indent=2)
+        temporary_path = handle.name
+    os.replace(temporary_path, ORGANISATIONS_FILE)
+
+
+def _organisation_for_admin(email: str) -> Optional[dict]:
+    return next((org for org in _read_organisations() if org["admin_email"] == email.lower()), None)
+
+
+@app.get("/api/organisations/mine")
+def get_my_organisation(current_user: UserDB = Depends(get_current_user)):
+    organisation = _organisation_for_admin(current_user.email)
+    return {"organisation": organisation, "is_portal_admin": current_user.email.lower() == ADMIN_EMAIL.lower()}
+
+
+@app.get("/api/admin/organisations")
+def list_organisations(current_user: UserDB = Depends(get_current_user)):
+    if current_user.email.lower() != ADMIN_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Only portal admin can view organisations")
+    return {"organisations": _read_organisations()}
+
+
+@app.post("/api/admin/organisations", status_code=201)
+def create_organisation(payload: OrganisationCreate, current_user: UserDB = Depends(get_current_user)):
+    if current_user.email.lower() != ADMIN_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Only portal admin can create organisations")
+    name = payload.name.strip()
+    admin_name = payload.admin_name.strip()
+    email = _valid_email(payload.admin_email)
+    if not name or not admin_name:
+        raise HTTPException(status_code=400, detail="Organisation and admin names are required")
+    if email == ADMIN_EMAIL.lower() or load_user_by_email(email, False) or email in get_whitelisted_emails(force_refresh=True):
+        raise HTTPException(status_code=409, detail="Admin email already has portal access")
+    organisation = {
+        "id": str(uuid4()), "name": name, "admin_email": email,
+        "member_emails": [email], "created_at": datetime.now().isoformat(),
+    }
+    if organisations_collection is not None:
+        try:
+            organisations_collection.insert_one(dict(organisation))
+        except DuplicateKeyError:
+            raise HTTPException(status_code=409, detail="Email already belongs to an organisation")
+    else:
+        with _organisations_lock:
+            organisations = _read_organisations()
+            if any(email in org["member_emails"] for org in organisations):
+                raise HTTPException(status_code=409, detail="Email already belongs to an organisation")
+            _write_organisations(organisations + [organisation])
+    user = {
+        "id": str(uuid4()), "email": email, "full_name": admin_name,
+        "hashed_password": get_password_hash(secrets.token_urlsafe(32)),
+        "is_active": "true", "created_at": datetime.now().isoformat(),
+    }
+    if not save_user_record(user) or not add_whitelisted_email(email):
+        if organisations_collection is not None:
+            organisations_collection.delete_one({"id": organisation["id"]})
+        else:
+            with _organisations_lock:
+                _write_organisations([org for org in _read_organisations() if org["id"] != organisation["id"]])
+        raise HTTPException(status_code=500, detail="Could not provision organisation admin")
+    return {"organisation": organisation, "message": "Admin account created. Use Forgot Password to set a password."}
+
+
+@app.post("/api/organisations/members", status_code=201)
+def add_organisation_member(payload: OrganisationMemberCreate, current_user: UserDB = Depends(get_current_user)):
+    organisation = _organisation_for_admin(current_user.email)
+    if organisation is None:
+        raise HTTPException(status_code=403, detail="Only organisation admin can add members")
+    email = _valid_email(payload.email)
+    if email == ADMIN_EMAIL.lower() or email in get_whitelisted_emails(force_refresh=True):
+        raise HTTPException(status_code=409, detail="Email already has portal access")
+    if organisations_collection is not None:
+        try:
+            organisations_collection.update_one({"id": organisation["id"]}, {"$addToSet": {"member_emails": email}})
+        except DuplicateKeyError:
+            raise HTTPException(status_code=409, detail="Email already belongs to an organisation")
+    else:
+        with _organisations_lock:
+            organisations = _read_organisations()
+            if any(email in org["member_emails"] for org in organisations):
+                raise HTTPException(status_code=409, detail="Email already belongs to an organisation")
+            for org in organisations:
+                if org["id"] == organisation["id"]:
+                    org["member_emails"].append(email)
+            _write_organisations(organisations)
+    if not add_whitelisted_email(email):
+        if organisations_collection is not None:
+            organisations_collection.update_one({"id": organisation["id"]}, {"$pull": {"member_emails": email}})
+        else:
+            with _organisations_lock:
+                organisations = _read_organisations()
+                for org in organisations:
+                    if org["id"] == organisation["id"]:
+                        org["member_emails"].remove(email)
+                _write_organisations(organisations)
+        raise HTTPException(status_code=500, detail="Could not add member")
+    return {"email": email, "message": "Member added. Ask them to sign up with this email."}
+
+
+@app.delete("/api/organisations/members/{email}")
+def remove_organisation_member(email: str, current_user: UserDB = Depends(get_current_user)):
+    organisation = _organisation_for_admin(current_user.email)
+    if organisation is None:
+        raise HTTPException(status_code=403, detail="Only organisation admin can remove members")
+    member_email = _valid_email(email)
+    if member_email == organisation["admin_email"] or member_email not in organisation["member_emails"]:
+        raise HTTPException(status_code=400, detail="Member cannot be removed")
+    user = load_user_by_email(member_email, False)
+    if user:
+        user["is_active"] = "false"
+        if not save_user_record(user):
+            raise HTTPException(status_code=500, detail="Could not revoke member access")
+    if not remove_whitelisted_email(member_email):
+        raise HTTPException(status_code=500, detail="Could not revoke member access")
+    if organisations_collection is not None:
+        organisations_collection.update_one({"id": organisation["id"]}, {"$pull": {"member_emails": member_email}})
+    else:
+        with _organisations_lock:
+            organisations = _read_organisations()
+            for org in organisations:
+                if org["id"] == organisation["id"]:
+                    org["member_emails"].remove(member_email)
+            _write_organisations(organisations)
+    return {"message": "Member removed"}
+
+
 @app.get("/api/admin/users")
 def get_whitelisted_users(current_user: UserDB = Depends(get_current_user)):
     """Get list of whitelisted users (admin only)"""
@@ -3173,6 +3373,8 @@ def remove_whitelisted_user(
     # Cannot remove admin
     if email_lower == ADMIN_EMAIL.lower():
         raise HTTPException(status_code=400, detail="Cannot remove admin user")
+    if any(email_lower in org["member_emails"] for org in _read_organisations()):
+        raise HTTPException(status_code=400, detail="Remove organisation users from their organisation first")
     
     # Check if exists
     if email_lower not in get_whitelisted_emails(force_refresh=True):
@@ -3184,70 +3386,96 @@ def remove_whitelisted_user(
     else:
         raise HTTPException(status_code=500, detail="Failed to save users file")
 
+EXCEL_REQUIRED_COLUMNS = {
+    "JobID": ("jobid", "job id", "job code", "jobcode"),
+    "Job Title": ("job title", "job type", "jobtype", "title"),
+    "Pay Rate": ("pay rate", "pay rates", "bill rate", "salary", "pay", "rate"),
+    "Facility Location": ("facility location", "facility locaton", "location", "city"),
+    "Job Description": ("job description", "description", "desc"),
+}
+
+
+def validate_excel_jobs_file(file_path: str) -> int:
+    import pandas as pd
+
+    try:
+        frame = pd.read_excel(file_path, dtype=str, engine="openpyxl")
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=f"Could not read Excel file: {error}")
+    columns = {str(column).strip().lower(): column for column in frame.columns}
+    missing = [label for label, aliases in EXCEL_REQUIRED_COLUMNS.items()
+               if not any(alias in columns for alias in aliases)]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing required columns: {', '.join(missing)}")
+    if frame.empty:
+        raise HTTPException(status_code=400, detail="Excel file has no jobs")
+    seen_ids = set()
+    for index, row in frame.iterrows():
+        values = {}
+        for label, aliases in EXCEL_REQUIRED_COLUMNS.items():
+            column = next(columns[alias] for alias in aliases if alias in columns)
+            value = row[column]
+            values[label] = "" if pd.isna(value) else str(value).strip()
+        missing_values = [label for label, value in values.items() if not value]
+        if missing_values:
+            raise HTTPException(status_code=400, detail=f"Row {index + 2}: missing {', '.join(missing_values)}")
+        if not BILL_RATE_NUMBER_PATTERN.search(values["Pay Rate"]):
+            raise HTTPException(status_code=400, detail=f"Row {index + 2}: Pay Rate must contain an amount")
+        if values["JobID"] in seen_ids:
+            raise HTTPException(status_code=400, detail=f"Row {index + 2}: duplicate JobID {values['JobID']}")
+        seen_ids.add(values["JobID"])
+    return len(frame)
+
+
 @app.post("/api/admin/jobs/upload-excel")
 async def upload_excel_jobs(
     file: UploadFile = File(...),
     current_user: UserDB = Depends(get_current_user)
 ):
-    """Upload Excel file with job data (admin only).
-    
-    Jobs from uploaded files are COMBINED with original VMS Job Fiule.xlsx jobs.
-    
-    Expected columns: Job Code, Location, Job title, Status, EndClient, Salary, 
-    Job Description, Start Date, Profession, Specialty, State, # of Open Positions,
-    # of Total Positions, Duration Description, Segment Names
-    
-    Note: 'Job title' column is supported in addition to 'Job Type'
-    """
-    global UPLOADED_EXCEL_FILES
-    
+    """Validate and store an Excel workbook of jobs alongside the base workbook."""
     # Verify admin
     is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
     if not is_admin:
         raise HTTPException(status_code=403, detail="Only admin can upload Excel files")
     
     # Validate file type
-    if not file.filename.endswith(('.xlsx', '.xls')):
-        raise HTTPException(status_code=400, detail="Only Excel files (.xlsx, .xls) are allowed")
-    
+    if not (file.filename or "").lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Upload an .xlsx Excel file")
+
+    content = await file.read(MAX_FILE_SIZE + 1)
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="Excel file exceeds the upload size limit")
+    if not content:
+        raise HTTPException(status_code=400, detail="Excel file is empty")
+    file_path = os.path.join(EXCEL_UPLOAD_DIR, f"jobs_{uuid4().hex}.xlsx")
+    temporary_path = f"{file_path}.uploading"
     try:
-        # Create upload directory if not exists
-        excel_upload_dir = os.path.join(DATA_DIR, "excel_uploads")
-        os.makedirs(excel_upload_dir, exist_ok=True)
-        
-        # Save file with timestamp to avoid conflicts
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        file_path = os.path.join(excel_upload_dir, f"jobs_{timestamp}_{file.filename}")
-        
-        # Write file
-        with open(file_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
-        
-        # Add to list of uploaded files (append, don't replace)
-        UPLOADED_EXCEL_FILES.append(file_path)
-        
-        # Clear cache to force reload
+        with open(temporary_path, "wb") as handle:
+            handle.write(content)
+        new_jobs_count = validate_excel_jobs_file(temporary_path)
+        os.replace(temporary_path, file_path)
         clear_excel_jobs_cache()
-        
-        # Test loading all files
         all_jobs = load_excel_jobs()
-        
-        # Get count from just this file
-        new_file_jobs = load_excel_jobs_from_file(file_path)
-        
         return {
-            "message": f"Excel file uploaded successfully. Added {len(new_file_jobs)} jobs from this file. Total jobs now: {len(all_jobs)}",
+            "message": f"Excel file uploaded successfully. Added {new_jobs_count} jobs from this file.",
             "filename": file.filename,
-            "new_jobs_count": len(new_file_jobs),
+            "new_jobs_count": new_jobs_count,
             "total_jobs_count": len(all_jobs),
-            "uploaded_files_count": len(UPLOADED_EXCEL_FILES),
-            "file_path": file_path
+            "uploaded_files_count": len(uploaded_excel_files()),
         }
-        
+    except HTTPException:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise
     except Exception as e:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+        if os.path.exists(file_path):
+            os.remove(file_path)
         print(f"[Excel Upload] Error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to upload Excel file: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to upload Excel file")
 
 
 @app.post("/api/admin/jobs")
@@ -3524,7 +3752,8 @@ async def list_uploaded_excel_files(current_user: UserDB = Depends(get_current_u
         raise HTTPException(status_code=403, detail="Only admin can view uploaded files")
     
     files_info = []
-    for idx, file_path in enumerate(UPLOADED_EXCEL_FILES):
+    uploaded_files = uploaded_excel_files()
+    for idx, file_path in enumerate(uploaded_files):
         if os.path.exists(file_path):
             files_info.append({
                 "index": idx,
@@ -3544,7 +3773,7 @@ async def list_uploaded_excel_files(current_user: UserDB = Depends(get_current_u
         "original_file": EXCEL_JOBS_FILE,
         "original_exists": os.path.exists(EXCEL_JOBS_FILE),
         "uploaded_files": files_info,
-        "total_uploaded": len(UPLOADED_EXCEL_FILES)
+        "total_uploaded": len(uploaded_files)
     }
 
 @app.delete("/api/admin/jobs/excel-files/{file_index}")
@@ -3553,16 +3782,15 @@ async def remove_uploaded_excel_file(
     current_user: UserDB = Depends(get_current_user)
 ):
     """Remove a specific uploaded Excel file by index (admin only)"""
-    global UPLOADED_EXCEL_FILES
-    
     is_admin = current_user.email.lower() == ADMIN_EMAIL.lower()
     if not is_admin:
         raise HTTPException(status_code=403, detail="Only admin can remove uploaded files")
     
-    if file_index < 0 or file_index >= len(UPLOADED_EXCEL_FILES):
+    uploaded_files = uploaded_excel_files()
+    if file_index < 0 or file_index >= len(uploaded_files):
         raise HTTPException(status_code=404, detail=f"File index {file_index} not found")
     
-    file_path = UPLOADED_EXCEL_FILES[file_index]
+    file_path = uploaded_files[file_index]
     filename = os.path.basename(file_path)
     
     # Remove file from disk if exists
@@ -3570,17 +3798,26 @@ async def remove_uploaded_excel_file(
         os.remove(file_path)
         print(f"[Excel] Deleted file: {file_path}")
     
-    # Remove from list
-    UPLOADED_EXCEL_FILES.pop(file_index)
-    
     # Clear cache to force reload
     clear_excel_jobs_cache()
     
     return {
         "message": f"Excel file '{filename}' removed successfully",
         "removed_file": filename,
-        "remaining_uploaded_files": len(UPLOADED_EXCEL_FILES)
+        "remaining_uploaded_files": len(uploaded_excel_files())
     }
+
+
+@app.delete("/api/admin/jobs/excel-files/by-name/{filename}")
+def remove_uploaded_excel_file_by_name(filename: str, current_user: UserDB = Depends(get_current_user)):
+    if current_user.email.lower() != ADMIN_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Only admin can remove uploaded files")
+    file_path = next((path for path in uploaded_excel_files() if os.path.basename(path) == filename), None)
+    if file_path is None:
+        raise HTTPException(status_code=404, detail="Excel file not found")
+    os.remove(file_path)
+    clear_excel_jobs_cache()
+    return {"message": f"Excel file '{filename}' removed successfully"}
 
 @app.get("/api/auth/me", response_model=UserResponse)
 async def get_current_user_info(current_user: UserDB = Depends(get_current_user)):
@@ -3612,6 +3849,7 @@ CLIENT_NAME_PATTERNS = [
 # Excel jobs cache
 _excel_jobs_cache: Optional[List[Job]] = None
 _excel_jobs_cache_time: Optional[datetime] = None
+_excel_upload_dir_mtime: Optional[float] = None
 _excel_jobs_rebuild_lock = Lock()
 
 EXCEL_CACHE_MINUTES = 1440  # Cache Excel jobs for 24 hours (1 day) - Excel jobs are static
@@ -3657,11 +3895,11 @@ def load_excel_jobs_from_file(file_path: str) -> List[Job]:
                 # Extract fields from Excel row (with flexible column matching)
                 job_code = get_val(row, ['Job Code', 'JobCode', 'Job ID', 'JobID'])
                 job_type = get_val(row, ['Job Type', 'JobType', 'Title', 'Job Title'])
-                location = get_val(row, ['Location', 'City'])
+                location = get_val(row, ['Facility Location', 'Facility Locaton', 'Location', 'City'])
                 state = get_val(row, ['State', 'Province'])
                 status = get_val(row, ['Status', 'Job Status'])
                 end_client = get_val(row, ['EndClient', 'End Client', 'Client', 'EndClient '])
-                salary = get_val(row, ['Salary', 'Pay', 'Rate', 'Bill Rate'])
+                salary = get_val(row, ['Pay Rate', 'Pay Rates', 'Salary', 'Pay', 'Rate', 'Bill Rate'])
                 displayed_salary = display_bill_rate(salary)
                 job_description = get_val(row, ['Job Description', 'Description', 'Desc'])
                 
@@ -3756,7 +3994,7 @@ def load_excel_jobs() -> List[Job]:
     
     Loads from:
     1. Original file: VMS Job Fiule.xlsx
-    2. All uploaded files in UPLOADED_EXCEL_FILES list
+    2. All uploaded files in the persistent upload directory
     
     Returns combined list of all jobs from all files.
     """
@@ -3777,12 +4015,13 @@ def _excel_jobs_cache_is_fresh() -> bool:
     return bool(
         _excel_jobs_cache is not None
         and _excel_jobs_cache_time
+        and _excel_upload_dir_mtime == os.path.getmtime(EXCEL_UPLOAD_DIR)
         and datetime.now() - _excel_jobs_cache_time < timedelta(minutes=EXCEL_CACHE_MINUTES)
     )
 
 
 def _read_all_excel_jobs() -> List[Job]:
-    global _excel_jobs_cache, _excel_jobs_cache_time
+    global _excel_jobs_cache, _excel_jobs_cache_time, _excel_upload_dir_mtime
 
     all_jobs: List[Job] = []
     
@@ -3796,7 +4035,7 @@ def _read_all_excel_jobs() -> List[Job]:
     
     # Load from all uploaded files
     uploaded_count = 0
-    for uploaded_file in UPLOADED_EXCEL_FILES:
+    for uploaded_file in uploaded_excel_files():
         if os.path.exists(uploaded_file):
             uploaded_jobs = load_excel_jobs_from_file(uploaded_file)
             all_jobs.extend(uploaded_jobs)
@@ -3810,15 +4049,17 @@ def _read_all_excel_jobs() -> List[Job]:
     # Cache the combined jobs
     _excel_jobs_cache = all_jobs
     _excel_jobs_cache_time = datetime.now()
+    _excel_upload_dir_mtime = os.path.getmtime(EXCEL_UPLOAD_DIR)
     
     return all_jobs
 
 
 def clear_excel_jobs_cache():
     """Clear the Excel jobs cache to force reload on next request"""
-    global _excel_jobs_cache, _excel_jobs_cache_time
+    global _excel_jobs_cache, _excel_jobs_cache_time, _excel_upload_dir_mtime
     _excel_jobs_cache = None
     _excel_jobs_cache_time = None
+    _excel_upload_dir_mtime = None
     clear_jobs_response_cache()
     print("[Excel] Cache cleared")
 
@@ -4432,6 +4673,8 @@ def get_jobs_response_payload(is_admin: bool) -> Dict[str, Any]:
     different worker still gets a correct 304 or a fresh body.
     """
     role = "admin" if is_admin else "vendor"
+    if _jobs_refresh_wakeup is None and _excel_upload_dir_mtime is not None and _excel_upload_dir_mtime != os.path.getmtime(EXCEL_UPLOAD_DIR):
+        clear_excel_jobs_cache()
     if _jobs_refresh_wakeup is not None:
         # The background refresher polls the version stamp and reloads jobs, so
         # requests never wait on MongoDB once this worker has built a payload.
@@ -4536,7 +4779,7 @@ _users_refreshed_at = 0.0
 
 def refresh_users_in_background() -> None:
     global _users_refreshed_at, _users_cache, _users_cache_time
-    if not (mongodb_enabled and users_collection is not None):
+    if not (mongodb_enabled and (users_collection is not None or secondary_users_collection is not None)):
         return
     if _monotonic() - _users_refreshed_at < USERS_REFRESH_SECONDS:
         return
@@ -4544,7 +4787,10 @@ def refresh_users_in_background() -> None:
     # Not load_users_from_json: on a MongoDB error that falls back to the JSON
     # file and would replace the good in-memory list. Here an error propagates
     # and the current list is kept.
-    users = {doc["email"].lower(): _normalize_user_doc(doc) for doc in users_collection.find()}
+    users = {}
+    for collection in (users_collection, secondary_users_collection):
+        if collection is not None:
+            users.update({doc["email"].lower(): _normalize_user_doc(doc) for doc in collection.find()})
     with _users_cache_lock:
         _users_cache = users
         _users_cache_time = datetime.now()
@@ -4553,6 +4799,8 @@ def refresh_users_in_background() -> None:
 def refresh_jobs_in_background() -> None:
     """One refresher pass: pick up foreign changes, honour the TTL, rebuild payloads."""
     refresh_jobs_if_version_changed()
+    if _excel_upload_dir_mtime is not None and _excel_upload_dir_mtime != os.path.getmtime(EXCEL_UPLOAD_DIR):
+        clear_excel_jobs_cache()
     if not _manual_jobs_cache_is_current():
         load_manual_jobs()  # clears the payloads only if the jobs actually changed
     for is_admin in (False, True):
