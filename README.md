@@ -49,7 +49,7 @@ A comprehensive Vendor Management System (VMS) that connects to ATS APIs to fetc
 - **Admin submission alert**: an email goes to `SUBMISSION_NOTIFICATION_RECIPIENTS` on every new submission.
 
 ### 7. Admin: users and system
-- **Organisations**: the portal admin creates an organisation with an admin name and email from the System page. The organisation admin uses **Forgot Password** to set their password, then manages team members from the same page. Members sign up with their invited email. Removing a member disables an existing account.
+- **Organisations**: the portal admin creates an organisation with an admin name and email from the System page. The organisation admin uses **Forgot Password** to set their password, then manages team members from the same page. Members sign up with their invited email. The portal admin can also assign existing whitelisted users to an organisation without changing their account or password. Removing an invited member revokes access; removing an assigned existing user only removes the organisation membership.
 - **Organisation activity**: the portal admin's Activity tab shows recent sign-ins, registrations, job views, candidate submissions, team changes, and job-file changes across organisations, with an organisation filter. Activity is recorded from this release onward; earlier candidate submissions appear when they can be matched to a current organisation member.
 - **User whitelist**: only whitelisted emails can sign in. Admin adds and removes users (`/api/admin/users`).
 - **System page**: admin tools including user management and Excel job file management.
@@ -234,7 +234,8 @@ python main.py backend
 
 ### Organisation and job import
 - `POST /api/admin/organisations` - Portal admin: create an organisation and its admin account
-- `GET /api/organisations/mine` - Organisation admin: view their organisation and team
+- `GET /api/organisations/mine` - Organisation admin or member: view their organisation and team
+- `PUT /api/admin/users/{email}/organisation` and `DELETE /api/admin/users/{email}/organisation` - Portal admin: assign or unassign an existing whitelisted user without changing portal access
 - `GET /api/admin/activity` - Portal admin: recent organisation activity (`organisation_id` and `limit` filters)
 - `POST /api/organisations/members` and `DELETE /api/organisations/members/{email}` - Organisation admin: add or remove a team member
 - `POST /api/admin/jobs/upload-excel` - Portal or organisation admin: upload a validated `.xlsx` job workbook; optional multipart `expires_on=YYYY-MM-DD` is inclusive in UTC

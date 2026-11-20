@@ -33,6 +33,7 @@ const els = {
   organisationCreateAlert: document.getElementById('organisationCreateAlert'),
   organisationsList: document.getElementById('organisationsList'),
   organisationMembersPanel: document.getElementById('organisationMembersPanel'),
+  organisationMemberControls: document.getElementById('organisationMemberControls'),
   organisationMembersTitle: document.getElementById('organisationMembersTitle'),
   organisationMemberEmail: document.getElementById('organisationMemberEmail'),
   organisationMembersAlert: document.getElementById('organisationMembersAlert'),
@@ -184,6 +185,7 @@ async function loadMyOrganisation() {
     els.systemNavBtn.hidden = !isAdmin() && !currentOrganisation;
     els.systemNavBtn.textContent = isAdmin() ? 'System' : 'Organisation';
     els.organisationMembersPanel.hidden = !currentOrganisation;
+    els.organisationMemberControls.hidden = !isOrganisationAdmin();
     els.excelUploadPanel.hidden = !isAdmin() && !isOrganisationAdmin();
     if (isAdmin() || isOrganisationAdmin()) loadExcelFiles();
     if (currentOrganisation) {
@@ -207,7 +209,8 @@ async function loadMyOrganisation() {
             await loadMyOrganisation();
           } catch (error) { setPanelAlert(els.organisationMembersAlert, 'error', error.message); }
         });
-        row.append(label, button);
+        row.append(label);
+        if (isOrganisationAdmin()) row.append(button);
         els.organisationMembersList.append(row);
       });
     }
@@ -301,7 +304,8 @@ async function loadActivity() {
     const actionNames = {
       account_registered: 'Account registered', signed_in: 'Signed in', job_viewed: 'Viewed job',
       candidate_submitted: 'Submitted candidate', member_added: 'Added member',
-      member_removed: 'Removed member', jobs_uploaded: 'Uploaded jobs', jobs_file_removed: 'Removed job file'
+      member_removed: 'Removed member', member_assigned: 'Assigned existing user',
+      member_unassigned: 'Unassigned existing user', jobs_uploaded: 'Uploaded jobs', jobs_file_removed: 'Removed job file'
     };
     result.events.forEach(event => {
       const row = document.createElement('tr');
@@ -341,30 +345,85 @@ function clearAddUserAlert() {
 
 async function loadWhitelistedUsers() {
   if (!isAdmin()) return;
-  
   try {
-    const data = await apiGetAuth('/api/admin/users');
+    const data = await apiGetAuth('/api/admin/users', { fresh: true });
     const users = data.users || [];
-    
     els.userCount.textContent = users.length;
-    
+    els.usersList.replaceChildren();
     if (users.length === 0) {
-      els.usersList.innerHTML = '<div class="empty">No whitelisted users yet.</div>';
+      els.usersList.textContent = 'No whitelisted users yet.';
       return;
     }
-    
-    const list = users.map(email => `
-      <div style="display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; background: var(--panel-2); border-radius: 6px; margin-bottom: 8px;">
-        <span>${email}</span>
-        ${email.toLowerCase() !== ADMIN_EMAIL.toLowerCase() ? `
-          <button class="btn btn--secondary btn--small" onclick="removeUser('${email}')" style="font-size: 12px; padding: 4px 12px;">Remove</button>
-        ` : '<span style="color: var(--muted); font-size: 12px;">(Admin)</span>'}
-      </div>
-    `).join('');
-    
-    els.usersList.innerHTML = list;
+    users.forEach(email => {
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.style.cssText = 'gap: 8px; flex-wrap: wrap; margin-bottom: 8px; padding: 10px 12px; background: var(--panel-2); border-radius: 6px;';
+      const label = document.createElement('span');
+      label.style.flex = '1';
+      label.textContent = email;
+      row.append(label);
+      const membership = (data.memberships || {})[email];
+      if (email.toLowerCase() === ADMIN_EMAIL.toLowerCase()) {
+        const role = document.createElement('span');
+        role.textContent = 'Portal admin';
+        row.append(role);
+      } else if (membership) {
+        const organisation = (data.organisations || []).find(item => item.id === membership.organisation_id);
+        const role = document.createElement('span');
+        role.textContent = `${organisation ? organisation.name : 'Organisation'} (${membership.role})`;
+        row.append(role);
+        if (membership.can_unassign) {
+          const unassign = document.createElement('button');
+          unassign.className = 'btn btn--secondary btn--small';
+          unassign.textContent = 'Unassign';
+          unassign.addEventListener('click', async () => {
+            if (!confirm(`Remove ${email} from this organisation? Portal access will remain.`)) return;
+            try {
+              await organisationRequest(`/api/admin/users/${encodeURIComponent(email)}/organisation`, 'DELETE');
+              await loadWhitelistedUsers();
+              await loadOrganisations();
+            } catch (error) { showAddUserAlert('error', error.message); }
+          });
+          row.append(unassign);
+        }
+      } else {
+        const select = document.createElement('select');
+        select.className = 'input';
+        select.setAttribute('aria-label', `Organisation for ${email}`);
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = 'Choose organisation';
+        select.append(placeholder);
+        (data.organisations || []).forEach(organisation => {
+          const option = document.createElement('option');
+          option.value = organisation.id;
+          option.textContent = organisation.name;
+          select.append(option);
+        });
+        const assign = document.createElement('button');
+        assign.className = 'btn btn--secondary btn--small';
+        assign.textContent = 'Assign';
+        assign.disabled = !(data.organisations || []).length;
+        assign.addEventListener('click', async () => {
+          if (!select.value) return showAddUserAlert('error', 'Choose an organisation first.');
+          try {
+            await organisationRequest(`/api/admin/users/${encodeURIComponent(email)}/organisation`, 'PUT', { organisation_id: select.value });
+            showAddUserAlert('ok', `${email} assigned to an organisation.`);
+            await loadWhitelistedUsers();
+            await loadOrganisations();
+          } catch (error) { showAddUserAlert('error', error.message); }
+        });
+        row.append(select, assign);
+        const remove = document.createElement('button');
+        remove.className = 'btn btn--secondary btn--small';
+        remove.textContent = 'Remove access';
+        remove.addEventListener('click', () => removeUser(email));
+        row.append(remove);
+      }
+      els.usersList.append(row);
+    });
   } catch (e) {
-    els.usersList.innerHTML = '<div class="empty">Error loading users: ' + e.message + '</div>';
+    els.usersList.textContent = `Error loading users: ${e.message}`;
   }
 }
 
@@ -1432,7 +1491,7 @@ function setView(view) {
   }
   if (view === 'settings') {
     els.pageTitle.textContent = isAdmin() ? 'System' : 'Organisation';
-    els.pageSubtitle.textContent = isAdmin() ? 'Manage organisations, users, and job imports.' : 'Manage your team and job imports.';
+    els.pageSubtitle.textContent = isAdmin() ? 'Manage organisations, users, and job imports.' : isOrganisationAdmin() ? 'Manage your team and job imports.' : 'View your organisation and team.';
     els.organisationCreatePanel.hidden = !isAdmin();
     els.excelUploadPanel.hidden = !isAdmin() && !isOrganisationAdmin();
     document.getElementById('systemDiagnosticsPanel').hidden = !isAdmin();
@@ -2759,6 +2818,7 @@ document.getElementById('createOrganisationBtn').addEventListener('click', async
     els.organisationAdminName.value = '';
     els.organisationAdminEmail.value = '';
     await loadOrganisations();
+    await loadWhitelistedUsers();
   } catch (error) { setPanelAlert(els.organisationCreateAlert, 'error', error.message); }
 });
 

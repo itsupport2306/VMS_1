@@ -272,8 +272,8 @@
         </div>
         <div class="panel" id="organisationMembersPanel" hidden>
           <div class="panel__title" id="organisationMembersTitle">Team Members</div>
-          <div class="panel__desc">Add a team member by email, then ask them to sign up to access the portal.</div>
-          <div class="row" style="gap: 12px; margin-top: 16px;">
+          <div class="panel__desc">Members can view their organisation. Organisation admins can add or remove team members.</div>
+          <div class="row" id="organisationMemberControls" style="gap: 12px; margin-top: 16px;">
             <input id="organisationMemberEmail" class="input" type="email" placeholder="Member email" />
             <button class="btn" id="addOrganisationMemberBtn">Add Member</button>
           </div>
@@ -294,7 +294,7 @@
         <!-- Admin User Management (admin only) -->
         <div class="panel" id="adminUserPanel" hidden>
           <div class="panel__title">User Management (Admin Only)</div>
-          <div class="panel__desc">Add or remove whitelisted users who can access the system.</div>
+          <div class="panel__desc">Add users, assign existing portal users to an organisation, or remove access. Assignment keeps their existing account and password.</div>
           
           <div style="margin: 20px 0; padding: 16px; background: var(--panel-2); border-radius: 8px;">
             <div style="font-weight: 600; margin-bottom: 12px;">Add New User</div>

@@ -2751,6 +2751,10 @@ class OrganisationCreate(BaseModel):
 class OrganisationMemberCreate(BaseModel):
     email: str
 
+
+class OrganisationAssignment(BaseModel):
+    organisation_id: str
+
 class UserLogin(BaseModel):
     email: str
     password: str
@@ -3347,7 +3351,7 @@ def get_organisation_activity(
 
 @app.get("/api/organisations/mine")
 def get_my_organisation(current_user: UserDB = Depends(get_current_user)):
-    organisation = _organisation_for_admin(current_user.email)
+    organisation = _organisation_for_member(current_user.email)
     return {"organisation": organisation, "is_portal_admin": current_user.email.lower() == ADMIN_EMAIL.lower()}
 
 
@@ -3356,6 +3360,73 @@ def list_organisations(current_user: UserDB = Depends(get_current_user)):
     if current_user.email.lower() != ADMIN_EMAIL.lower():
         raise HTTPException(status_code=403, detail="Only portal admin can view organisations")
     return {"organisations": _read_organisations()}
+
+
+@app.put("/api/admin/users/{email}/organisation")
+def assign_existing_user_to_organisation(
+    email: str, payload: OrganisationAssignment, background_tasks: BackgroundTasks,
+    current_user: UserDB = Depends(get_current_user),
+):
+    if current_user.email.lower() != ADMIN_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Only portal admin can assign users")
+    member_email = _valid_email(email)
+    if member_email == ADMIN_EMAIL.lower():
+        raise HTTPException(status_code=400, detail="Portal admin cannot join an organisation")
+    if member_email not in get_whitelisted_emails(force_refresh=True):
+        raise HTTPException(status_code=404, detail="User is not on the portal whitelist")
+    with _organisations_lock:
+        organisations = _read_organisations()
+        organisation = next((org for org in organisations if org["id"] == payload.organisation_id), None)
+        if organisation is None:
+            raise HTTPException(status_code=404, detail="Organisation not found")
+        existing = next((org for org in organisations if member_email in org["member_emails"]), None)
+        if existing is not None:
+            if existing["id"] == organisation["id"]:
+                return {"message": "User already belongs to this organisation", "organisation": organisation}
+            raise HTTPException(status_code=409, detail="User already belongs to another organisation")
+        if organisations_collection is not None:
+            try:
+                organisations_collection.update_one(
+                    {"id": organisation["id"]},
+                    {"$addToSet": {"member_emails": member_email, "retained_member_emails": member_email}},
+                )
+            except DuplicateKeyError:
+                raise HTTPException(status_code=409, detail="User already belongs to another organisation")
+        else:
+            organisation["member_emails"].append(member_email)
+            organisation.setdefault("retained_member_emails", []).append(member_email)
+            _write_organisations(organisations)
+    background_tasks.add_task(record_organisation_activity, current_user.email, "member_assigned", member_email, organisation["id"])
+    return {"message": "Existing user assigned to organisation", "organisation_id": organisation["id"], "email": member_email}
+
+
+@app.delete("/api/admin/users/{email}/organisation")
+def unassign_existing_user_from_organisation(
+    email: str, background_tasks: BackgroundTasks, current_user: UserDB = Depends(get_current_user),
+):
+    if current_user.email.lower() != ADMIN_EMAIL.lower():
+        raise HTTPException(status_code=403, detail="Only portal admin can unassign users")
+    member_email = _valid_email(email)
+    with _organisations_lock:
+        organisations = _read_organisations()
+        organisation = next((org for org in organisations if member_email in org["member_emails"]), None)
+        if organisation is None:
+            raise HTTPException(status_code=404, detail="User does not belong to an organisation")
+        if member_email == organisation["admin_email"]:
+            raise HTTPException(status_code=400, detail="Organisation admin cannot be unassigned")
+        if member_email not in organisation.get("retained_member_emails", []):
+            raise HTTPException(status_code=400, detail="Only existing portal users can be unassigned here")
+        if organisations_collection is not None:
+            organisations_collection.update_one(
+                {"id": organisation["id"]},
+                {"$pull": {"member_emails": member_email, "retained_member_emails": member_email}},
+            )
+        else:
+            organisation["member_emails"].remove(member_email)
+            organisation["retained_member_emails"].remove(member_email)
+            _write_organisations(organisations)
+    background_tasks.add_task(record_organisation_activity, current_user.email, "member_unassigned", member_email, organisation["id"])
+    return {"message": "User removed from organisation; portal access retained", "email": member_email}
 
 
 @app.post("/api/admin/organisations", status_code=201)
@@ -3444,21 +3515,25 @@ def remove_organisation_member(email: str, background_tasks: BackgroundTasks, cu
     member_email = _valid_email(email)
     if member_email == organisation["admin_email"] or member_email not in organisation["member_emails"]:
         raise HTTPException(status_code=400, detail="Member cannot be removed")
-    user = load_user_by_email(member_email, False)
-    if user:
-        user["is_active"] = "false"
-        if not save_user_record(user):
+    retain_portal_access = member_email in organisation.get("retained_member_emails", [])
+    if not retain_portal_access:
+        user = load_user_by_email(member_email, False)
+        if user:
+            user["is_active"] = "false"
+            if not save_user_record(user):
+                raise HTTPException(status_code=500, detail="Could not revoke member access")
+        if not remove_whitelisted_email(member_email):
             raise HTTPException(status_code=500, detail="Could not revoke member access")
-    if not remove_whitelisted_email(member_email):
-        raise HTTPException(status_code=500, detail="Could not revoke member access")
     if organisations_collection is not None:
-        organisations_collection.update_one({"id": organisation["id"]}, {"$pull": {"member_emails": member_email}})
+        organisations_collection.update_one({"id": organisation["id"]}, {"$pull": {"member_emails": member_email, "retained_member_emails": member_email}})
     else:
         with _organisations_lock:
             organisations = _read_organisations()
             for org in organisations:
                 if org["id"] == organisation["id"]:
                     org["member_emails"].remove(member_email)
+                    if retain_portal_access:
+                        org["retained_member_emails"].remove(member_email)
             _write_organisations(organisations)
     background_tasks.add_task(record_organisation_activity, current_user.email, "member_removed", member_email, organisation["id"])
     return {"message": "Member removed"}
@@ -3472,9 +3547,16 @@ def get_whitelisted_users(current_user: UserDB = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Only admin can manage users")
     
     emails = get_whitelisted_emails(force_refresh=True)
+    organisations = _read_organisations()
     return {
         "users": sorted(emails),
-        "count": len(emails)
+        "count": len(emails),
+        "organisations": [{"id": org["id"], "name": org["name"]} for org in organisations],
+        "memberships": {
+            email: {"organisation_id": org["id"], "role": "admin" if email == org["admin_email"] else "member",
+                    "can_unassign": email in org.get("retained_member_emails", [])}
+            for org in organisations for email in org["member_emails"]
+        },
     }
 
 @app.post("/api/admin/users")
